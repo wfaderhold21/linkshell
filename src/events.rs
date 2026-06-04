@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     /// Raw PTY bytes — fed into the vt100 screen buffer for display
     SessionBytes      { session_id: usize, data: Vec<u8> },
     /// Complete line — used only for state inference / token parsing

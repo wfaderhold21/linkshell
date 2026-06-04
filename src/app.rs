@@ -1,9 +1,38 @@
 use std::time::Duration;
 use tokio::sync::mpsc;
+use ratatui::layout::Rect;
+use vt100::Parser as VtParser;
 
 use crate::events::AppEvent;
 use crate::patterns::PatternMatcher;
 use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_ROWS, PTY_COLS};
+
+/// Screen-coordinate selection (col, row both relative to output area inner content).
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub start_col: u16,
+    pub start_row: u16,
+    pub end_col: u16,
+    pub end_row: u16,
+}
+
+impl Selection {
+    /// Returns ((min_row, min_col), (max_row, max_col)) in reading order.
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        let a = (self.start_row, self.start_col);
+        let b = (self.end_row,   self.end_col);
+        if a <= b { (a, b) } else { (b, a) }
+    }
+
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        let ((min_row, min_col), (max_row, max_col)) = self.normalized();
+        if row < min_row || row > max_row { return false; }
+        if row == min_row && row == max_row { return col >= min_col && col <= max_col; }
+        if row == min_row { return col >= min_col; }
+        if row == max_row { return col <= max_col; }
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NewSessionField {
@@ -41,6 +70,7 @@ pub enum AppMode {
     Normal,
     NewSession,
     CommandBar,
+    Help,
 }
 
 pub struct App {
@@ -51,6 +81,12 @@ pub struct App {
     pub command_input: String,
     pub should_quit: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
+    // Layout cache (updated after each draw, used for mouse hit-testing)
+    pub output_area: Rect,
+    pub session_bar_area: Rect,
+    pub session_slot_areas: Vec<Rect>,
+    // Text selection
+    pub selection: Option<Selection>,
     matcher: PatternMatcher,
     next_id: usize,
 }
@@ -65,6 +101,10 @@ impl App {
             command_input: String::new(),
             should_quit: false,
             event_tx,
+            output_area: Rect::default(),
+            session_bar_area: Rect::default(),
+            session_slot_areas: Vec::new(),
+            selection: None,
             matcher: PatternMatcher::new(),
             next_id: 0,
         }
@@ -125,11 +165,21 @@ impl App {
 
     pub fn kill_active_session(&mut self) {
         if let Some(idx) = self.active_idx {
-            if idx < self.sessions.len() {
-                self.sessions[idx].pty_writer = None;
-                self.sessions[idx].state = SessionState::Dead;
-            }
+            self.remove_session(idx);
         }
+    }
+
+    fn remove_session(&mut self, idx: usize) {
+        if idx >= self.sessions.len() { return; }
+        // Drop the PTY write channel so the background task exits
+        self.sessions[idx].pty_writer = None;
+        self.sessions.remove(idx);
+        let n = self.sessions.len();
+        self.active_idx = if n == 0 {
+            None
+        } else {
+            Some(idx.min(n - 1))
+        };
     }
 
     pub fn switch_to(&mut self, idx: usize) {
@@ -187,8 +237,8 @@ impl App {
     }
 
     pub fn handle_session_died(&mut self, session_id: usize) {
-        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            s.state = SessionState::Dead;
+        if let Some(idx) = self.sessions.iter().position(|s| s.id == session_id) {
+            self.remove_session(idx);
         }
     }
 
@@ -199,6 +249,117 @@ impl App {
                     && matches!(session.state, SessionState::Running | SessionState::Thinking)
                 {
                     session.state = SessionState::Ready;
+                }
+            }
+            if matches!(session.kind, SessionKind::Claude | SessionKind::Codex) {
+                let text = extract_screen_text(&session.screen);
+                if !session.pro_sub && text.contains("Claude Pro") {
+                    session.pro_sub = true;
+                }
+                if !session.pro_sub {
+                    if let Some(stats) = self.matcher.parse_screen_stats(&text) {
+                        session.stats = stats;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Mouse handling ─────────────────────────────────────────────────────
+
+    pub fn handle_mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let col = ev.column;
+        let row = ev.row;
+
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Session bar click → switch session
+                for (i, slot) in self.session_slot_areas.iter().enumerate() {
+                    if rect_hit(*slot, col, row) {
+                        self.switch_to(i);
+                        self.selection = None;
+                        return;
+                    }
+                }
+                // Output area click → begin selection
+                if rect_inner_hit(self.output_area, col, row) {
+                    let (c, r) = to_content_coords(self.output_area, col, row);
+                    self.selection = Some(Selection {
+                        start_col: c, start_row: r,
+                        end_col:   c, end_row:   r,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if rect_inner_hit(self.output_area, col, row) {
+                    let (c, r) = to_content_coords(self.output_area, col, row);
+                    if let Some(sel) = &mut self.selection {
+                        sel.end_col = c;
+                        sel.end_row = r;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Finalize selection; auto-copy to clipboard
+                if let Some(sel) = &self.selection {
+                    let ((mr, mc), (er, ec)) = sel.normalized();
+                    // Don't keep a zero-area click as a selection
+                    if mr == er && mc == ec {
+                        self.selection = None;
+                    } else {
+                        self.copy_selection();
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click copies current selection (or clears it)
+                if self.selection.is_some() {
+                    self.copy_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        let session = self.active_session()?;
+        let screen = session.screen.screen();
+        let (screen_rows, screen_cols) = screen.size();
+        let display_rows = self.output_area.height.saturating_sub(2) as u16;
+        let start_vt_row = screen_rows.saturating_sub(display_rows);
+
+        let ((min_row, min_col), (max_row, max_col)) = sel.normalized();
+
+        let mut text = String::new();
+        for disp_row in min_row..=max_row {
+            let vt_row = start_vt_row + disp_row;
+            let col_start = if disp_row == min_row { min_col } else { 0 };
+            let col_end   = if disp_row == max_row { max_col } else { screen_cols.saturating_sub(1) };
+            let mut row_text = String::new();
+            for col in col_start..=col_end {
+                if let Some(cell) = screen.cell(vt_row, col) {
+                    let s = cell.contents();
+                    row_text.push_str(if s.is_empty() { " " } else { &s });
+                }
+            }
+            if disp_row < max_row {
+                text.push_str(row_text.trim_end());
+                text.push('\n');
+            } else {
+                text.push_str(row_text.trim_end());
+            }
+        }
+        Some(text)
+    }
+
+    fn copy_selection(&self) {
+        if let Some(text) = self.selected_text() {
+            if !text.is_empty() {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
                 }
             }
         }
@@ -305,11 +466,9 @@ impl App {
             }
             ["kill"] => self.kill_active_session(),
             ["kill", n] => {
-                if let Ok(idx) = n.parse::<usize>() {
-                    if idx >= 1 && idx <= self.sessions.len() {
-                        let i = idx - 1;
-                        self.sessions[i].pty_writer = None;
-                        self.sessions[i].state = SessionState::Dead;
+                if let Ok(num) = n.parse::<usize>() {
+                    if num >= 1 && num <= self.sessions.len() {
+                        self.remove_session(num - 1);
                     }
                 }
             }
@@ -339,11 +498,16 @@ async fn run_pty(
 
     let pty = pty_process::Pty::new()?;
     pty.resize(pty_process::Size::new(PTY_ROWS, PTY_COLS))?;
-    let pts = pty.pts()?;
 
-    let mut command = pty_process::Command::new(&cmd);
-    command.current_dir(&cwd);
-    let _child = command.spawn(&pts)?;
+    // Spawn the child then immediately drop pts so the parent holds no reference
+    // to the slave FD. Without this, reading the master never returns EIO after
+    // the child exits — SessionDied would never fire.
+    let _child = {
+        let pts = pty.pts()?;
+        let mut command = pty_process::Command::new(&cmd);
+        command.current_dir(&cwd);
+        command.spawn(&pts)?
+    };
 
     let (read_half, mut write_half) = pty.into_split();
 
@@ -437,6 +601,38 @@ fn split_pty_lines(s: &str) -> (Vec<String>, String) {
     (lines, current)
 }
 
+
+fn rect_hit(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
+fn rect_inner_hit(r: Rect, col: u16, row: u16) -> bool {
+    col > r.x && col < r.x + r.width.saturating_sub(1) &&
+    row > r.y && row < r.y + r.height.saturating_sub(1)
+}
+
+/// Convert absolute terminal coords to (content_col, content_row) inside a bordered rect.
+fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
+    let c = col.saturating_sub(area.x + 1).min(area.width.saturating_sub(2));
+    let r = row.saturating_sub(area.y + 1).min(area.height.saturating_sub(2));
+    (c, r)
+}
+
+fn extract_screen_text(parser: &VtParser) -> String {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let mut text = String::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                let s = cell.contents();
+                text.push_str(if s.is_empty() { " " } else { &s });
+            }
+        }
+        text.push('\n');
+    }
+    text
+}
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

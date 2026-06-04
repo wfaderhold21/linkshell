@@ -6,8 +6,16 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, NewSessionField};
+use crate::app::{App, AppMode, NewSessionField, Selection};
 use crate::session::{SessionKind, SessionState};
+use vt100::Screen;
+
+#[derive(Default)]
+pub struct LayoutInfo {
+    pub output_area: Rect,
+    pub session_bar_area: Rect,
+    pub session_slot_areas: Vec<Rect>,
+}
 
 /// Strip ANSI/VT escape sequences and prepare a line for safe ratatui rendering.
 ///
@@ -91,7 +99,7 @@ fn state_border_style(state: &SessionState, active: bool) -> Style {
     base
 }
 
-pub fn draw(f: &mut Frame<'_>, app: &App) {
+pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let size = f.size();
 
     // ── Top-level vertical split ───────────────────────────────────────────
@@ -107,24 +115,32 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
         .split(size);
 
     draw_main_output(f, app, chunks[0]);
-    draw_session_bar(f, app, chunks[1]);
+    let slot_areas = draw_session_bar(f, app, chunks[1]);
     draw_status_panel(f, app, chunks[2]);
 
     // ── Overlays ───────────────────────────────────────────────────────────
     match &app.mode {
         AppMode::NewSession => draw_new_session_dialog(f, app, size),
         AppMode::CommandBar => draw_command_bar(f, app, size),
+        AppMode::Help       => draw_help(f, size),
         AppMode::Normal     => {}
+    }
+
+    LayoutInfo {
+        output_area:        chunks[0],
+        session_bar_area:   chunks[1],
+        session_slot_areas: slot_areas,
     }
 }
 
 // ── Main output zone ───────────────────────────────────────────────────────
 
 fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let (title, lines, border_style) = if let Some(session) = app.active_session() {
+    let (title, lines, border_style) = if let Some(idx) = app.active_idx {
+        let session = &app.sessions[idx];
         let title = format!(
             " {} [{}] {} ",
-            session.id + 1,
+            idx + 1,
             session.kind.label().to_uppercase(),
             session.name
         );
@@ -132,16 +148,12 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         let (screen_rows, screen_cols) = screen.size();
         let display_rows = area.height.saturating_sub(2) as u16;
         let start_row = screen_rows.saturating_sub(display_rows);
+        let sel = app.selection.as_ref();
         let items: Vec<ListItem> = (start_row..screen_rows)
-            .map(|row| {
-                let mut content = String::new();
-                for col in 0..screen_cols {
-                    if let Some(cell) = screen.cell(row, col) {
-                        let s = cell.contents();
-                        content.push_str(if s.is_empty() { " " } else { &s });
-                    }
-                }
-                ListItem::new(Line::from(content.trim_end().to_string()))
+            .enumerate()
+            .map(|(disp_row, vt_row)| {
+                let disp_row = disp_row as u16;
+                build_row(screen, vt_row, screen_cols, disp_row, sel)
             })
             .collect();
         let style = state_border_style(&session.state, true);
@@ -150,7 +162,7 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         let items = vec![ListItem::new(Line::from(
             " No sessions. Press alt-n to create one.",
         ))];
-        (" agentui ".to_string(), items, Style::default().fg(Color::DarkGray))
+        (" linkshell ".to_string(), items, Style::default().fg(Color::DarkGray))
     };
 
     let block = Block::default()
@@ -164,7 +176,7 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 // ── Session bar ────────────────────────────────────────────────────────────
 
-fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let n = app.sessions.len();
 
     // outer block
@@ -173,7 +185,7 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(outer, area);
 
     if n == 0 {
-        return;
+        return vec![];
     }
 
     // inner area (remove outer border)
@@ -230,6 +242,13 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
         f.render_widget(para, slot);
     }
+
+    (0..n).map(|i| Rect {
+        x: offset_x + i as u16 * slot_w,
+        y: inner.y,
+        width: slot_w,
+        height: inner.height,
+    }).collect()
 }
 
 // ── Status panel ───────────────────────────────────────────────────────────
@@ -271,7 +290,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
         let elapsed = session.elapsed_display();
 
         let spans = vec![
-            Span::styled(format!(" {:1} ", session.id + 1), num_style),
+            Span::styled(format!(" {:1} ", i + 1), num_style),
             Span::raw("│ "),
             Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
             Span::raw("│ "),
@@ -386,6 +405,57 @@ fn draw_input_field(f: &mut Frame<'_>, label: &str, value: &str, area: Rect, act
     f.render_widget(p, area);
 }
 
+// ── Help overlay ───────────────────────────────────────────────────────────
+
+fn draw_help(f: &mut Frame<'_>, area: Rect) {
+    const BINDINGS: &[(&str, &str)] = &[
+        ("alt-n",          "New session dialog"),
+        ("alt-tab",        "Next session"),
+        ("alt-shift-tab",  "Previous session"),
+        ("alt-1 … alt-8",  "Switch to session by number"),
+        ("alt-← / alt-→",  "Cycle sessions"),
+        ("alt-x",          "Kill active session"),
+        ("alt-c",          "Open command bar"),
+        ("alt-h",          "Show this help"),
+        ("ctrl-q",         "Quit"),
+        ("esc",            "Dismiss overlay"),
+    ];
+
+    let height = BINDINGS.len() as u16 + 4; // borders + title + footer
+    let popup = centered_rect(52, height, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Keyboard Shortcuts ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let key_style   = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let desc_style  = Style::default().fg(Color::White);
+    let sep_style   = Style::default().fg(Color::DarkGray);
+
+    let rows: Vec<ListItem> = BINDINGS.iter().map(|(key, desc)| {
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("  {:<18}", key), key_style),
+            Span::styled("│  ", sep_style),
+            Span::styled(*desc, desc_style),
+        ]))
+    }).collect();
+
+    let list = List::new(rows);
+    f.render_widget(list, inner);
+
+    let footer = Paragraph::new(" press any key to close ")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(
+        footer,
+        Rect { x: inner.x, y: popup.y + popup.height - 2, width: inner.width, height: 1 },
+    );
+}
+
 // ── Command bar ────────────────────────────────────────────────────────────
 
 fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
@@ -402,6 +472,45 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Build one display row, applying selection highlight where applicable.
+fn build_row(
+    screen: &Screen,
+    vt_row: u16,
+    screen_cols: u16,
+    disp_row: u16,
+    sel: Option<&Selection>,
+) -> ListItem<'static> {
+    let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut in_sel = false;
+
+    for col in 0..screen_cols {
+        let cell_sel = sel.map_or(false, |s| s.contains(disp_row, col));
+        let content = screen.cell(vt_row, col)
+            .map(|c| { let s = c.contents(); if s.is_empty() { " ".to_string() } else { s } })
+            .unwrap_or_else(|| " ".to_string());
+
+        if cell_sel != in_sel {
+            if !run.is_empty() {
+                spans.push(Span::styled(run.clone(), if in_sel { sel_style } else { Style::default() }));
+                run.clear();
+            }
+            in_sel = cell_sel;
+        }
+        run.push_str(&content);
+    }
+
+    // Trim trailing spaces only when there's no trailing selection
+    let trimmed = if in_sel { run } else { run.trim_end().to_string() };
+    if !trimmed.is_empty() {
+        spans.push(Span::styled(trimmed, if in_sel { sel_style } else { Style::default() }));
+    }
+
+    ListItem::new(Line::from(spans))
+}
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let w = r.width * percent_x / 100;

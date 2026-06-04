@@ -7,7 +7,7 @@ mod ui;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,22 +22,26 @@ use events::AppEvent;
 async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
     let mut app = App::new(tx.clone());
 
-    // Key reader task
+    // Input reader task — forwards key and mouse events
     let key_tx = tx.clone();
     tokio::spawn(async move {
         loop {
             if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key_tx.send(AppEvent::Key(key)).await.is_err() {
-                        break;
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if key_tx.send(AppEvent::Key(key)).await.is_err() { break; }
                     }
+                    Ok(Event::Mouse(mouse)) => {
+                        if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() { break; }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -56,7 +60,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        let mut layout = ui::LayoutInfo::default();
+        terminal.draw(|f| { layout = ui::draw(f, &app); })?;
+        app.output_area        = layout.output_area;
+        app.session_bar_area   = layout.session_bar_area;
+        app.session_slot_areas = layout.session_slot_areas;
 
         if let Some(event) = rx.recv().await {
             handle_event(&mut app, event);
@@ -68,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     Ok(())
@@ -92,7 +100,8 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::SessionDied { session_id } => {
             app.handle_session_died(session_id);
         }
-        AppEvent::Key(key) => handle_key(app, key),
+        AppEvent::Key(key)   => handle_key(app, key),
+        AppEvent::Mouse(ev)  => app.handle_mouse(ev),
     }
 }
 
@@ -128,12 +137,16 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     _ => {}
                 }
             }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Tab {
+            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Tab {
                 app.next_session();
                 return;
             }
-            if key.modifiers == KeyModifiers::SHIFT && key.code == KeyCode::BackTab {
+            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::BackTab {
                 app.prev_session();
+                return;
+            }
+            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('h') {
+                app.mode = AppMode::Help;
                 return;
             }
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
@@ -199,6 +212,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 KeyCode::Char(c) => { app.command_input_char(c); }
                 _ => {}
             }
+        }
+
+        AppMode::Help => {
+            app.mode = AppMode::Normal; // any key dismisses
         }
     }
 }

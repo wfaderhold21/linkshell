@@ -75,6 +75,7 @@ pub struct Session {
     /// vt100 screen buffer — updated with raw PTY bytes, used for display
     pub screen: vt100::Parser,
     pub stats: TokenStats,
+    pub pro_sub: bool,
     pub started_at: Instant,
     pub last_output_at: Option<Instant>,
     pub cwd: String,
@@ -91,6 +92,7 @@ impl Session {
             state: SessionState::Starting,
             screen: vt100::Parser::new(PTY_ROWS, PTY_COLS, 1000),
             stats: TokenStats::default(),
+            pro_sub: false,
             started_at: Instant::now(),
             last_output_at: None,
             cwd,
@@ -117,7 +119,9 @@ impl Session {
     }
 
     pub fn cost_display(&self) -> String {
-        if self.stats.total_cost_usd == 0.0 {
+        if self.pro_sub {
+            "Pro".to_string()
+        } else if self.stats.total_cost_usd == 0.0 {
             "—".to_string()
         } else {
             format!("${:.3}", self.stats.total_cost_usd)
@@ -126,7 +130,9 @@ impl Session {
 
     pub fn tokens_display(&self) -> String {
         let total = self.stats.input_tokens + self.stats.output_tokens;
-        if total == 0 {
+        if self.pro_sub {
+            "—".to_string()
+        } else if total == 0 {
             "—".to_string()
         } else if total >= 1000 {
             format!("{:.1}k tok", total as f64 / 1000.0)
