@@ -149,11 +149,13 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         let display_rows = area.height.saturating_sub(2) as u16;
         let start_row = screen_rows.saturating_sub(display_rows);
         let sel = app.selection.as_ref();
+        let cursor = screen.cursor_position();
         let items: Vec<ListItem> = (start_row..screen_rows)
             .enumerate()
             .map(|(disp_row, vt_row)| {
                 let disp_row = disp_row as u16;
-                build_row(screen, vt_row, screen_cols, disp_row, sel)
+                let cursor_col = if vt_row == cursor.0 { Some(cursor.1) } else { None };
+                build_row(screen, vt_row, screen_cols, disp_row, sel, cursor_col)
             })
             .collect();
         let style = state_border_style(&session.state, true);
@@ -473,40 +475,77 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/// Build one display row, applying selection highlight where applicable.
+fn vt100_color(c: vt100::Color) -> Option<Color> {
+    match c {
+        vt100::Color::Default      => None,
+        vt100::Color::Idx(n)       => Some(Color::Indexed(n)),
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut s = Style::default();
+    if let Some(fg) = vt100_color(cell.fgcolor()) { s = s.fg(fg); }
+    if let Some(bg) = vt100_color(cell.bgcolor()) { s = s.bg(bg); }
+    if cell.bold()      { s = s.add_modifier(Modifier::BOLD); }
+    if cell.italic()    { s = s.add_modifier(Modifier::ITALIC); }
+    if cell.underline() { s = s.add_modifier(Modifier::UNDERLINED); }
+    if cell.inverse()   { s = s.add_modifier(Modifier::REVERSED); }
+    s
+}
+
+/// Build one display row, applying per-cell colors, selection highlight, and cursor.
 fn build_row(
     screen: &Screen,
     vt_row: u16,
     screen_cols: u16,
     disp_row: u16,
     sel: Option<&Selection>,
+    cursor_col: Option<u16>,
 ) -> ListItem<'static> {
-    let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
+    let sel_style    = Style::default().bg(Color::Blue).fg(Color::White);
+    let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();
-    let mut in_sel = false;
+    let mut cur_style: Option<Style> = None;
 
     for col in 0..screen_cols {
-        let cell_sel = sel.map_or(false, |s| s.contains(disp_row, col));
-        let content = screen.cell(vt_row, col)
-            .map(|c| { let s = c.contents(); if s.is_empty() { " ".to_string() } else { s } })
-            .unwrap_or_else(|| " ".to_string());
+        let is_sel    = sel.map_or(false, |s| s.contains(disp_row, col));
+        let is_cursor = cursor_col == Some(col);
+        let (content, style) = match screen.cell(vt_row, col) {
+            Some(cell) => {
+                let s = cell.contents();
+                let content = if s.is_empty() { " ".to_string() } else { s };
+                let style = if is_sel {
+                    sel_style
+                } else if is_cursor {
+                    cursor_style
+                } else {
+                    cell_style(cell)
+                };
+                (content, style)
+            }
+            None => {
+                let style = if is_cursor { cursor_style } else { Style::default() };
+                (" ".to_string(), style)
+            }
+        };
 
-        if cell_sel != in_sel {
+        if Some(style) != cur_style {
             if !run.is_empty() {
-                spans.push(Span::styled(run.clone(), if in_sel { sel_style } else { Style::default() }));
+                spans.push(Span::styled(run.clone(), cur_style.unwrap_or_default()));
                 run.clear();
             }
-            in_sel = cell_sel;
+            cur_style = Some(style);
         }
         run.push_str(&content);
     }
 
-    // Trim trailing spaces only when there's no trailing selection
-    let trimmed = if in_sel { run } else { run.trim_end().to_string() };
+    let final_style = cur_style.unwrap_or_default();
+    let trimmed = if final_style == sel_style { run } else { run.trim_end().to_string() };
     if !trimmed.is_empty() {
-        spans.push(Span::styled(trimmed, if in_sel { sel_style } else { Style::default() }));
+        spans.push(Span::styled(trimmed, final_style));
     }
 
     ListItem::new(Line::from(spans))
