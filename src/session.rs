@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 pub const MAX_SESSIONS: usize = 8;
-pub const RING_BUFFER_LINES: usize = 1000;
+pub const PTY_ROWS: u16 = 40;
+pub const PTY_COLS: u16 = 200;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionKind {
@@ -72,7 +72,8 @@ pub struct Session {
     pub name: String,
     pub kind: SessionKind,
     pub state: SessionState,
-    pub output: VecDeque<String>,
+    /// vt100 screen buffer — updated with raw PTY bytes, used for display
+    pub screen: vt100::Parser,
     pub stats: TokenStats,
     pub started_at: Instant,
     pub last_output_at: Option<Instant>,
@@ -88,7 +89,7 @@ impl Session {
             name,
             kind,
             state: SessionState::Starting,
-            output: VecDeque::with_capacity(RING_BUFFER_LINES),
+            screen: vt100::Parser::new(PTY_ROWS, PTY_COLS, 1000),
             stats: TokenStats::default(),
             started_at: Instant::now(),
             last_output_at: None,
@@ -97,12 +98,9 @@ impl Session {
         }
     }
 
-    pub fn push_line(&mut self, line: String) {
+    pub fn process_bytes(&mut self, data: &[u8]) {
         self.last_output_at = Some(Instant::now());
-        if self.output.len() >= RING_BUFFER_LINES {
-            self.output.pop_front();
-        }
-        self.output.push_back(line);
+        self.screen.process(data);
     }
 
     pub fn elapsed_secs(&self) -> u64 {

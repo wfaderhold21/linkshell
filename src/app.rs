@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::events::AppEvent;
 use crate::patterns::PatternMatcher;
-use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS};
+use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_ROWS, PTY_COLS};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NewSessionField {
@@ -159,6 +159,12 @@ impl App {
         }
     }
 
+    pub fn handle_session_bytes(&mut self, session_id: usize, data: Vec<u8>) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.process_bytes(&data);
+        }
+    }
+
     pub fn handle_session_output(&mut self, session_id: usize, line: String) {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             let stripped = strip_ansi(&line);
@@ -168,7 +174,15 @@ impl App {
             if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                 session.stats = stats;
             }
-            session.push_line(line);
+        }
+    }
+
+    pub fn handle_session_current_line(&mut self, session_id: usize, text: String) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            let stripped = strip_ansi(&text);
+            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+                session.state = new_state;
+            }
         }
     }
 
@@ -321,10 +335,10 @@ async fn run_pty(
     cwd: String,
     tx: mpsc::Sender<AppEvent>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
 
     let pty = pty_process::Pty::new()?;
-    pty.resize(pty_process::Size::new(40, 200))?;
+    pty.resize(pty_process::Size::new(PTY_ROWS, PTY_COLS))?;
     let pts = pty.pts()?;
 
     let mut command = pty_process::Command::new(&cmd);
@@ -351,33 +365,78 @@ async fn run_pty(
         }
     });
 
-    // Reader: forward lines to event loop
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    // Reader: split PTY output into lines, handling \r\n, \n, and bare \r.
+    // Bare \r (carriage return without \n) means "overwrite current line" — used
+    // by spinners and progress bars. Partial lines (prompts without \n) are sent
+    // as SessionCurrentLine so they appear without creating a new buffer entry.
+    use tokio::io::AsyncReadExt;
+    let mut reader = read_half;
+    let mut buf = [0u8; 4096];
+    let mut pending = String::new();
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = line
-                    .trim_end_matches('\n')
-                    .trim_end_matches('\r')
-                    .to_string();
-                if tx.send(AppEvent::SessionOutput {
-                    session_id,
-                    line: trimmed,
-                }).await.is_err() {
-                    break;
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            reader.read(&mut buf),
+        ).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                let data = buf[..n].to_vec();
+                // Raw bytes → vt100 screen buffer for display
+                if tx.send(AppEvent::SessionBytes { session_id, data: data.clone() }).await.is_err() {
+                    return Ok(());
+                }
+                // Line splitting → state inference only
+                pending.push_str(&String::from_utf8_lossy(&data));
+                let (complete, partial) = split_pty_lines(&pending);
+                pending = partial;
+                for line in complete {
+                    if tx.send(AppEvent::SessionOutput { session_id, line }).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
-            Err(_) => break,
+            Ok(Err(_)) => break,
+            // Timeout: update current-line display without adding to the line buffer
+            Err(_) => {
+                if tx.send(AppEvent::SessionCurrentLine {
+                    session_id,
+                    text: pending.clone(),
+                }).await.is_err() {
+                    return Ok(());
+                }
+            }
         }
     }
 
     let _ = tx.send(AppEvent::SessionDied { session_id }).await;
     Ok(())
 }
+
+/// Split PTY bytes into complete lines and a leftover partial.
+/// Handles \r\n (line end), \n (line end), and bare \r (carriage return —
+/// overwrite current line). A trailing \r is deferred until the next chunk
+/// so we can tell whether it's \r\n or a bare CR.
+fn split_pty_lines(s: &str) -> (Vec<String>, String) {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                match chars.peek() {
+                    Some('\n') => { chars.next(); lines.push(std::mem::take(&mut current)); }
+                    Some(_)    => { current.clear(); } // bare CR: overwrite
+                    None       => { current.push('\r'); } // defer until next chunk
+                }
+            }
+            '\n' => lines.push(std::mem::take(&mut current)),
+            _    => current.push(c),
+        }
+    }
+    (lines, current)
+}
+
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

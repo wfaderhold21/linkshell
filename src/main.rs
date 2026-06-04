@@ -77,8 +77,14 @@ async fn main() -> anyhow::Result<()> {
 fn handle_event(app: &mut App, event: AppEvent) {
     match event {
         AppEvent::Tick => app.handle_tick(),
+        AppEvent::SessionBytes { session_id, data } => {
+            app.handle_session_bytes(session_id, data);
+        }
         AppEvent::SessionOutput { session_id, line } => {
             app.handle_session_output(session_id, line);
+        }
+        AppEvent::SessionCurrentLine { session_id, text } => {
+            app.handle_session_current_line(session_id, text);
         }
         AppEvent::SessionWriter { session_id, writer_tx } => {
             app.handle_session_writer(session_id, writer_tx);
@@ -121,6 +127,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     KeyCode::Right => { app.next_session(); return; }
                     _ => {}
                 }
+            }
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Tab {
+                app.next_session();
+                return;
+            }
+            if key.modifiers == KeyModifiers::SHIFT && key.code == KeyCode::BackTab {
+                app.prev_session();
+                return;
             }
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
                 app.should_quit = true;

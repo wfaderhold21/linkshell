@@ -9,6 +9,62 @@ use ratatui::{
 use crate::app::{App, AppMode, NewSessionField};
 use crate::session::{SessionKind, SessionState};
 
+/// Strip ANSI/VT escape sequences and prepare a line for safe ratatui rendering.
+///
+/// If raw escape sequences reach ratatui they get forwarded to the terminal,
+/// where the terminal interprets them (e.g. \x1b[2J clears the screen mid-draw).
+/// This strips CSI, OSC, and other escape sequences, expands tabs, and drops
+/// remaining non-printable control characters.
+fn prepare_display(s: &str) -> String {
+    // Phase 1: strip escape sequences
+    let mut stripped = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            stripped.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // CSI — consume parameter + intermediate bytes, then final byte (0x40–0x7E)
+                for nc in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&nc) { break; }
+                }
+            }
+            Some(']') => {
+                // OSC — consume until BEL or ST (ESC \)
+                loop {
+                    match chars.next() {
+                        Some('\x07') | None => break,
+                        Some('\x1b') => { chars.next(); break; }
+                        _ => {}
+                    }
+                }
+            }
+            Some('(') | Some(')') | Some('*') | Some('+') => {
+                chars.next(); // charset designation: skip one more char
+            }
+            _ => {} // other two-char sequences: already consumed
+        }
+    }
+
+    // Phase 2: expand tabs, drop remaining control chars
+    let mut out = String::with_capacity(stripped.len());
+    let mut col: usize = 0;
+    for c in stripped.chars() {
+        match c {
+            '\t' => {
+                let spaces = 8 - (col % 8);
+                for _ in 0..spaces { out.push(' '); }
+                col += spaces;
+            }
+            c if (c as u32) < 0x20 || c == '\x7f' => {} // drop control chars
+            c => { out.push(c); col += 1; }
+        }
+    }
+    out
+}
+
 // ── Brand colours ──────────────────────────────────────────────────────────
 const CLAUDE_COLOR: Color = Color::Rgb(255, 140, 0);  // orange
 const CODEX_COLOR:  Color = Color::Rgb(64, 128, 255); // blue
@@ -72,10 +128,21 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
             session.kind.label().to_uppercase(),
             session.name
         );
-        let items: Vec<ListItem> = session
-            .output
-            .iter()
-            .map(|l| ListItem::new(Line::from(l.as_str())))
+        let screen = session.screen.screen();
+        let (screen_rows, screen_cols) = screen.size();
+        let display_rows = area.height.saturating_sub(2) as u16;
+        let start_row = screen_rows.saturating_sub(display_rows);
+        let items: Vec<ListItem> = (start_row..screen_rows)
+            .map(|row| {
+                let mut content = String::new();
+                for col in 0..screen_cols {
+                    if let Some(cell) = screen.cell(row, col) {
+                        let s = cell.contents();
+                        content.push_str(if s.is_empty() { " " } else { &s });
+                    }
+                }
+                ListItem::new(Line::from(content.trim_end().to_string()))
+            })
             .collect();
         let style = state_border_style(&session.state, true);
         (title, items, style)
