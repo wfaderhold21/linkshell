@@ -222,7 +222,7 @@ impl App {
                 session.state = new_state;
             }
             if let Some(stats) = self.matcher.parse_tokens(&stripped) {
-                session.stats = stats;
+                session.merge_stats(stats);
             }
         }
     }
@@ -258,7 +258,7 @@ impl App {
                 }
                 if !session.pro_sub {
                     if let Some(stats) = self.matcher.parse_screen_stats(&text) {
-                        session.stats = stats;
+                        session.merge_stats(stats);
                     }
                 }
             }

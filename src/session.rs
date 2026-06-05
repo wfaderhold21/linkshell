@@ -141,6 +141,20 @@ impl Session {
         }
     }
 
+    /// Update stats only if the new observation is strictly better than what we
+    /// already know. Both per-turn cost lines and screen-scraped values can be
+    /// partial; /cost always produces the true cumulative total which will be
+    /// larger, so it naturally wins this comparison.
+    pub fn merge_stats(&mut self, new: TokenStats) {
+        let new_tokens  = new.input_tokens + new.output_tokens;
+        let cur_tokens  = self.stats.input_tokens + self.stats.output_tokens;
+        if new.total_cost_usd > self.stats.total_cost_usd
+            || (new.total_cost_usd == self.stats.total_cost_usd && new_tokens > cur_tokens)
+        {
+            self.stats = new;
+        }
+    }
+
     /// Non-blocking send to PTY; silently drops if channel is full or closed
     pub fn write_bytes(&self, data: Vec<u8>) {
         if let Some(tx) = &self.pty_writer {
