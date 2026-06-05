@@ -225,8 +225,11 @@ impl App {
             if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
                 session.state = new_state;
             }
-            if let Some(stats) = self.matcher.parse_tokens(&stripped) {
-                session.accumulate_stats(stats);
+            // Claude stats come from the JSONL watcher (SessionStats events); skip here.
+            if !matches!(session.kind, SessionKind::Claude) {
+                if let Some(stats) = self.matcher.parse_tokens(&stripped) {
+                    session.accumulate_stats(stats);
+                }
             }
         }
     }
@@ -266,7 +269,8 @@ impl App {
                 if !session.pro_sub && text.contains("Claude Pro") {
                     session.pro_sub = true;
                 }
-                if !session.pro_sub {
+                // Claude stats come from the JSONL watcher; only use screen scraping for Codex.
+                if !session.pro_sub && !matches!(session.kind, SessionKind::Claude) {
                     if let Some(stats) = self.matcher.parse_screen_stats(&text) {
                         session.apply_reported_total(stats);
                     }
