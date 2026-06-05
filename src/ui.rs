@@ -336,8 +336,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) {
     let ns = &app.new_session_state;
     let block = Block::default()
         .title(" New Session ")
-        .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
+        .borders(Borders::ALL);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -411,7 +410,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_input_field(f: &mut Frame<'_>, label: &str, value: &str, area: Rect, active: bool) {
     let style = if active {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -446,13 +445,12 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) {
 
     let block = Block::default()
         .title(" Keyboard Shortcuts ")
-        .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
+        .borders(Borders::ALL);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let key_style   = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let desc_style  = Style::default().fg(Color::White);
+    let desc_style  = Style::default();
     let sep_style   = Style::default().fg(Color::DarkGray);
 
     let rows: Vec<ListItem> = BINDINGS.iter().map(|(key, desc)| {

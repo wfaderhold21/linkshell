@@ -230,8 +230,10 @@ impl App {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&line);
             session.push_output_line(stripped.clone());
-            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
-                session.state = new_state;
+            if !session.ipc_state {
+                if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+                    session.state = new_state;
+                }
             }
             // Claude stats come from the JSONL watcher (SessionStats events); skip here.
             if !matches!(session.kind, SessionKind::Claude) {
@@ -277,8 +279,10 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&text);
-            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
-                session.state = new_state;
+            if !session.ipc_state {
+                if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+                    session.state = new_state;
+                }
             }
             state_after = Some(session.state.clone());
         }
@@ -302,6 +306,7 @@ impl App {
             .map(|s| s.state.clone());
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.state = state.clone();
+            session.ipc_state = true;
         }
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
@@ -324,12 +329,14 @@ impl App {
         let mut tick_ready: Vec<usize> = Vec::new();
 
         for session in self.sessions.iter_mut() {
-            if let Some(last) = session.last_output_at {
-                if last.elapsed() > Duration::from_secs(2)
-                    && matches!(session.state, SessionState::Running | SessionState::Thinking)
-                {
-                    session.state = SessionState::Ready;
-                    tick_ready.push(session.id);
+            if !session.ipc_state {
+                if let Some(last) = session.last_output_at {
+                    if last.elapsed() > Duration::from_secs(2)
+                        && matches!(session.state, SessionState::Running | SessionState::Thinking)
+                    {
+                        session.state = SessionState::Ready;
+                        tick_ready.push(session.id);
+                    }
                 }
             }
             if matches!(session.kind, SessionKind::Claude | SessionKind::Codex) {

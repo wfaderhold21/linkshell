@@ -69,8 +69,9 @@ fn parse_usage(line: &str) -> Option<TokenStats> {
     let cache_read  = get("cache_read_input_tokens");
     let output      = get("output_tokens");
 
-    let input_tokens  = input + cache_write + cache_read;
-    let output_tokens = output;
+    let input_tokens   = input + cache_write + cache_read;
+    let output_tokens  = output;
+    let context_tokens = input + cache_write + cache_read; // total input for this call
 
     if input_tokens == 0 && output_tokens == 0 {
         return None;
@@ -82,7 +83,7 @@ fn parse_usage(line: &str) -> Option<TokenStats> {
              + (cache_read  as f64 / 1_000_000.0) *  0.30   // cache read
              + (output      as f64 / 1_000_000.0) * 15.00;  // output
 
-    Some(TokenStats { input_tokens, output_tokens, total_cost_usd: cost })
+    Some(TokenStats { input_tokens, output_tokens, total_cost_usd: cost, context_tokens })
 }
 
 /// Tail a JSONL file from `offset`, accumulating token stats into `total`.
@@ -113,9 +114,10 @@ async fn tail(
                         Ok(n) => {
                             offset += n as u64;
                             if let Some(delta) = parse_usage(&line) {
-                                total.input_tokens  += delta.input_tokens;
-                                total.output_tokens += delta.output_tokens;
+                                total.input_tokens   += delta.input_tokens;
+                                total.output_tokens  += delta.output_tokens;
                                 total.total_cost_usd += delta.total_cost_usd;
+                                total.context_tokens  = delta.context_tokens; // latest, not cumulative
                                 new_data = true;
                             }
                         }

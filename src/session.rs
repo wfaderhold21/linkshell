@@ -75,6 +75,9 @@ pub struct Session {
     pub name: String,
     pub kind: SessionKind,
     pub state: SessionState,
+    /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
+    /// Cleared when pattern matching updates the state from PTY output.
+    pub ipc_state: bool,
     /// vt100 screen buffer — updated with raw PTY bytes, used for display
     pub screen: vt100::Parser,
     pub stats: TokenStats,
@@ -95,6 +98,7 @@ impl Session {
             name,
             kind,
             state: SessionState::Starting,
+            ipc_state: false,
             screen: vt100::Parser::new(PTY_ROWS, PTY_COLS, 1000),
             stats: TokenStats::default(),
             pro_sub: false,

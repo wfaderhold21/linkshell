@@ -49,14 +49,14 @@ async fn handle_connection(
     }
 }
 
-async fn dispatch(msg: &serde_json::Value, tx: &mpsc::Sender<AppEvent>, session_id: usize) {
+async fn dispatch(msg: &serde_json::Value, tx: &mpsc::Sender<AppEvent>, default_session_id: usize) {
+    let session_id = msg["session_id"].as_u64().map(|v| v as usize).unwrap_or(default_session_id);
     match msg["type"].as_str() {
         Some("state") => {
             let state = parse_state(msg["state"].as_str().unwrap_or(""));
             if let Some(s) = state {
                 let _ = tx.send(AppEvent::IpcStateOverride { session_id, state: s }).await;
             }
-            // Optional detail line shown as output
             if let Some(detail) = msg["detail"].as_str() {
                 let _ = tx.send(AppEvent::SessionOutput {
                     session_id,
