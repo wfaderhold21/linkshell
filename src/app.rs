@@ -150,6 +150,10 @@ impl App {
         let tx = self.event_tx.clone();
         let cmd_str = kind.command();
 
+        if matches!(kind, SessionKind::Claude) {
+            crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone());
+        }
+
         tokio::spawn(async move {
             if let Err(e) = run_pty(id, cmd_str, cwd, tx.clone()).await {
                 let _ = tx.send(AppEvent::SessionOutput {
@@ -222,7 +226,7 @@ impl App {
                 session.state = new_state;
             }
             if let Some(stats) = self.matcher.parse_tokens(&stripped) {
-                session.merge_stats(stats);
+                session.accumulate_stats(stats);
             }
         }
     }
@@ -233,6 +237,12 @@ impl App {
             if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
                 session.state = new_state;
             }
+        }
+    }
+
+    pub fn handle_session_stats(&mut self, session_id: usize, stats: crate::session::TokenStats) {
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            s.stats = stats;
         }
     }
 
@@ -258,7 +268,7 @@ impl App {
                 }
                 if !session.pro_sub {
                     if let Some(stats) = self.matcher.parse_screen_stats(&text) {
-                        session.merge_stats(stats);
+                        session.apply_reported_total(stats);
                     }
                 }
             }

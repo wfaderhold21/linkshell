@@ -141,16 +141,20 @@ impl Session {
         }
     }
 
-    /// Update stats only if the new observation is strictly better than what we
-    /// already know. Both per-turn cost lines and screen-scraped values can be
-    /// partial; /cost always produces the true cumulative total which will be
-    /// larger, so it naturally wins this comparison.
-    pub fn merge_stats(&mut self, new: TokenStats) {
-        let new_tokens  = new.input_tokens + new.output_tokens;
-        let cur_tokens  = self.stats.input_tokens + self.stats.output_tokens;
-        if new.total_cost_usd > self.stats.total_cost_usd
-            || (new.total_cost_usd == self.stats.total_cost_usd && new_tokens > cur_tokens)
-        {
+    /// Accumulate per-turn stats into the running session total.
+    /// Called once per completed output line; each turn contributes its own
+    /// cost and token counts additively.
+    pub fn accumulate_stats(&mut self, new: TokenStats) {
+        self.stats.input_tokens  += new.input_tokens;
+        self.stats.output_tokens += new.output_tokens;
+        self.stats.total_cost_usd += new.total_cost_usd;
+    }
+
+    /// Replace stats with an authoritative total (e.g. from /cost).
+    /// Only replaces when the reported value exceeds what we have accumulated,
+    /// so it acts as a correction when our running total drifted.
+    pub fn apply_reported_total(&mut self, new: TokenStats) {
+        if new.total_cost_usd > self.stats.total_cost_usd {
             self.stats = new;
         }
     }

@@ -13,5 +13,7 @@ pub enum AppEvent {
     /// PTY write channel for a newly spawned session
     SessionWriter     { session_id: usize, writer_tx: mpsc::Sender<Vec<u8>> },
     SessionDied       { session_id: usize },
+    /// Authoritative cumulative token stats read from ~/.claude project JSONL
+    SessionStats      { session_id: usize, stats: crate::session::TokenStats },
     Tick,
 }

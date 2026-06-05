@@ -1,4 +1,5 @@
 mod app;
+mod claude_log;
 mod events;
 mod patterns;
 mod session;
@@ -101,6 +102,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::SessionDied { session_id } => {
             app.handle_session_died(session_id);
+        }
+        AppEvent::SessionStats { session_id, stats } => {
+            app.handle_session_stats(session_id, stats);
         }
         AppEvent::Key(key)   => handle_key(app, key),
         AppEvent::Mouse(ev)  => app.handle_mouse(ev),
