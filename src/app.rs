@@ -497,13 +497,16 @@ async fn run_pty(
     use tokio::io::AsyncWriteExt;
 
     let pty = pty_process::Pty::new()?;
-    pty.resize(pty_process::Size::new(PTY_ROWS, PTY_COLS))?;
 
     // Spawn the child then immediately drop pts so the parent holds no reference
     // to the slave FD. Without this, reading the master never returns EIO after
     // the child exits — SessionDied would never fire.
+    // Resize is best-effort: on macOS the TIOCSWINSZ ioctl on the master fd
+    // returns ENOTTY in some environments; ignore the error so the session still
+    // spawns (the PTY will use the OS default window size).
     let _child = {
         let pts = pty.pts()?;
+        let _ = pty.resize(pty_process::Size::new(PTY_ROWS, PTY_COLS));
         let mut command = pty_process::Command::new(&cmd);
         command.current_dir(&cwd);
         command.spawn(&pts)?

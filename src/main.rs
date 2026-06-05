@@ -43,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ => {}
                 }
+            } else if key_tx.is_closed() {
+                break;
             }
         }
     });
