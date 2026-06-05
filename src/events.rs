@@ -28,6 +28,12 @@ pub enum AppEvent {
         payload: IpcQueryPayload,
         response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
     },
+    /// Persistent agent connected; app stores the write channel keyed by session_id
+    IpcAgentConnected { session_id: usize, agent_tx: mpsc::Sender<String> },
+    /// Agent socket closed; app removes the write channel and marks session Dead
+    IpcAgentDisconnected { session_id: usize },
+    /// Push a JSON message to a connected agent
+    IpcSend { session_id: usize, message: serde_json::Value },
     Tick,
 }
 
@@ -35,4 +41,5 @@ pub enum AppEvent {
 pub enum IpcQueryPayload {
     SessionCreate { kind_str: String, name: String, cwd: String },
     SessionInputWait { session_id: usize, text: String },
+    Register { name: String, group: Option<String> },
 }

@@ -98,6 +98,8 @@ pub struct App {
     next_id: usize,
     /// Pending IPC reply channels: session_id → (oneshot sender, line offset when input was sent).
     pub pending_ipc_replies: HashMap<usize, (tokio::sync::oneshot::Sender<serde_json::Value>, usize)>,
+    /// Write channels to connected persistent agents, keyed by session_id.
+    pub agent_writers: HashMap<usize, mpsc::Sender<String>>,
 }
 
 impl App {
@@ -120,6 +122,7 @@ impl App {
             matcher: PatternMatcher::new(),
             next_id: 0,
             pending_ipc_replies: HashMap::new(),
+            agent_writers: HashMap::new(),
         }
     }
 
@@ -179,6 +182,22 @@ impl App {
         });
 
         Ok(())
+    }
+
+    pub fn spawn_headless_session(&mut self, name: String, group: Option<String>) -> anyhow::Result<usize> {
+        if self.sessions.len() >= MAX_SESSIONS {
+            return Err(anyhow::anyhow!("Maximum {} sessions reached", MAX_SESSIONS));
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let label = if name.is_empty() { format!("agent-{}", id + 1) } else { name };
+        let cwd = group.unwrap_or_else(|| ".".to_string());
+        let (pty_rows, pty_cols) = self.pty_size;
+        let mut session = Session::new(id, label, SessionKind::Shell, cwd, pty_rows, pty_cols);
+        session.headless = true;
+        session.state = SessionState::Ready;
+        self.sessions.push(session);
+        Ok(id)
     }
 
     pub fn kill_active_session(&mut self) {
@@ -344,7 +363,11 @@ impl App {
             let stripped = strip_ansi(&text);
             if !session.ipc_state {
                 if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
-                    session.state = new_state;
+                    // Partial lines can detect Thinking/Waiting/Ready but must not
+                    // flip to Running — that requires a complete line.
+                    if new_state != SessionState::Running {
+                        session.state = new_state;
+                    }
                 }
             }
             state_after = Some(session.state.clone());
@@ -380,6 +403,24 @@ impl App {
     pub fn handle_ipc_tokens(&mut self, session_id: usize, stats: crate::session::TokenStats) {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.accumulate_stats(stats);
+        }
+    }
+
+    pub fn handle_ipc_agent_connected(&mut self, session_id: usize, agent_tx: mpsc::Sender<String>) {
+        self.agent_writers.insert(session_id, agent_tx);
+    }
+
+    pub fn handle_ipc_agent_disconnected(&mut self, session_id: usize) {
+        self.agent_writers.remove(&session_id);
+        if let Some(idx) = self.sessions.iter().position(|s| s.id == session_id && s.headless) {
+            self.remove_session(idx);
+        }
+    }
+
+    pub fn handle_ipc_send(&self, session_id: usize, message: serde_json::Value) {
+        if let Some(tx) = self.agent_writers.get(&session_id) {
+            let line = serde_json::to_string(&message).unwrap_or_default() + "\n";
+            let _ = tx.try_send(line);
         }
     }
 
@@ -430,6 +471,16 @@ impl App {
                     }
                 }
             }
+            IpcQueryPayload::Register { name, group } => {
+                match self.spawn_headless_session(name, group) {
+                    Ok(new_id) => {
+                        let _ = response_tx.send(serde_json::json!({"type": "registered", "session_id": new_id}));
+                    }
+                    Err(e) => {
+                        let _ = response_tx.send(serde_json::json!({"error": e.to_string()}));
+                    }
+                }
+            }
             IpcQueryPayload::SessionInputWait { session_id, text } => {
                 if let Some(s) = self.sessions.iter().find(|s| s.id == session_id) {
                     let line_offset = s.output_lines.len();
@@ -449,10 +500,24 @@ impl App {
         let mut tick_ready: Vec<usize> = Vec::new();
 
         for session in self.sessions.iter_mut() {
+            // Flip Ready → Running when a meaningful volume of bytes arrived this
+            // tick. Cursor-blink sequences are ~20 bytes/tick; response streaming
+            // is always well above that threshold.
+            let bytes = session.bytes_since_last_tick;
+            session.bytes_since_last_tick = 0;
+            if !session.ipc_state && session.state == SessionState::Ready && bytes > 80 {
+                session.state = SessionState::Running;
+            }
             if !session.ipc_state {
                 if let Some(last) = session.last_output_at {
-                    if last.elapsed() > Duration::from_secs(2)
+                    let elapsed = last.elapsed();
+                    if elapsed > Duration::from_secs(2)
                         && matches!(session.state, SessionState::Running | SessionState::Thinking)
+                    {
+                        session.state = SessionState::Ready;
+                        tick_ready.push(session.id);
+                    } else if elapsed > Duration::from_secs(30)
+                        && session.state == SessionState::Waiting
                     {
                         session.state = SessionState::Ready;
                         tick_ready.push(session.id);

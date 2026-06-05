@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     // IPC listener — external orchestrators connect to /tmp/linkshell.sock.
     // Session 0 is the default target; orchestrators can override per message.
-    ipc::spawn_listener(tx.clone(), 0);
+    ipc::spawn_listener(tx.clone());
 
     // Tick task
     let tick_tx = tx.clone();
@@ -140,6 +140,15 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::IpcQuery { payload, response_tx } => {
             app.handle_ipc_query(payload, response_tx);
+        }
+        AppEvent::IpcAgentConnected { session_id, agent_tx } => {
+            app.handle_ipc_agent_connected(session_id, agent_tx);
+        }
+        AppEvent::IpcAgentDisconnected { session_id } => {
+            app.handle_ipc_agent_disconnected(session_id);
+        }
+        AppEvent::IpcSend { session_id, message } => {
+            app.handle_ipc_send(session_id, message);
         }
         AppEvent::Key(key)   => handle_key(app, key),
         AppEvent::Mouse(ev)  => app.handle_mouse(ev),

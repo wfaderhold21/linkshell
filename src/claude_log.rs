@@ -60,9 +60,7 @@ struct RawUsage {
     output:      u64,
 }
 
-/// Parse a single JSONL line: if it's a type=assistant record, return the raw token counts.
-fn parse_usage(line: &str) -> Option<RawUsage> {
-    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
     if v["type"].as_str()? != "assistant" {
         return None;
     }
@@ -88,9 +86,25 @@ fn compute_cost(input: u64, cache_write: u64, cache_read: u64, output: u64) -> f
         + (output      as f64 / 1_000_000.0) * 15.00
 }
 
-/// Tail a JSONL file from `offset`, emitting the latest token stats on each new entry.
-/// Each assistant record contains the cumulative session total, so we use the latest
-/// value directly rather than summing.
+use crate::session::SessionState;
+
+/// Infer session state from a JSONL record.
+fn parse_state(v: &serde_json::Value) -> Option<SessionState> {
+    match v["type"].as_str()? {
+        "user" => Some(SessionState::Thinking),
+        "tool" => Some(SessionState::Running),
+        "assistant" => {
+            match v["message"]["stop_reason"].as_str().unwrap_or("") {
+                "tool_use" => Some(SessionState::Running),
+                "end_turn" => Some(SessionState::Ready),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Tail a JSONL file from `offset`, emitting token stats and state transitions.
 async fn tail(
     session_id: usize,
     path: &Path,
@@ -108,7 +122,7 @@ async fn tail(
             break;
         }
 
-        let mut new_data = false;
+        let mut new_stats = false;
         if let Ok(file) = tokio::fs::File::open(path).await {
             let mut file = file;
             if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
@@ -120,13 +134,23 @@ async fn tail(
                         Ok(0) => break,
                         Ok(n) => {
                             offset += n as u64;
-                            if let Some(raw) = parse_usage(&line) {
+                            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            if let Some(state) = parse_state(&v) {
+                                let _ = tx.send(AppEvent::IpcStateOverride {
+                                    session_id,
+                                    state,
+                                }).await;
+                            }
+                            if let Some(raw) = parse_usage_from_value(&v) {
                                 acc_input       += raw.input;
                                 acc_cache_write += raw.cache_write;
                                 acc_cache_read  += raw.cache_read;
                                 acc_output      += raw.output;
                                 context_tokens   = raw.input + raw.cache_write + raw.cache_read;
-                                new_data = true;
+                                new_stats = true;
                             }
                         }
                         Err(_) => break,
@@ -135,7 +159,7 @@ async fn tail(
             }
         }
 
-        if new_data {
+        if new_stats {
             let stats = TokenStats {
                 input_tokens:  acc_input + acc_cache_write + acc_cache_read,
                 output_tokens: acc_output,

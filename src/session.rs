@@ -75,6 +75,8 @@ pub struct Session {
     pub name: String,
     pub kind: SessionKind,
     pub state: SessionState,
+    /// No PTY — managed entirely via IPC socket.
+    pub headless: bool,
     /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
     /// Cleared when pattern matching updates the state from PTY output.
     pub ipc_state: bool,
@@ -91,6 +93,9 @@ pub struct Session {
     pub pty_resizer: Option<mpsc::Sender<(u16, u16)>>,
     /// Scrollback of stripped output lines for pipe extraction
     pub output_lines: VecDeque<String>,
+    /// Raw bytes received since the last tick — used to detect active generation
+    /// without relying on newlines (Claude Code streams via cursor movement, not \n).
+    pub bytes_since_last_tick: usize,
 }
 
 impl Session {
@@ -100,6 +105,7 @@ impl Session {
             name,
             kind,
             state: SessionState::Starting,
+            headless: false,
             ipc_state: false,
             screen: vt100::Parser::new(rows, cols, 1000),
             stats: TokenStats::default(),
@@ -110,11 +116,12 @@ impl Session {
             pty_writer: None,
             pty_resizer: None,
             output_lines: VecDeque::new(),
+            bytes_since_last_tick: 0,
         }
     }
 
     pub fn process_bytes(&mut self, data: &[u8]) {
-        self.last_output_at = Some(Instant::now());
+        self.bytes_since_last_tick += data.len();
         self.screen.process(data);
     }
 
@@ -123,6 +130,7 @@ impl Session {
     }
 
     pub fn push_output_line(&mut self, line: String) {
+        self.last_output_at = Some(Instant::now());
         self.output_lines.push_back(line);
         if self.output_lines.len() > 2000 {
             self.output_lines.pop_front();

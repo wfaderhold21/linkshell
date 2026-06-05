@@ -26,11 +26,11 @@ impl PatternMatcher {
         Self {
             shell_ready:     Regex::new(r"[\$#%>]\s*$").unwrap(),
             claude_thinking: Regex::new(r"(Thinking|Processing|Analyzing)\.\.\.|⠋|⠙|⠹|⠸").unwrap(),
-            claude_ready:    Regex::new(r"^>\s*$|Human:\s*$|^\s*$").unwrap(),
-            claude_waiting:  Regex::new(r"\?\s*$|\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?").unwrap(),
+            claude_ready:    Regex::new(r"^>\s*$|Human:\s*$").unwrap(),
+            claude_waiting:  Regex::new(r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?|proceed\?").unwrap(),
             codex_ready:     Regex::new(r"codex>\s*$|>\s*$").unwrap(),
             codex_waiting:   Regex::new(r"\?\s*$|Approve\?|confirm").unwrap(),
-            generic_waiting: Regex::new(r"\?\s*$|\[y/n\]|\[Y/n\]|Press Enter").unwrap(),
+            generic_waiting: Regex::new(r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter").unwrap(),
             generic_error:   Regex::new(r"(?i)error:|failed:|panic!|fatal:|command not found").unwrap(),
 
             // "$0.052" or "~$1.23" or "$12"
