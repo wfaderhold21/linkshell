@@ -287,20 +287,37 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
             SessionState::Starting => Style::default().fg(Color::Gray),
         };
 
-        let tokens = session.tokens_display();
-        let cost   = session.cost_display();
+        let tokens  = session.tokens_display();
+        let context = session.context_display();
+        let cost    = session.cost_display();
         let elapsed = session.elapsed_display();
+
+        // Pipe destinations: "→2,→3" or blank
+        let pipe_label = {
+            let dests: Vec<String> = app.pipes.iter()
+                .filter(|p| p.source == session.id && p.active)
+                .filter_map(|p| {
+                    app.sessions.iter().position(|s| s.id == p.dest)
+                        .map(|idx| format!("→{}", idx + 1))
+                })
+                .collect();
+            if dests.is_empty() { String::new() } else { dests.join(",") }
+        };
 
         let spans = vec![
             Span::styled(format!(" {:1} ", i + 1), num_style),
             Span::raw("│ "),
             Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
             Span::raw("│ "),
+            Span::styled(format!("{:<5} ", pipe_label), Style::default().fg(Color::Cyan)),
+            Span::raw("│ "),
             Span::styled(format!("{:<8} ", session.state.label()), state_style),
             Span::raw("│ "),
             Span::styled(format!("{:>6}  ", elapsed), Style::default().fg(Color::Gray)),
             Span::raw("│ "),
             Span::styled(format!("{:>8}  ", tokens), Style::default().fg(Color::Cyan)),
+            Span::raw("│ "),
+            Span::styled(format!("{:>8}  ", context), Style::default().fg(Color::Magenta)),
             Span::raw("│ "),
             Span::styled(format!("{:>7}", cost), Style::default().fg(Color::Green)),
         ];

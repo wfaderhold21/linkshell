@@ -2,6 +2,7 @@ mod app;
 mod claude_log;
 mod events;
 mod patterns;
+mod pipe;
 mod session;
 mod ui;
 
@@ -105,6 +106,11 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::SessionStats { session_id, stats } => {
             app.handle_session_stats(session_id, stats);
+        }
+        AppEvent::PipeRelay { dest_id, message } => {
+            if let Some(session) = app.sessions.iter().find(|s| s.id == dest_id) {
+                session.write_bytes(message.into_bytes());
+            }
         }
         AppEvent::Key(key)   => handle_key(app, key),
         AppEvent::Mouse(ev)  => app.handle_mouse(ev),

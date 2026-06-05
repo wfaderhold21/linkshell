@@ -15,5 +15,7 @@ pub enum AppEvent {
     SessionDied       { session_id: usize },
     /// Authoritative cumulative token stats read from ~/.claude project JSONL
     SessionStats      { session_id: usize, stats: crate::session::TokenStats },
+    /// Content forwarded from a source session's pipe to a destination session's PTY
+    PipeRelay         { dest_id: usize, message: String },
     Tick,
 }

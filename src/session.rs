@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -65,6 +66,8 @@ pub struct TokenStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_cost_usd: f64,
+    /// Total input tokens for the most recent API call — reflects current context window size.
+    pub context_tokens: u64,
 }
 
 pub struct Session {
@@ -81,6 +84,8 @@ pub struct Session {
     pub cwd: String,
     /// Send bytes to the PTY writer task
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
+    /// Scrollback of stripped output lines for pipe extraction
+    pub output_lines: VecDeque<String>,
 }
 
 impl Session {
@@ -97,12 +102,20 @@ impl Session {
             last_output_at: None,
             cwd,
             pty_writer: None,
+            output_lines: VecDeque::new(),
         }
     }
 
     pub fn process_bytes(&mut self, data: &[u8]) {
         self.last_output_at = Some(Instant::now());
         self.screen.process(data);
+    }
+
+    pub fn push_output_line(&mut self, line: String) {
+        self.output_lines.push_back(line);
+        if self.output_lines.len() > 2000 {
+            self.output_lines.pop_front();
+        }
     }
 
     pub fn elapsed_secs(&self) -> u64 {
@@ -125,6 +138,18 @@ impl Session {
             "—".to_string()
         } else {
             format!("${:.3}", self.stats.total_cost_usd)
+        }
+    }
+
+    pub fn context_display(&self) -> String {
+        let ctx = self.stats.context_tokens;
+        if ctx == 0 {
+            return "—".to_string();
+        }
+        if ctx >= 1000 {
+            format!("{:.1}k ctx", ctx as f64 / 1000.0)
+        } else {
+            format!("{} ctx", ctx)
         }
     }
 

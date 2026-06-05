@@ -5,6 +5,7 @@ use vt100::Parser as VtParser;
 
 use crate::events::AppEvent;
 use crate::patterns::PatternMatcher;
+use crate::pipe::{self, Pipe, PipeTrigger, ExtractMode};
 use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_ROWS, PTY_COLS};
 
 /// Screen-coordinate selection (col, row both relative to output area inner content).
@@ -81,6 +82,7 @@ pub struct App {
     pub command_input: String,
     pub should_quit: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
+    pub pipes: Vec<Pipe>,
     // Layout cache (updated after each draw, used for mouse hit-testing)
     pub output_area: Rect,
     pub session_bar_area: Rect,
@@ -101,6 +103,7 @@ impl App {
             command_input: String::new(),
             should_quit: false,
             event_tx,
+            pipes: Vec::new(),
             output_area: Rect::default(),
             session_bar_area: Rect::default(),
             session_slot_areas: Vec::new(),
@@ -220,8 +223,13 @@ impl App {
     }
 
     pub fn handle_session_output(&mut self, session_id: usize, line: String) {
+        let mut state_before = None;
+        let mut state_after = None;
+
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            state_before = Some(session.state.clone());
             let stripped = strip_ansi(&line);
+            session.push_output_line(stripped.clone());
             if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
                 session.state = new_state;
             }
@@ -231,14 +239,53 @@ impl App {
                     session.accumulate_stats(stats);
                 }
             }
+            state_after = Some(session.state.clone());
+        }
+
+        if let (Some(before), Some(after)) = (state_before, state_after) {
+            if before != after {
+                self.check_pipes(session_id, &after);
+            }
+        }
+    }
+
+    fn check_pipes(&mut self, session_id: usize, new_state: &SessionState) {
+        let triggered: Vec<Pipe> = self.pipes.iter()
+            .filter(|p| {
+                p.source == session_id
+                    && p.active
+                    && match p.trigger {
+                        PipeTrigger::OnReady   => *new_state == SessionState::Ready,
+                        PipeTrigger::OnWaiting => *new_state == SessionState::Waiting,
+                        PipeTrigger::Manual    => false,
+                    }
+            })
+            .cloned()
+            .collect();
+
+        for p in triggered {
+            if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
+                pipe::fire_pipe_task(p, content, self.event_tx.clone());
+            }
         }
     }
 
     pub fn handle_session_current_line(&mut self, session_id: usize, text: String) {
+        let mut state_before = None;
+        let mut state_after = None;
+
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            state_before = Some(session.state.clone());
             let stripped = strip_ansi(&text);
             if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
                 session.state = new_state;
+            }
+            state_after = Some(session.state.clone());
+        }
+
+        if let (Some(before), Some(after)) = (state_before, state_after) {
+            if before != after {
+                self.check_pipes(session_id, &after);
             }
         }
     }
@@ -256,12 +303,15 @@ impl App {
     }
 
     pub fn handle_tick(&mut self) {
+        let mut tick_ready: Vec<usize> = Vec::new();
+
         for session in self.sessions.iter_mut() {
             if let Some(last) = session.last_output_at {
                 if last.elapsed() > Duration::from_secs(2)
                     && matches!(session.state, SessionState::Running | SessionState::Thinking)
                 {
                     session.state = SessionState::Ready;
+                    tick_ready.push(session.id);
                 }
             }
             if matches!(session.kind, SessionKind::Claude | SessionKind::Codex) {
@@ -276,6 +326,10 @@ impl App {
                     }
                 }
             }
+        }
+
+        for id in tick_ready {
+            self.check_pipes(id, &SessionState::Ready);
         }
     }
 
@@ -463,6 +517,14 @@ impl App {
         self.mode = AppMode::Normal;
         self.command_input.clear();
 
+        // Pipe commands need the full token list; handle before the splitn block.
+        let all_parts: Vec<&str> = cmd.split_whitespace().collect();
+        match all_parts.first().copied() {
+            Some("pipe") => { self.execute_pipe_command(&all_parts[1..]); return; }
+            Some("unpipe") => { self.execute_unpipe_command(&all_parts[1..]); return; }
+            _ => {}
+        }
+
         let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
         match parts.as_slice() {
             ["new", kind_str, rest @ ..] => {
@@ -487,6 +549,79 @@ impl App {
                 }
             }
             ["quit"] | ["q"] => self.should_quit = true,
+            _ => {}
+        }
+    }
+
+    fn execute_pipe_command(&mut self, args: &[&str]) {
+        if args.len() < 2 { return; }
+        let src_id = args[0].parse::<usize>().ok()
+            .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
+            .map(|s| s.id);
+        let dst_id = args[1].parse::<usize>().ok()
+            .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
+            .map(|s| s.id);
+
+        let (source, dest) = match (src_id, dst_id) {
+            (Some(s), Some(d)) => (s, d),
+            _ => return,
+        };
+
+        let mut extract = ExtractMode::LastBlock;
+        let mut trigger = PipeTrigger::OnReady;
+        let mut prefix: Option<String> = None;
+
+        let flags = &args[2..];
+        let mut i = 0;
+        while i < flags.len() {
+            let flag = flags[i];
+            if let Some(val) = flag.strip_prefix("--extract=") {
+                extract = if val == "diff" {
+                    ExtractMode::Diff
+                } else if let Some(n) = val.strip_prefix("last-n=") {
+                    ExtractMode::LastN(n.parse().unwrap_or(20))
+                } else {
+                    ExtractMode::LastBlock
+                };
+            } else if let Some(val) = flag.strip_prefix("--summarize=") {
+                extract = ExtractMode::Summarize(val.parse().unwrap_or(150));
+            } else if let Some(val) = flag.strip_prefix("--on=") {
+                trigger = match val {
+                    "waiting" => PipeTrigger::OnWaiting,
+                    "manual"  => PipeTrigger::Manual,
+                    _         => PipeTrigger::OnReady,
+                };
+            } else if let Some(val) = flag.strip_prefix("--prefix=") {
+                // Consume rest of tokens as the prefix value
+                let rest = flags[i + 1..].join(" ");
+                let full = if rest.is_empty() { val.to_string() } else { format!("{} {}", val, rest) };
+                prefix = Some(full.trim_matches('"').to_string());
+                break;
+            }
+            i += 1;
+        }
+
+        self.pipes.push(Pipe { source, dest, trigger, extract, prefix, active: true });
+    }
+
+    fn execute_unpipe_command(&mut self, args: &[&str]) {
+        match args {
+            [src] => {
+                if let Ok(n) = src.parse::<usize>() {
+                    if let Some(id) = self.sessions.get(n.wrapping_sub(1)).map(|s| s.id) {
+                        self.pipes.retain(|p| p.source != id);
+                    }
+                }
+            }
+            [src, dst] => {
+                let src_id = src.parse::<usize>().ok()
+                    .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
+                let dst_id = dst.parse::<usize>().ok()
+                    .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
+                if let (Some(s), Some(d)) = (src_id, dst_id) {
+                    self.pipes.retain(|p| !(p.source == s && p.dest == d));
+                }
+            }
             _ => {}
         }
     }

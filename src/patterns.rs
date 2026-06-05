@@ -24,7 +24,7 @@ pub struct PatternMatcher {
 impl PatternMatcher {
     pub fn new() -> Self {
         Self {
-            shell_ready:     Regex::new(r"[\$#>]\s*$").unwrap(),
+            shell_ready:     Regex::new(r"[\$#%>]\s*$").unwrap(),
             claude_thinking: Regex::new(r"(Thinking|Processing|Analyzing)\.\.\.|⠋|⠙|⠹|⠸").unwrap(),
             claude_ready:    Regex::new(r"^>\s*$|Human:\s*$|^\s*$").unwrap(),
             claude_waiting:  Regex::new(r"\?\s*$|\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?").unwrap(),
@@ -112,7 +112,7 @@ impl PatternMatcher {
             return None;
         }
 
-        Some(TokenStats { input_tokens, output_tokens, total_cost_usd })
+        Some(TokenStats { input_tokens, output_tokens, total_cost_usd, context_tokens: 0 })
     }
 
     /// Line-based token parsing kept as a secondary signal for non-TUI output.
