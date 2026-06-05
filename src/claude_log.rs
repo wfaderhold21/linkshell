@@ -53,47 +53,54 @@ async fn wait_for_new_jsonl(
     }
 }
 
-/// Parse a single JSONL line: if it's a type=assistant record, return the
-/// per-turn token delta as a TokenStats.
-fn parse_usage(line: &str) -> Option<TokenStats> {
+struct RawUsage {
+    input:       u64,
+    cache_write: u64,
+    cache_read:  u64,
+    output:      u64,
+}
+
+/// Parse a single JSONL line: if it's a type=assistant record, return the raw token counts.
+fn parse_usage(line: &str) -> Option<RawUsage> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     if v["type"].as_str()? != "assistant" {
         return None;
     }
     let usage = v["message"]["usage"].as_object()?;
-
     let get = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let input       = get("input_tokens");
-    let cache_write = get("cache_creation_input_tokens");
-    let cache_read  = get("cache_read_input_tokens");
-    let output      = get("output_tokens");
-
-    let input_tokens   = input + cache_write + cache_read;
-    let output_tokens  = output;
-    let context_tokens = input + cache_write + cache_read; // total input for this call
-
-    if input_tokens == 0 && output_tokens == 0 {
+    let raw = RawUsage {
+        input:       get("input_tokens"),
+        cache_write: get("cache_creation_input_tokens"),
+        cache_read:  get("cache_read_input_tokens"),
+        output:      get("output_tokens"),
+    };
+    if raw.input == 0 && raw.cache_write == 0 && raw.cache_read == 0 && raw.output == 0 {
         return None;
     }
-
-    // Sonnet 4.x pricing — cache reads are 10x cheaper than regular input
-    let cost = (input       as f64 / 1_000_000.0) *  3.00   // standard input
-             + (cache_write as f64 / 1_000_000.0) *  3.75   // cache write (5-min)
-             + (cache_read  as f64 / 1_000_000.0) *  0.30   // cache read
-             + (output      as f64 / 1_000_000.0) * 15.00;  // output
-
-    Some(TokenStats { input_tokens, output_tokens, total_cost_usd: cost, context_tokens })
+    Some(raw)
 }
 
-/// Tail a JSONL file from `offset`, accumulating token stats into `total`.
-/// Returns when the channel closes or an unrecoverable read error occurs.
+fn compute_cost(input: u64, cache_write: u64, cache_read: u64, output: u64) -> f64 {
+    // Sonnet 4.x pricing
+    (input       as f64 / 1_000_000.0) *  3.00
+        + (cache_write as f64 / 1_000_000.0) *  3.75
+        + (cache_read  as f64 / 1_000_000.0) *  0.30
+        + (output      as f64 / 1_000_000.0) * 15.00
+}
+
+/// Tail a JSONL file from `offset`, emitting the latest token stats on each new entry.
+/// Each assistant record contains the cumulative session total, so we use the latest
+/// value directly rather than summing.
 async fn tail(
     session_id: usize,
     path: &Path,
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
 ) {
-    let mut total = TokenStats::default();
+    let mut acc_input:       u64 = 0;
+    let mut acc_cache_write: u64 = 0;
+    let mut acc_cache_read:  u64 = 0;
+    let mut acc_output:      u64 = 0;
+    let mut context_tokens:  u64 = 0;
     let mut offset: u64 = 0;
 
     loop {
@@ -113,11 +120,12 @@ async fn tail(
                         Ok(0) => break,
                         Ok(n) => {
                             offset += n as u64;
-                            if let Some(delta) = parse_usage(&line) {
-                                total.input_tokens   += delta.input_tokens;
-                                total.output_tokens  += delta.output_tokens;
-                                total.total_cost_usd += delta.total_cost_usd;
-                                total.context_tokens  = delta.context_tokens; // latest, not cumulative
+                            if let Some(raw) = parse_usage(&line) {
+                                acc_input       += raw.input;
+                                acc_cache_write += raw.cache_write;
+                                acc_cache_read  += raw.cache_read;
+                                acc_output      += raw.output;
+                                context_tokens   = raw.input + raw.cache_write + raw.cache_read;
                                 new_data = true;
                             }
                         }
@@ -128,10 +136,13 @@ async fn tail(
         }
 
         if new_data {
-            if tx.send(AppEvent::SessionStats {
-                session_id,
-                stats: total.clone(),
-            }).await.is_err() {
+            let stats = TokenStats {
+                input_tokens:  acc_input + acc_cache_write + acc_cache_read,
+                output_tokens: acc_output,
+                context_tokens,
+                total_cost_usd: compute_cost(acc_input, acc_cache_write, acc_cache_read, acc_output),
+            };
+            if tx.send(AppEvent::SessionStats { session_id, stats }).await.is_err() {
                 break;
             }
         }
