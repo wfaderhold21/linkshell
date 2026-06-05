@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use ratatui::layout::Rect;
@@ -83,14 +84,20 @@ pub struct App {
     pub should_quit: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub pipes: Vec<Pipe>,
+    // Current PTY size derived from the output pane (rows, cols)
+    pub pty_size: (u16, u16),
     // Layout cache (updated after each draw, used for mouse hit-testing)
     pub output_area: Rect,
     pub session_bar_area: Rect,
     pub session_slot_areas: Vec<Rect>,
     // Text selection
     pub selection: Option<Selection>,
+    // Per-session scroll offsets (lines from bottom; 0 = live tail)
+    pub scroll_offsets: HashMap<usize, usize>,
     matcher: PatternMatcher,
     next_id: usize,
+    /// Pending IPC reply channels: session_id → (oneshot sender, line offset when input was sent).
+    pub pending_ipc_replies: HashMap<usize, (tokio::sync::oneshot::Sender<serde_json::Value>, usize)>,
 }
 
 impl App {
@@ -104,12 +111,15 @@ impl App {
             should_quit: false,
             event_tx,
             pipes: Vec::new(),
+            pty_size: (PTY_ROWS, PTY_COLS),
             output_area: Rect::default(),
             session_bar_area: Rect::default(),
             session_slot_areas: Vec::new(),
             selection: None,
+            scroll_offsets: HashMap::new(),
             matcher: PatternMatcher::new(),
             next_id: 0,
+            pending_ipc_replies: HashMap::new(),
         }
     }
 
@@ -142,7 +152,8 @@ impl App {
             name
         };
 
-        let session = Session::new(id, session_name, kind.clone(), cwd.clone());
+        let (pty_rows, pty_cols) = self.pty_size;
+        let session = Session::new(id, session_name, kind.clone(), cwd.clone(), pty_rows, pty_cols);
         let idx = self.sessions.len();
         self.sessions.push(session);
 
@@ -158,7 +169,7 @@ impl App {
         }
 
         tokio::spawn(async move {
-            if let Err(e) = run_pty(id, cmd_str, cwd, tx.clone()).await {
+            if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone()).await {
                 let _ = tx.send(AppEvent::SessionOutput {
                     session_id: id,
                     line: format!("[error: {}]", e),
@@ -207,6 +218,35 @@ impl App {
         self.active_idx = Some(self.active_idx.map_or(0, |i| if i == 0 { n - 1 } else { i - 1 }));
     }
 
+    pub fn scroll_up(&mut self, lines: usize) {
+        if let Some(idx) = self.active_idx {
+            if let Some(session) = self.sessions.get(idx) {
+                let screen = session.screen.screen();
+                let (screen_rows, _) = screen.size();
+                let max_offset = screen_rows as usize;
+                let offset = self.scroll_offsets.entry(session.id).or_insert(0);
+                *offset = (*offset + lines).min(max_offset);
+            }
+        }
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        if let Some(idx) = self.active_idx {
+            if let Some(session) = self.sessions.get(idx) {
+                let offset = self.scroll_offsets.entry(session.id).or_insert(0);
+                *offset = offset.saturating_sub(lines);
+            }
+        }
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.active_idx
+            .and_then(|i| self.sessions.get(i))
+            .and_then(|s| self.scroll_offsets.get(&s.id))
+            .copied()
+            .unwrap_or(0)
+    }
+
     // ── Event handlers ─────────────────────────────────────────────────────
 
     pub fn handle_session_writer(&mut self, session_id: usize, writer_tx: mpsc::Sender<Vec<u8>>) {
@@ -216,9 +256,31 @@ impl App {
         }
     }
 
+    pub fn handle_session_resizer(&mut self, session_id: usize, resizer_tx: mpsc::Sender<(u16, u16)>) {
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            s.pty_resizer = Some(resizer_tx);
+        }
+    }
+
+    /// Called from the main loop after each draw when the output area changes size.
+    pub fn handle_resize(&mut self, rows: u16, cols: u16) {
+        if self.pty_size == (rows, cols) { return; }
+        self.pty_size = (rows, cols);
+        for session in &mut self.sessions {
+            session.resize_screen(rows, cols);
+            if let Some(tx) = &session.pty_resizer {
+                let _ = tx.try_send((rows, cols));
+            }
+        }
+    }
+
     pub fn handle_session_bytes(&mut self, session_id: usize, data: Vec<u8>) {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.process_bytes(&data);
+        }
+        // Auto-scroll to bottom when the active session receives new output
+        if self.active_idx.and_then(|i| self.sessions.get(i)).map(|s| s.id) == Some(session_id) {
+            self.scroll_offsets.insert(session_id, 0);
         }
     }
 
@@ -247,6 +309,7 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.check_pipes(session_id, &after);
+                self.check_ipc_replies(session_id, &after);
             }
         }
     }
@@ -310,6 +373,7 @@ impl App {
         }
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
+            self.check_ipc_replies(session_id, &state);
         }
     }
 
@@ -322,6 +386,62 @@ impl App {
     pub fn handle_session_died(&mut self, session_id: usize) {
         if let Some(idx) = self.sessions.iter().position(|s| s.id == session_id) {
             self.remove_session(idx);
+        }
+    }
+
+    fn check_ipc_replies(&mut self, session_id: usize, new_state: &SessionState) {
+        if *new_state != SessionState::Ready {
+            return;
+        }
+        if let Some((resp_tx, line_offset)) = self.pending_ipc_replies.remove(&session_id) {
+            let lines: Vec<String> = self.sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map(|s| s.output_lines.iter().skip(line_offset).cloned().collect())
+                .unwrap_or_default();
+            let _ = resp_tx.send(serde_json::json!({
+                "session_id": session_id,
+                "lines": lines,
+            }));
+        }
+    }
+
+    pub fn handle_ipc_query(
+        &mut self,
+        payload: crate::events::IpcQueryPayload,
+        response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) {
+        use crate::events::IpcQueryPayload;
+        match payload {
+            IpcQueryPayload::SessionCreate { kind_str, name, cwd } => {
+                let kind = match kind_str.as_str() {
+                    "claude" => crate::session::SessionKind::Claude,
+                    "codex"  => crate::session::SessionKind::Codex,
+                    "shell"  => crate::session::SessionKind::Shell,
+                    other    => crate::session::SessionKind::Custom(other.to_string()),
+                };
+                let new_id = self.next_id;
+                match self.spawn_session(kind, name, cwd) {
+                    Ok(()) => {
+                        let _ = response_tx.send(serde_json::json!({"session_id": new_id}));
+                    }
+                    Err(e) => {
+                        let _ = response_tx.send(serde_json::json!({"error": e.to_string()}));
+                    }
+                }
+            }
+            IpcQueryPayload::SessionInputWait { session_id, text } => {
+                if let Some(s) = self.sessions.iter().find(|s| s.id == session_id) {
+                    let line_offset = s.output_lines.len();
+                    let mut input = text;
+                    input.push('\n');
+                    s.write_bytes(input.into_bytes());
+                    self.pending_ipc_replies.insert(session_id, (response_tx, line_offset));
+                } else {
+                    let _ = response_tx.send(
+                        serde_json::json!({"error": "session not found"}));
+                }
+            }
         }
     }
 
@@ -355,6 +475,7 @@ impl App {
 
         for id in tick_ready {
             self.check_pipes(id, &SessionState::Ready);
+            self.check_ipc_replies(id, &SessionState::Ready);
         }
     }
 
@@ -666,6 +787,8 @@ async fn run_pty(
     session_id: usize,
     cmd: String,
     cwd: String,
+    pty_rows: u16,
+    pty_cols: u16,
     tx: mpsc::Sender<AppEvent>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -680,8 +803,14 @@ async fn run_pty(
     // spawns (the PTY will use the OS default window size).
     let _child = {
         let pts = pty.pts()?;
-        let _ = pty.resize(pty_process::Size::new(PTY_ROWS, PTY_COLS));
-        let mut command = pty_process::Command::new(&cmd);
+        let _ = pty.resize(pty_process::Size::new(pty_rows, pty_cols));
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        let (bin, cmd_args) = match args.as_slice() {
+            [first, rest @ ..] => (*first, rest),
+            [] => return Err(anyhow::anyhow!("empty command")),
+        };
+        let mut command = pty_process::Command::new(bin);
+        command.args(cmd_args);
         command.current_dir(&cwd);
         command.spawn(&pts)?
     };
@@ -690,18 +819,30 @@ async fn run_pty(
 
     // Channel for bytes coming from App → PTY
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Channel for resize events coming from App → PTY
+    let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(4);
 
-    // Notify App of the write channel
+    // Notify App of the write and resize channels
     tx.send(AppEvent::SessionWriter {
         session_id,
         writer_tx: write_tx,
     }).await?;
+    tx.send(AppEvent::SessionResizer {
+        session_id,
+        resizer_tx: resize_tx,
+    }).await?;
 
-    // Writer task: relay bytes from App into the PTY
+    // Writer task: relay bytes and resize events from App into the PTY
     tokio::spawn(async move {
-        while let Some(bytes) = write_rx.recv().await {
-            if write_half.write_all(&bytes).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                Some(bytes) = write_rx.recv() => {
+                    if write_half.write_all(&bytes).await.is_err() { break; }
+                }
+                Some((rows, cols)) = resize_rx.recv() => {
+                    let _ = write_half.resize(pty_process::Size::new(rows, cols));
+                }
+                else => break,
             }
         }
     });

@@ -31,6 +31,14 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
     let mut app = App::new(tx.clone());
+    // Seed pty_size from actual terminal dimensions (best-effort; refined on first draw)
+    if let Ok((term_cols, term_rows)) = crossterm::terminal::size() {
+        // Reserve rows for session bar (3) + status panel (sessions+3, assume 1 session = 4)
+        let chrome_rows = 3 + 4;
+        let rows = term_rows.saturating_sub(chrome_rows).max(1);
+        let cols = term_cols.saturating_sub(2).max(1);
+        app.pty_size = (rows, cols);
+    }
 
     // Input reader task — forwards key and mouse events
     let key_tx = tx.clone();
@@ -74,6 +82,10 @@ async fn main() -> anyhow::Result<()> {
         app.output_area        = layout.output_area;
         app.session_bar_area   = layout.session_bar_area;
         app.session_slot_areas = layout.session_slot_areas;
+        // Resize PTYs to match the output pane (inner area = subtract 2 for borders)
+        let pty_rows = layout.output_area.height.saturating_sub(2).max(1);
+        let pty_cols = layout.output_area.width.saturating_sub(2).max(1);
+        app.handle_resize(pty_rows, pty_cols);
 
         if let Some(event) = rx.recv().await {
             handle_event(&mut app, event);
@@ -106,6 +118,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::SessionWriter { session_id, writer_tx } => {
             app.handle_session_writer(session_id, writer_tx);
         }
+        AppEvent::SessionResizer { session_id, resizer_tx } => {
+            app.handle_session_resizer(session_id, resizer_tx);
+        }
         AppEvent::SessionDied { session_id } => {
             app.handle_session_died(session_id);
         }
@@ -122,6 +137,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::IpcTokenUpdate { session_id, stats } => {
             app.handle_ipc_tokens(session_id, stats);
+        }
+        AppEvent::IpcQuery { payload, response_tx } => {
+            app.handle_ipc_query(payload, response_tx);
         }
         AppEvent::Key(key)   => handle_key(app, key),
         AppEvent::Mouse(ev)  => app.handle_mouse(ev),
@@ -175,6 +193,19 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
                 app.should_quit = true;
                 return;
+            }
+            // Scrollback
+            match key.code {
+                KeyCode::PageUp => { app.scroll_up(20); return; }
+                KeyCode::PageDown => { app.scroll_down(20); return; }
+                _ => {}
+            }
+            if key.modifiers == KeyModifiers::SHIFT {
+                match key.code {
+                    KeyCode::Up   => { app.scroll_up(3); return; }
+                    KeyCode::Down => { app.scroll_down(3); return; }
+                    _ => {}
+                }
             }
             // Pass through to PTY
             let bytes = key_to_bytes(&key);

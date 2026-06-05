@@ -12,6 +12,8 @@ pub enum AppEvent {
     SessionCurrentLine { session_id: usize, text: String },
     /// PTY write channel for a newly spawned session
     SessionWriter     { session_id: usize, writer_tx: mpsc::Sender<Vec<u8>> },
+    /// PTY resize channel for a newly spawned session
+    SessionResizer    { session_id: usize, resizer_tx: mpsc::Sender<(u16, u16)> },
     SessionDied       { session_id: usize },
     /// Authoritative cumulative token stats read from ~/.claude project JSONL
     SessionStats      { session_id: usize, stats: crate::session::TokenStats },
@@ -21,5 +23,16 @@ pub enum AppEvent {
     IpcStateOverride  { session_id: usize, state: crate::session::SessionState },
     /// Token/cost update injected by an external orchestrator via the IPC socket
     IpcTokenUpdate    { session_id: usize, stats: crate::session::TokenStats },
+    /// IPC request/response — caller awaits a reply on response_tx
+    IpcQuery {
+        payload: IpcQueryPayload,
+        response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+    },
     Tick,
+}
+
+#[derive(Debug)]
+pub enum IpcQueryPayload {
+    SessionCreate { kind_str: String, name: String, cwd: String },
+    SessionInputWait { session_id: usize, text: String },
 }

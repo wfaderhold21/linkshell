@@ -87,25 +87,28 @@ pub struct Session {
     pub cwd: String,
     /// Send bytes to the PTY writer task
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
+    /// Send resize events to the PTY writer task
+    pub pty_resizer: Option<mpsc::Sender<(u16, u16)>>,
     /// Scrollback of stripped output lines for pipe extraction
     pub output_lines: VecDeque<String>,
 }
 
 impl Session {
-    pub fn new(id: usize, name: String, kind: SessionKind, cwd: String) -> Self {
+    pub fn new(id: usize, name: String, kind: SessionKind, cwd: String, rows: u16, cols: u16) -> Self {
         Self {
             id,
             name,
             kind,
             state: SessionState::Starting,
             ipc_state: false,
-            screen: vt100::Parser::new(PTY_ROWS, PTY_COLS, 1000),
+            screen: vt100::Parser::new(rows, cols, 1000),
             stats: TokenStats::default(),
             pro_sub: false,
             started_at: Instant::now(),
             last_output_at: None,
             cwd,
             pty_writer: None,
+            pty_resizer: None,
             output_lines: VecDeque::new(),
         }
     }
@@ -113,6 +116,10 @@ impl Session {
     pub fn process_bytes(&mut self, data: &[u8]) {
         self.last_output_at = Some(Instant::now());
         self.screen.process(data);
+    }
+
+    pub fn resize_screen(&mut self, rows: u16, cols: u16) {
+        self.screen.set_size(rows, cols);
     }
 
     pub fn push_output_line(&mut self, line: String) {

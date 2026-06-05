@@ -104,7 +104,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 
     // ── Top-level vertical split ───────────────────────────────────────────
     // main output | session bar | status panel
-    let status_rows = app.sessions.len().max(1) as u16 + 2; // border + rows
+    let status_rows = app.sessions.len().max(1) as u16 + 3; // border + header + rows
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -138,23 +138,33 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
     let (title, lines, border_style) = if let Some(idx) = app.active_idx {
         let session = &app.sessions[idx];
-        let title = format!(
-            " {} [{}] {} ",
-            idx + 1,
-            session.kind.label().to_uppercase(),
-            session.name
-        );
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
         let display_rows = area.height.saturating_sub(2) as u16;
-        let start_row = screen_rows.saturating_sub(display_rows);
+        let scroll_offset = app.scroll_offset() as u16;
+        // end_row is exclusive; clamp so we never exceed screen_rows
+        let end_row = screen_rows.saturating_sub(scroll_offset);
+        let start_row = end_row.saturating_sub(display_rows);
+        let scroll_indicator = if scroll_offset > 0 {
+            format!(" ↑{} ", scroll_offset)
+        } else {
+            String::new()
+        };
+        let title = format!(
+            " {} [{}] {}{}",
+            idx + 1,
+            session.kind.label().to_uppercase(),
+            session.name,
+            scroll_indicator,
+        );
         let sel = app.selection.as_ref();
         let cursor = screen.cursor_position();
-        let items: Vec<ListItem> = (start_row..screen_rows)
+        let items: Vec<ListItem> = (start_row..end_row)
             .enumerate()
             .map(|(disp_row, vt_row)| {
                 let disp_row = disp_row as u16;
-                let cursor_col = if vt_row == cursor.0 { Some(cursor.1) } else { None };
+                // Only show cursor when at the live tail
+                let cursor_col = if scroll_offset == 0 && vt_row == cursor.0 { Some(cursor.1) } else { None };
                 build_row(screen, vt_row, screen_cols, disp_row, sel, cursor_col)
             })
             .collect();
@@ -263,14 +273,38 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Header row
+    if inner.height > 0 {
+        let hdr_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        let header_spans = vec![
+            Span::styled("  # ", hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:<6} ", "Kind"),    hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:<5} ", "Pipe"),    hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:<8} ", "State"),   hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:>6}  ", "Time"),   hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:>8}  ", "Tokens"), hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:>8}  ", "Ctx"),    hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:>7}",   "Cost"),   hdr_style),
+        ];
+        let header_row = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
+        f.render_widget(Paragraph::new(Line::from(header_spans)), header_row);
+    }
+
     for (i, session) in app.sessions.iter().enumerate() {
-        if i >= inner.height as usize {
+        if i + 1 >= inner.height as usize {
             break;
         }
 
         let row = Rect {
             x: inner.x,
-            y: inner.y + i as u16,
+            y: inner.y + 1 + i as u16,
             width: inner.width,
             height: 1,
         };
