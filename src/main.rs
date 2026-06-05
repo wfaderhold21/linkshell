@@ -1,6 +1,7 @@
 mod app;
 mod claude_log;
 mod events;
+mod ipc;
 mod patterns;
 mod pipe;
 mod session;
@@ -50,6 +51,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // IPC listener — external orchestrators connect to /tmp/linkshell.sock.
+    // Session 0 is the default target; orchestrators can override per message.
+    ipc::spawn_listener(tx.clone(), 0);
 
     // Tick task
     let tick_tx = tx.clone();
@@ -111,6 +116,12 @@ fn handle_event(app: &mut App, event: AppEvent) {
             if let Some(session) = app.sessions.iter().find(|s| s.id == dest_id) {
                 session.write_bytes(message.into_bytes());
             }
+        }
+        AppEvent::IpcStateOverride { session_id, state } => {
+            app.handle_ipc_state(session_id, state);
+        }
+        AppEvent::IpcTokenUpdate { session_id, stats } => {
+            app.handle_ipc_tokens(session_id, stats);
         }
         AppEvent::Key(key)   => handle_key(app, key),
         AppEvent::Mouse(ev)  => app.handle_mouse(ev),

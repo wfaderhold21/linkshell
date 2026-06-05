@@ -296,6 +296,24 @@ impl App {
         }
     }
 
+    pub fn handle_ipc_state(&mut self, session_id: usize, state: SessionState) {
+        let old = self.sessions.iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.state.clone());
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.state = state.clone();
+        }
+        if old.as_ref() != Some(&state) {
+            self.check_pipes(session_id, &state);
+        }
+    }
+
+    pub fn handle_ipc_tokens(&mut self, session_id: usize, stats: crate::session::TokenStats) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.accumulate_stats(stats);
+        }
+    }
+
     pub fn handle_session_died(&mut self, session_id: usize) {
         if let Some(idx) = self.sessions.iter().position(|s| s.id == session_id) {
             self.remove_session(idx);

@@ -17,5 +17,9 @@ pub enum AppEvent {
     SessionStats      { session_id: usize, stats: crate::session::TokenStats },
     /// Content forwarded from a source session's pipe to a destination session's PTY
     PipeRelay         { dest_id: usize, message: String },
+    /// State override injected by an external orchestrator via the IPC socket
+    IpcStateOverride  { session_id: usize, state: crate::session::SessionState },
+    /// Token/cost update injected by an external orchestrator via the IPC socket
+    IpcTokenUpdate    { session_id: usize, stats: crate::session::TokenStats },
     Tick,
 }
