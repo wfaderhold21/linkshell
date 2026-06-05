@@ -543,6 +543,10 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     s
 }
 
+fn style_preserves_spaces(style: Style) -> bool {
+    style.bg.is_some() || style.add_modifier.contains(Modifier::REVERSED)
+}
+
 /// Build one display row, applying per-cell colors, selection highlight, and cursor.
 fn build_row(
     screen: &Screen,
@@ -592,7 +596,11 @@ fn build_row(
     }
 
     let final_style = cur_style.unwrap_or_default();
-    let trimmed = if final_style == sel_style { run } else { run.trim_end().to_string() };
+    let trimmed = if style_preserves_spaces(final_style) {
+        run
+    } else {
+        run.trim_end().to_string()
+    };
     if !trimmed.is_empty() {
         spans.push(Span::styled(trimmed, final_style));
     }
