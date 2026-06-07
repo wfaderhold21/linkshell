@@ -62,11 +62,14 @@ Then create your first session with `alt-n`.
 |-----|--------|
 | `alt-n` | New session dialog |
 | `alt-c` | Open command bar |
+| `alt-h` | Toggle help |
 | `alt-x` | Kill active session |
 | `alt-1` … `alt-8` | Switch to session by number |
 | `alt-←` / `alt-→` | Cycle sessions |
 | `ctrl-q` | Quit |
 | `esc` | Dismiss overlay |
+| `PageUp` / `PageDown` | Scroll output (20 lines) |
+| `Shift-↑` / `Shift-↓` | Scroll output (3 lines) |
 
 All other input is passed through to the active session's PTY.
 
@@ -81,6 +84,9 @@ new shell [name]      Start a shell session
 new <cmd> [name]      Start any command as a session
 kill                  Kill the active session
 kill <n>              Kill session by number
+pipe <src> <dst> [--extract=last-block|last-n=N|diff] [--summarize=N] [--on=waiting] [--prefix="..."]
+                      Forward output from src to dst on state change
+unpipe <src> [dst]    Remove pipe(s) from src
 quit                  Exit linkshell
 ```
 

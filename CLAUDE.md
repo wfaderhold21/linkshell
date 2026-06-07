@@ -74,13 +74,13 @@ Overlays: NewSession dialog, CommandBar (`:` prefix), Help (`?`).
 | `Alt+Left/Right` | Previous/next session |
 | `Alt+X` | Kill active session |
 | `:` | Open command bar |
-| `?` | Toggle help |
+| `Alt+H` | Toggle help |
 | `Ctrl+Q` | Quit |
 | Mouse drag | Select text (auto-copies to clipboard) |
 
 ### Command Bar Commands
 
-`new <claude|codex|shell|cmd>`, `kill <id>`, `switch <id>`, `quit`
+`new <claude|codex|shell|cmd>`, `kill <id>`, `quit`
 
 `pipe 1 2`, `pipe 1 2 --extract=last-n=15`, `pipe 1 2 --extract=diff`, `pipe 1 2 --summarize=150`, `pipe 1 2 --on=waiting`, `pipe 1 2 --prefix="Review this:"`, `unpipe 1`, `unpipe 1 2`
 
