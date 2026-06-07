@@ -357,7 +357,7 @@ impl App {
         }
     }
 
-    fn fire_manual_pipes(&mut self, source: usize, dest: Option<usize>) {
+    pub fn fire_manual_pipes(&mut self, source: usize, dest: Option<usize>) {
         let now = std::time::Instant::now();
         let mut to_fire: Vec<Pipe> = Vec::new();
 
@@ -910,6 +910,8 @@ async fn run_pty(
         let mut command = pty_process::Command::new(bin);
         command.args(cmd_args);
         command.current_dir(&cwd);
+        command.env("LINKSHELL_SESSION_ID", session_id.to_string());
+        command.env("LINKSHELL_SOCK", crate::ipc::SOCKET_PATH);
         command.spawn(&pts)?
     };
 

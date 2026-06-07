@@ -34,6 +34,8 @@ pub enum AppEvent {
     IpcAgentDisconnected { session_id: usize },
     /// Push a JSON message to a connected agent
     IpcSend { session_id: usize, message: serde_json::Value },
+    /// Fire manual pipes from source; dest=None fires all manual pipes from source
+    IpcFirePipe { source: usize, dest: Option<usize> },
     Tick,
 }
 

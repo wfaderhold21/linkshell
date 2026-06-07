@@ -64,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
     // Session 0 is the default target; orchestrators can override per message.
     ipc::spawn_listener(tx.clone());
 
+    // Optional TCP agent listener — enabled with --tcp [PORT] (default 7373).
+    let tcp_port = parse_tcp_flag();
+    if let Some(port) = tcp_port {
+        ipc::spawn_tcp_listener(tx.clone(), port);
+    }
+
     // Tick task
     let tick_tx = tx.clone();
     tokio::spawn(async move {
@@ -128,9 +134,19 @@ fn handle_event(app: &mut App, event: AppEvent) {
             app.handle_session_stats(session_id, stats);
         }
         AppEvent::PipeRelay { dest_id, message } => {
+            // Push to a connected remote agent if registered for this session.
+            if let Some(agent_tx) = app.agent_writers.get(&dest_id) {
+                let relay = serde_json::json!({"type": "relay", "content": message.clone()});
+                let line = serde_json::to_string(&relay).unwrap_or_default() + "\n";
+                let _ = agent_tx.try_send(line);
+            }
+            // Write into the PTY if the session has one.
             if let Some(session) = app.sessions.iter().find(|s| s.id == dest_id) {
                 session.write_bytes(message.into_bytes());
             }
+        }
+        AppEvent::IpcFirePipe { source, dest } => {
+            app.fire_manual_pipes(source, dest);
         }
         AppEvent::IpcStateOverride { session_id, state } => {
             app.handle_ipc_state(session_id, state);
@@ -308,4 +324,20 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         KeyCode::Delete    => vec![27, b'[', b'3', b'~'],
         _                  => vec![],
     }
+}
+
+fn parse_tcp_flag() -> Option<u16> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--tcp" {
+            let port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(7373);
+            return Some(port);
+        }
+        if let Some(p) = args[i].strip_prefix("--tcp=") {
+            return Some(p.parse().unwrap_or(7373));
+        }
+        i += 1;
+    }
+    None
 }

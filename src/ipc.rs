@@ -23,7 +23,8 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>) {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let tx = tx.clone();
-                    tokio::spawn(handle_connection(stream, tx));
+                    let (r, w) = stream.into_split();
+                    tokio::spawn(handle_stream(Box::new(r), Box::new(w), tx));
                 }
                 Err(_) => break,
             }
@@ -31,8 +32,35 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>) {
     });
 }
 
-async fn handle_connection(stream: tokio::net::UnixStream, tx: mpsc::Sender<AppEvent>) {
-    let (read_half, write_half) = stream.into_split();
+pub fn spawn_tcp_listener(tx: mpsc::Sender<AppEvent>, port: u16) {
+    tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{}", port);
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[ipc] failed to bind TCP {}: {}", addr, e);
+                return;
+            }
+        };
+        eprintln!("[ipc] TCP agent listener on {}", addr);
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let tx = tx.clone();
+                    let (r, w) = stream.into_split();
+                    tokio::spawn(handle_stream(Box::new(r), Box::new(w), tx));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+async fn handle_stream(
+    read_half: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    write_half: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    tx: mpsc::Sender<AppEvent>,
+) {
     let (agent_tx, agent_rx) = mpsc::channel::<String>(32);
     tokio::spawn(write_loop(write_half, agent_rx));
 
@@ -89,7 +117,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, tx: mpsc::Sender<AppE
 }
 
 async fn write_loop(
-    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    mut write_half: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     mut rx: mpsc::Receiver<String>,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -142,6 +170,15 @@ async fn dispatch(
                 let _ = tx.send(AppEvent::SessionOutput {
                     session_id: sid,
                     line: text.to_string(),
+                }).await;
+            }
+        }
+        Some("fire_pipe") => {
+            if let Some(source) = msg["source"].as_u64() {
+                let dest = msg["dest"].as_u64().map(|v| v as usize);
+                let _ = tx.send(AppEvent::IpcFirePipe {
+                    source: source as usize,
+                    dest,
                 }).await;
             }
         }
