@@ -1,5 +1,6 @@
 mod app;
 mod claude_log;
+mod codex_log;
 mod events;
 mod ipc;
 mod patterns;

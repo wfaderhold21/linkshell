@@ -173,6 +173,9 @@ impl App {
             }
             crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone());
         }
+        if matches!(kind, SessionKind::Codex) {
+            crate::codex_log::spawn_watcher(id, cwd.clone(), tx.clone());
+        }
 
         tokio::spawn(async move {
             if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone()).await {
@@ -319,8 +322,8 @@ impl App {
                     session.state = new_state;
                 }
             }
-            // Claude stats come from the JSONL watcher (SessionStats events); skip here.
-            if !matches!(session.kind, SessionKind::Claude) {
+            // Claude and Codex stats come from their JSONL watchers; skip terminal scraping.
+            if matches!(session.kind, SessionKind::Shell | SessionKind::Custom(_)) {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
                 }
@@ -549,16 +552,10 @@ impl App {
                     }
                 }
             }
-            if matches!(session.kind, SessionKind::Claude | SessionKind::Codex) {
+            if matches!(session.kind, SessionKind::Claude) {
                 let text = extract_screen_text(&session.screen);
                 if !session.pro_sub && text.contains("Claude Pro") {
                     session.pro_sub = true;
-                }
-                // Claude stats come from the JSONL watcher; only use screen scraping for Codex.
-                if !session.pro_sub && !matches!(session.kind, SessionKind::Claude) {
-                    if let Some(stats) = self.matcher.parse_screen_stats(&text) {
-                        session.apply_reported_total(stats);
-                    }
                 }
             }
         }
