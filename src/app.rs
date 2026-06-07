@@ -168,6 +168,9 @@ impl App {
         let cmd_str = kind.command();
 
         if matches!(kind, SessionKind::Claude) {
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                s.pro_sub = crate::claude_log::is_pro_subscription();
+            }
             crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone());
         }
 

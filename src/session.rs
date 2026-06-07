@@ -174,9 +174,7 @@ impl Session {
 
     pub fn tokens_display(&self) -> String {
         let total = self.stats.input_tokens + self.stats.output_tokens;
-        if self.pro_sub {
-            "—".to_string()
-        } else if total == 0 {
+        if total == 0 {
             "—".to_string()
         } else if total >= 1000 {
             format!("{:.1}k tok", total as f64 / 1000.0)

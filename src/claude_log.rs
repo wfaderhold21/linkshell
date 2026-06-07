@@ -175,6 +175,36 @@ async fn tail(
     }
 }
 
+/// Returns true if stats-cache.json shows token usage with zero cost — reliable
+/// indicator that the account is on a Pro/Max subscription rather than API billing.
+pub fn is_pro_subscription() -> bool {
+    let path = match std::env::var("HOME").ok() {
+        Some(h) => std::path::PathBuf::from(h).join(".claude").join("stats-cache.json"),
+        None => return false,
+    };
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if let Some(models) = v["modelUsage"].as_object() {
+        for usage in models.values() {
+            let tokens = usage["inputTokens"].as_u64().unwrap_or(0)
+                + usage["outputTokens"].as_u64().unwrap_or(0)
+                + usage["cacheReadInputTokens"].as_u64().unwrap_or(0)
+                + usage["cacheCreationInputTokens"].as_u64().unwrap_or(0);
+            let cost = usage["costUSD"].as_f64().unwrap_or(-1.0);
+            if tokens > 0 && cost == 0.0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Spawn a background task that watches the Claude CLI project JSONL for this
 /// session and emits `SessionStats` events with the true cumulative totals.
 pub fn spawn_watcher(
