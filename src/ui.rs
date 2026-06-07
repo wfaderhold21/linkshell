@@ -142,9 +142,10 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         let (screen_rows, screen_cols) = screen.size();
         let display_rows = area.height.saturating_sub(2) as u16;
         let scroll_offset = app.scroll_offset() as u16;
-        // end_row is exclusive; clamp so we never exceed screen_rows
-        let end_row = screen_rows.saturating_sub(scroll_offset);
-        let start_row = end_row.saturating_sub(display_rows);
+        // vt100 handles the scrollback offset internally via set_scrollback;
+        // just display the bottom display_rows rows of the virtual screen.
+        let start_row = screen_rows.saturating_sub(display_rows);
+        let end_row = screen_rows;
         let scroll_indicator = if scroll_offset > 0 {
             format!(" ↑{} ", scroll_offset)
         } else {

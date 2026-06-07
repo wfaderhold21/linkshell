@@ -92,8 +92,6 @@ pub struct App {
     pub session_slot_areas: Vec<Rect>,
     // Text selection
     pub selection: Option<Selection>,
-    // Per-session scroll offsets (lines from bottom; 0 = live tail)
-    pub scroll_offsets: HashMap<usize, usize>,
     matcher: PatternMatcher,
     next_id: usize,
     /// Pending IPC reply channels: session_id → (oneshot sender, line offset when input was sent).
@@ -118,7 +116,6 @@ impl App {
             session_bar_area: Rect::default(),
             session_slot_areas: Vec::new(),
             selection: None,
-            scroll_offsets: HashMap::new(),
             matcher: PatternMatcher::new(),
             next_id: 0,
             pending_ipc_replies: HashMap::new(),
@@ -245,21 +242,18 @@ impl App {
 
     pub fn scroll_up(&mut self, lines: usize) {
         if let Some(idx) = self.active_idx {
-            if let Some(session) = self.sessions.get(idx) {
-                let screen = session.screen.screen();
-                let (screen_rows, _) = screen.size();
-                let max_offset = screen_rows as usize;
-                let offset = self.scroll_offsets.entry(session.id).or_insert(0);
-                *offset = (*offset + lines).min(max_offset);
+            if let Some(session) = self.sessions.get_mut(idx) {
+                let current = session.screen.screen().scrollback();
+                session.screen.set_scrollback(current + lines);
             }
         }
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
         if let Some(idx) = self.active_idx {
-            if let Some(session) = self.sessions.get(idx) {
-                let offset = self.scroll_offsets.entry(session.id).or_insert(0);
-                *offset = offset.saturating_sub(lines);
+            if let Some(session) = self.sessions.get_mut(idx) {
+                let current = session.screen.screen().scrollback();
+                session.screen.set_scrollback(current.saturating_sub(lines));
             }
         }
     }
@@ -267,8 +261,7 @@ impl App {
     pub fn scroll_offset(&self) -> usize {
         self.active_idx
             .and_then(|i| self.sessions.get(i))
-            .and_then(|s| self.scroll_offsets.get(&s.id))
-            .copied()
+            .map(|s| s.screen.screen().scrollback())
             .unwrap_or(0)
     }
 
@@ -304,8 +297,16 @@ impl App {
             session.process_bytes(&data);
         }
         // Auto-scroll to bottom when the active session receives new output
-        if self.active_idx.and_then(|i| self.sessions.get(i)).map(|s| s.id) == Some(session_id) {
-            self.scroll_offsets.insert(session_id, 0);
+        let active_is_updated = self.active_idx
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.id == session_id)
+            .unwrap_or(false);
+        if active_is_updated {
+            if let Some(idx) = self.active_idx {
+                if let Some(session) = self.sessions.get_mut(idx) {
+                    session.screen.set_scrollback(0);
+                }
+            }
         }
     }
 
