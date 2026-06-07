@@ -334,20 +334,42 @@ impl App {
     }
 
     fn check_pipes(&mut self, session_id: usize, new_state: &SessionState) {
-        let triggered: Vec<Pipe> = self.pipes.iter()
-            .filter(|p| {
-                p.source == session_id
-                    && p.active
-                    && match p.trigger {
-                        PipeTrigger::OnReady   => *new_state == SessionState::Ready,
-                        PipeTrigger::OnWaiting => *new_state == SessionState::Waiting,
-                        PipeTrigger::Manual    => false,
-                    }
-            })
-            .cloned()
-            .collect();
+        let now = std::time::Instant::now();
+        let mut to_fire: Vec<Pipe> = Vec::new();
 
-        for p in triggered {
+        for p in self.pipes.iter_mut() {
+            if p.source != session_id || !p.active { continue; }
+            let fires = match p.trigger {
+                PipeTrigger::OnReady   => *new_state == SessionState::Ready,
+                PipeTrigger::OnWaiting => *new_state == SessionState::Waiting,
+                PipeTrigger::Manual    => false,
+            };
+            if fires {
+                p.last_fired = Some(now);
+                to_fire.push(p.clone());
+            }
+        }
+
+        for p in to_fire {
+            if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
+                pipe::fire_pipe_task(p, content, self.event_tx.clone());
+            }
+        }
+    }
+
+    fn fire_manual_pipes(&mut self, source: usize, dest: Option<usize>) {
+        let now = std::time::Instant::now();
+        let mut to_fire: Vec<Pipe> = Vec::new();
+
+        for p in self.pipes.iter_mut() {
+            if p.source != source || !p.active { continue; }
+            if p.trigger != PipeTrigger::Manual { continue; }
+            if let Some(d) = dest { if p.dest != d { continue; } }
+            p.last_fired = Some(now);
+            to_fire.push(p.clone());
+        }
+
+        for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
                 pipe::fire_pipe_task(p, content, self.event_tx.clone());
             }
@@ -765,6 +787,17 @@ impl App {
     }
 
     fn execute_pipe_command(&mut self, args: &[&str]) {
+        if args.first() == Some(&"fire") {
+            let src_id = args.get(1).and_then(|s| s.parse::<usize>().ok())
+                .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
+            let dst_id = args.get(2).and_then(|s| s.parse::<usize>().ok())
+                .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
+            if let Some(source) = src_id {
+                self.fire_manual_pipes(source, dst_id);
+            }
+            return;
+        }
+
         if args.len() < 2 { return; }
         let src_id = args[0].parse::<usize>().ok()
             .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
@@ -812,7 +845,7 @@ impl App {
             i += 1;
         }
 
-        self.pipes.push(Pipe { source, dest, trigger, extract, prefix, active: true });
+        self.pipes.push(Pipe { source, dest, trigger, extract, prefix, active: true, last_fired: None });
     }
 
     fn execute_unpipe_command(&mut self, args: &[&str]) {

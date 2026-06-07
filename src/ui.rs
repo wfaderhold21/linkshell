@@ -326,16 +326,21 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
         let cost    = session.cost_display();
         let elapsed = session.elapsed_display();
 
-        // Pipe destinations: "→2,→3" or blank
-        let pipe_label = {
+        // Pipe destinations: "→2,→3" or blank; bold for 1s after firing
+        let (pipe_label, pipe_recently_fired) = {
+            let mut fired = false;
             let dests: Vec<String> = app.pipes.iter()
                 .filter(|p| p.source == session.id && p.active)
                 .filter_map(|p| {
+                    if p.last_fired.map(|t| t.elapsed().as_millis() < 1000).unwrap_or(false) {
+                        fired = true;
+                    }
                     app.sessions.iter().position(|s| s.id == p.dest)
                         .map(|idx| format!("→{}", idx + 1))
                 })
                 .collect();
-            if dests.is_empty() { String::new() } else { dests.join(",") }
+            let label = if dests.is_empty() { String::new() } else { dests.join(",") };
+            (label, fired)
         };
 
         let spans = vec![
@@ -343,7 +348,10 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw("│ "),
             Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
             Span::raw("│ "),
-            Span::styled(format!("{:<5} ", pipe_label), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<5} ", pipe_label), {
+                let s = Style::default().fg(Color::Cyan);
+                if pipe_recently_fired { s.add_modifier(Modifier::BOLD) } else { s }
+            }),
             Span::raw("│ "),
             Span::styled(format!("{:<8} ", session.state.label()), state_style),
             Span::raw("│ "),

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use tokio::sync::mpsc;
 
 use crate::events::AppEvent;
@@ -26,6 +28,7 @@ pub struct Pipe {
     pub extract: ExtractMode,
     pub prefix: Option<String>,
     pub active: bool,
+    pub last_fired: Option<Instant>,
 }
 
 pub fn extract_from_session(sessions: &[Session], id: usize, mode: &ExtractMode) -> Option<String> {
