@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
+    event::{
+        self, Event, KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture,
+        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -32,6 +35,13 @@ async fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
+    // Enable kitty keyboard protocol so the outer terminal (e.g. iTerm) sends
+    // extended sequences for keys like Shift+Enter that would otherwise be
+    // indistinguishable from plain Enter.
+    let kitty_supported = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    ).is_ok();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -110,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
+    if kitty_supported {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 

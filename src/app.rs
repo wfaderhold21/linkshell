@@ -1149,6 +1149,8 @@ async fn run_pty(
 
     // Channel for bytes coming from App → PTY
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Clone for use inside the PTY reader task (kitty protocol responses)
+    let write_tx_kitty = write_tx.clone();
     // Channel for resize events coming from App → PTY
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(4);
 
@@ -1194,6 +1196,12 @@ async fn run_pty(
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
                 let data = buf[..n].to_vec();
+                // Respond to kitty keyboard protocol query (CSI ? u → CSI ? 1 u).
+                // Without this, apps like claude code never enable kitty mode and
+                // won't recognize Shift+Enter (ESC [ 13 ; 2 u).
+                if data.windows(4).any(|w| w == b"\x1b[?u") {
+                    let _ = write_tx_kitty.send(b"\x1b[?1u".to_vec()).await;
+                }
                 // Raw bytes → vt100 screen buffer for display
                 if tx.send(AppEvent::SessionBytes { session_id, data: data.clone() }).await.is_err() {
                     return Ok(());
