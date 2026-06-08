@@ -140,6 +140,11 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::SessionStats { session_id, stats } => {
             app.handle_session_stats(session_id, stats);
         }
+        AppEvent::SessionBillingKnown { session_id, is_pro } => {
+            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.pro_sub = is_pro;
+            }
+        }
         AppEvent::PipeRelay { dest_id, message } => {
             app.handle_pipe_relay(dest_id, message);
         }

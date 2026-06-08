@@ -17,6 +17,8 @@ pub enum AppEvent {
     SessionDied       { session_id: usize },
     /// Authoritative cumulative token stats read from ~/.claude project JSONL
     SessionStats      { session_id: usize, stats: crate::session::TokenStats },
+    /// Billing type detected from service_tier in JSONL; emitted once per session
+    SessionBillingKnown { session_id: usize, is_pro: bool },
     /// Content forwarded from a source session's pipe to a destination session's PTY
     PipeRelay         { dest_id: usize, message: String },
     /// State override injected by an external orchestrator via the IPC socket

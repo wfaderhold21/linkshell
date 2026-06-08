@@ -56,11 +56,12 @@ async fn wait_for_new_jsonl(
 }
 
 struct RawUsage {
-    input:       u64,
-    cache_write: u64,
-    cache_read:  u64,
-    output:      u64,
-    model:       String,
+    input:        u64,
+    cache_write:  u64,
+    cache_read:   u64,
+    output:       u64,
+    model:        String,
+    service_tier: Option<String>,
 }
 
 fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
@@ -74,11 +75,12 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
     let usage = v["message"]["usage"].as_object()?;
     let get = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     let raw = RawUsage {
-        input:       get("input_tokens"),
-        cache_write: get("cache_creation_input_tokens"),
-        cache_read:  get("cache_read_input_tokens"),
-        output:      get("output_tokens"),
+        input:        get("input_tokens"),
+        cache_write:  get("cache_creation_input_tokens"),
+        cache_read:   get("cache_read_input_tokens"),
+        output:       get("output_tokens"),
         model,
+        service_tier: usage.get("service_tier").and_then(|v| v.as_str()).map(str::to_owned),
     };
     if raw.input == 0 && raw.cache_write == 0 && raw.cache_read == 0 && raw.output == 0 {
         return None;
@@ -119,12 +121,13 @@ async fn tail(
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
     config: &Config,
 ) {
-    let mut acc_input:       u64 = 0;
-    let mut acc_cache_write: u64 = 0;
-    let mut acc_cache_read:  u64 = 0;
-    let mut acc_output:      u64 = 0;
-    let mut acc_cost:        f64 = 0.0;
-    let mut context_tokens:  u64 = 0;
+    let mut acc_input:        u64  = 0;
+    let mut acc_cache_write:  u64  = 0;
+    let mut acc_cache_read:   u64  = 0;
+    let mut acc_output:       u64  = 0;
+    let mut acc_cost:         f64  = 0.0;
+    let mut context_tokens:   u64  = 0;
+    let mut billing_detected: bool = false;
     let mut offset: u64 = 0;
 
     loop {
@@ -155,6 +158,16 @@ async fn tail(
                                 }).await;
                             }
                             if let Some(raw) = parse_usage_from_value(&v) {
+                                if !billing_detected {
+                                    if let Some(ref tier) = raw.service_tier {
+                                        billing_detected = true;
+                                        let is_pro = tier != "standard";
+                                        let _ = tx.send(AppEvent::SessionBillingKnown {
+                                            session_id,
+                                            is_pro,
+                                        }).await;
+                                    }
+                                }
                                 acc_cost        += compute_cost(&raw, config);
                                 acc_input       += raw.input;
                                 acc_cache_write += raw.cache_write;
@@ -186,35 +199,6 @@ async fn tail(
     }
 }
 
-/// Returns true if stats-cache.json shows token usage with zero cost — reliable
-/// indicator that the account is on a Pro/Max subscription rather than API billing.
-pub fn is_pro_subscription() -> bool {
-    let path = match std::env::var("HOME").ok() {
-        Some(h) => std::path::PathBuf::from(h).join(".claude").join("stats-cache.json"),
-        None => return false,
-    };
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    let v: serde_json::Value = match serde_json::from_str(&data) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if let Some(models) = v["modelUsage"].as_object() {
-        for usage in models.values() {
-            let tokens = usage["inputTokens"].as_u64().unwrap_or(0)
-                + usage["outputTokens"].as_u64().unwrap_or(0)
-                + usage["cacheReadInputTokens"].as_u64().unwrap_or(0)
-                + usage["cacheCreationInputTokens"].as_u64().unwrap_or(0);
-            let cost = usage["costUSD"].as_f64().unwrap_or(-1.0);
-            if tokens > 0 && cost == 0.0 {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 /// Spawn a background task that watches the Claude CLI project JSONL for this
 /// session and emits `SessionStats` events with the true cumulative totals.

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use ratatui::layout::Rect;
-use vt100::Parser as VtParser;
 
 use crate::config::{self, Config};
 use crate::events::AppEvent;
@@ -206,9 +205,6 @@ impl App {
         let socket = crate::ipc::socket_path(&self.config);
 
         if matches!(kind, SessionKind::Claude) {
-            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
-                s.pro_sub = crate::claude_log::is_pro_subscription();
-            }
             crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
         }
         if matches!(kind, SessionKind::Codex) {
@@ -790,12 +786,6 @@ impl App {
                     }
                 }
             }
-            if matches!(session.kind, SessionKind::Claude) {
-                let text = extract_screen_text(&session.screen);
-                if !session.pro_sub && text.contains("Claude Pro") {
-                    session.pro_sub = true;
-                }
-            }
         }
 
         for id in tick_ready {
@@ -1276,21 +1266,6 @@ fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
     (c, r)
 }
 
-fn extract_screen_text(parser: &VtParser) -> String {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let mut text = String::new();
-    for row in 0..rows {
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                let s = cell.contents();
-                text.push_str(if s.is_empty() { " " } else { &s });
-            }
-        }
-        text.push('\n');
-    }
-    text
-}
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
