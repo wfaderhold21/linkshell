@@ -291,6 +291,7 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         KeyCode::Enter     => vec![b'\r'],
         KeyCode::Backspace => vec![127],
         KeyCode::Tab       => vec![b'\t'],
+        KeyCode::BackTab   => vec![27, b'[', b'Z'],
         KeyCode::Esc       => vec![27],
         KeyCode::Up        => vec![27, b'[', b'A'],
         KeyCode::Down      => vec![27, b'[', b'B'],
