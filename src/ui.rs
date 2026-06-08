@@ -104,7 +104,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 
     // ── Top-level vertical split ───────────────────────────────────────────
     // main output | session bar | status panel
-    let status_rows = app.sessions.len().max(1) as u16 + 3; // border + header + rows
+    let status_rows = app.sessions.len().max(1) as u16 + 4; // border + header + rows + socket footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -299,7 +299,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     for (i, session) in app.sessions.iter().enumerate() {
-        if i + 1 >= inner.height as usize {
+        if i + 2 >= inner.height as usize {
             break;
         }
 
@@ -367,6 +367,22 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
 
         let line = Paragraph::new(Line::from(spans));
         f.render_widget(line, row);
+    }
+
+    // Socket path footer — always at the last row of inner area
+    if inner.height > 0 {
+        let sock = crate::ipc::socket_path(&app.config);
+        let footer_row = Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        };
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("  sock: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(sock, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
+        ]));
+        f.render_widget(footer, footer_row);
     }
 }
 
