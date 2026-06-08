@@ -42,8 +42,6 @@ fn default_keymap() -> Keymap {
     let mut m = HashMap::new();
     let alt   = KeyModifiers::ALT;
     let ctrl  = KeyModifiers::CONTROL;
-    let shift = KeyModifiers::SHIFT;
-    let none  = KeyModifiers::NONE;
 
     m.insert((alt,   KeyCode::Char('n')),  Action::NewSession);
     m.insert((alt,   KeyCode::Char('c')),  Action::CommandBar);
@@ -54,10 +52,11 @@ fn default_keymap() -> Keymap {
     m.insert((alt,   KeyCode::Right),      Action::NextSession);
     m.insert((alt,   KeyCode::Tab),        Action::NextSession);
     m.insert((alt,   KeyCode::BackTab),    Action::PrevSession);
-    m.insert((none,  KeyCode::PageUp),     Action::ScrollUpPage);
-    m.insert((none,  KeyCode::PageDown),   Action::ScrollDownPage);
-    m.insert((shift, KeyCode::Up),         Action::ScrollUpLine);
-    m.insert((shift, KeyCode::Down),       Action::ScrollDownLine);
+    let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+    m.insert((alt_shift, KeyCode::PageUp),   Action::ScrollUpPage);
+    m.insert((alt_shift, KeyCode::PageDown), Action::ScrollDownPage);
+    m.insert((alt_shift, KeyCode::Up),       Action::ScrollUpLine);
+    m.insert((alt_shift, KeyCode::Down),     Action::ScrollDownLine);
 
     for i in 1u32..=8 {
         let c = char::from_digit(i, 10).unwrap();

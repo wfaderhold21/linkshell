@@ -277,6 +277,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         KeyCode::Char(c) => {
             if key.modifiers == KeyModifiers::CONTROL {
@@ -288,18 +289,21 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
             let mut buf = [0u8; 4];
             c.encode_utf8(&mut buf).as_bytes().to_vec()
         }
-        KeyCode::Enter     => vec![b'\r'],
+        // Shift+Enter: ESC [ 13 ; 2 u (kitty/xterm extended)
+        KeyCode::Enter     => if shift { vec![27, b'[', b'1', b'3', b';', b'2', b'u'] } else { vec![b'\r'] },
         KeyCode::Backspace => vec![127],
         KeyCode::Tab       => vec![b'\t'],
         KeyCode::BackTab   => vec![27, b'[', b'Z'],
         KeyCode::Esc       => vec![27],
-        KeyCode::Up        => vec![27, b'[', b'A'],
-        KeyCode::Down      => vec![27, b'[', b'B'],
-        KeyCode::Right     => vec![27, b'[', b'C'],
-        KeyCode::Left      => vec![27, b'[', b'D'],
-        KeyCode::Home      => vec![27, b'[', b'H'],
-        KeyCode::End       => vec![27, b'[', b'F'],
-        KeyCode::Delete    => vec![27, b'[', b'3', b'~'],
+        KeyCode::Up        => if shift { vec![27, b'[', b'1', b';', b'2', b'A'] } else { vec![27, b'[', b'A'] },
+        KeyCode::Down      => if shift { vec![27, b'[', b'1', b';', b'2', b'B'] } else { vec![27, b'[', b'B'] },
+        KeyCode::Right     => if shift { vec![27, b'[', b'1', b';', b'2', b'C'] } else { vec![27, b'[', b'C'] },
+        KeyCode::Left      => if shift { vec![27, b'[', b'1', b';', b'2', b'D'] } else { vec![27, b'[', b'D'] },
+        KeyCode::Home      => if shift { vec![27, b'[', b'1', b';', b'2', b'H'] } else { vec![27, b'[', b'H'] },
+        KeyCode::End       => if shift { vec![27, b'[', b'1', b';', b'2', b'F'] } else { vec![27, b'[', b'F'] },
+        KeyCode::Delete    => if shift { vec![27, b'[', b'3', b';', b'2', b'~'] } else { vec![27, b'[', b'3', b'~'] },
+        KeyCode::PageUp    => if shift { vec![27, b'[', b'5', b';', b'2', b'~'] } else { vec![27, b'[', b'5', b'~'] },
+        KeyCode::PageDown  => if shift { vec![27, b'[', b'6', b';', b'2', b'~'] } else { vec![27, b'[', b'6', b'~'] },
         _                  => vec![],
     }
 }
