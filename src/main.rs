@@ -135,16 +135,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
             app.handle_session_stats(session_id, stats);
         }
         AppEvent::PipeRelay { dest_id, message } => {
-            // Push to a connected remote agent if registered for this session.
-            if let Some(agent_tx) = app.agent_writers.get(&dest_id) {
-                let relay = serde_json::json!({"type": "relay", "content": message.clone()});
-                let line = serde_json::to_string(&relay).unwrap_or_default() + "\n";
-                let _ = agent_tx.try_send(line);
-            }
-            // Write into the PTY if the session has one.
-            if let Some(session) = app.sessions.iter().find(|s| s.id == dest_id) {
-                session.write_bytes(message.into_bytes());
-            }
+            app.handle_pipe_relay(dest_id, message);
         }
         AppEvent::IpcFirePipe { source, dest } => {
             app.fire_manual_pipes(source, dest);

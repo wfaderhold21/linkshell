@@ -98,6 +98,8 @@ pub struct App {
     pub pending_ipc_replies: HashMap<usize, (tokio::sync::oneshot::Sender<serde_json::Value>, usize)>,
     /// Write channels to connected persistent agents, keyed by session_id.
     pub agent_writers: HashMap<usize, mpsc::Sender<String>>,
+    /// Buffered pipe relays waiting for the dest session to reach READY.
+    pub pending_relays: HashMap<usize, Vec<String>>,
 }
 
 impl App {
@@ -120,6 +122,7 @@ impl App {
             next_id: 0,
             pending_ipc_replies: HashMap::new(),
             agent_writers: HashMap::new(),
+            pending_relays: HashMap::new(),
         }
     }
 
@@ -336,6 +339,9 @@ impl App {
             if before != after {
                 self.check_pipes(session_id, &after);
                 self.check_ipc_replies(session_id, &after);
+                if after == SessionState::Ready {
+                    self.flush_pending_relays(session_id);
+                }
             }
         }
     }
@@ -352,6 +358,11 @@ impl App {
                 PipeTrigger::Manual    => false,
             };
             if fires {
+                if let Some(last) = p.last_fired {
+                    if last.elapsed().as_secs_f64() < 2.0 {
+                        continue;
+                    }
+                }
                 p.last_fired = Some(now);
                 to_fire.push(p.clone());
             }
@@ -426,6 +437,9 @@ impl App {
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
             self.check_ipc_replies(session_id, &state);
+            if state == SessionState::Ready {
+                self.flush_pending_relays(session_id);
+            }
         }
     }
 
@@ -454,8 +468,44 @@ impl App {
     }
 
     pub fn handle_session_died(&mut self, session_id: usize) {
+        if let Some((resp_tx, _)) = self.pending_ipc_replies.remove(&session_id) {
+            let _ = resp_tx.send(serde_json::json!({
+                "error": "session died before reaching READY",
+                "session_id": session_id,
+            }));
+        }
+        self.pending_relays.remove(&session_id);
         if let Some(idx) = self.sessions.iter().position(|s| s.id == session_id) {
             self.remove_session(idx);
+        }
+    }
+
+    pub fn handle_pipe_relay(&mut self, dest_id: usize, message: String) {
+        if let Some(agent_tx) = self.agent_writers.get(&dest_id) {
+            let relay = serde_json::json!({"type": "relay", "content": message.clone()});
+            let line = serde_json::to_string(&relay).unwrap_or_default() + "\n";
+            let _ = agent_tx.try_send(line);
+        }
+        let dest_ready = self.sessions.iter()
+            .find(|s| s.id == dest_id)
+            .map(|s| s.state == SessionState::Ready)
+            .unwrap_or(false);
+        if dest_ready {
+            if let Some(session) = self.sessions.iter().find(|s| s.id == dest_id) {
+                session.write_bytes(message.into_bytes());
+            }
+        } else {
+            self.pending_relays.entry(dest_id).or_default().push(message);
+        }
+    }
+
+    pub fn flush_pending_relays(&mut self, session_id: usize) {
+        if let Some(msgs) = self.pending_relays.remove(&session_id) {
+            if let Some(session) = self.sessions.iter().find(|s| s.id == session_id) {
+                for msg in msgs {
+                    session.write_bytes(msg.into_bytes());
+                }
+            }
         }
     }
 
@@ -564,6 +614,7 @@ impl App {
         for id in tick_ready {
             self.check_pipes(id, &SessionState::Ready);
             self.check_ipc_replies(id, &SessionState::Ready);
+            self.flush_pending_relays(id);
         }
     }
 
@@ -912,7 +963,7 @@ async fn run_pty(
         command.args(cmd_args);
         command.current_dir(&cwd);
         command.env("LINKSHELL_SESSION_ID", session_id.to_string());
-        command.env("LINKSHELL_SOCK", crate::ipc::SOCKET_PATH);
+        command.env("LINKSHELL_SOCK", crate::ipc::socket_path());
         command.spawn(&pts)?
     };
 

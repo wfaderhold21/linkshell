@@ -7,18 +7,22 @@ use tokio::sync::mpsc;
 use crate::events::{AppEvent, IpcQueryPayload};
 use crate::session::{SessionState, TokenStats};
 
-pub const SOCKET_PATH: &str = "/tmp/linkshell.sock";
+pub fn socket_path() -> String {
+    format!("/tmp/linkshell-{}.sock", std::process::id())
+}
 
 pub fn spawn_listener(tx: mpsc::Sender<AppEvent>) {
+    let path = socket_path();
     tokio::spawn(async move {
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        let listener = match UnixListener::bind(SOCKET_PATH) {
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[ipc] failed to bind {}: {}", SOCKET_PATH, e);
+                eprintln!("[ipc] failed to bind {}: {}", path, e);
                 return;
             }
         };
+        eprintln!("[linkshell] IPC socket: {}", path);
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -72,7 +76,11 @@ async fn handle_stream(
     }
     let first = match serde_json::from_str::<serde_json::Value>(line.trim()) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("invalid JSON: {}", e)});
+            let _ = agent_tx.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+            return;
+        }
     };
     line.clear();
 
