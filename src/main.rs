@@ -4,6 +4,7 @@ mod codex_log;
 mod config;
 mod events;
 mod ipc;
+mod keybindings;
 mod patterns;
 mod pipe;
 mod session;
@@ -23,6 +24,7 @@ use tokio::time;
 
 use app::{App, AppMode, NewSessionField};
 use events::AppEvent;
+use keybindings::Action;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -185,63 +187,22 @@ fn handle_event(app: &mut App, event: AppEvent) {
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     match app.mode {
         AppMode::Normal => {
-            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('n') {
-                app.open_new_session();
-                return;
-            }
-            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('c') {
-                app.open_command_bar();
-                return;
-            }
-            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('x') {
-                app.kill_active_session();
-                return;
-            }
-            if key.modifiers == KeyModifiers::ALT {
-                if let KeyCode::Char(c) = key.code {
-                    if let Some(digit) = c.to_digit(10) {
-                        if digit >= 1 && digit <= 8 {
-                            app.switch_to((digit - 1) as usize);
-                            return;
-                        }
-                    }
+            if let Some(action) = app.keymap.get(&(key.modifiers, key.code)).cloned() {
+                match action {
+                    Action::NewSession          => app.open_new_session(),
+                    Action::KillSession         => app.kill_active_session(),
+                    Action::CommandBar          => app.open_command_bar(),
+                    Action::Help                => app.mode = AppMode::Help,
+                    Action::Quit                => app.should_quit = true,
+                    Action::PrevSession         => app.prev_session(),
+                    Action::NextSession         => app.next_session(),
+                    Action::SwitchSession(i)    => app.switch_to(i),
+                    Action::ScrollUpPage        => app.scroll_up(20),
+                    Action::ScrollDownPage      => app.scroll_down(20),
+                    Action::ScrollUpLine        => app.scroll_up(3),
+                    Action::ScrollDownLine      => app.scroll_down(3),
                 }
-            }
-            if key.modifiers == KeyModifiers::ALT {
-                match key.code {
-                    KeyCode::Left  => { app.prev_session(); return; }
-                    KeyCode::Right => { app.next_session(); return; }
-                    _ => {}
-                }
-            }
-            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Tab {
-                app.next_session();
                 return;
-            }
-            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::BackTab {
-                app.prev_session();
-                return;
-            }
-            if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('h') {
-                app.mode = AppMode::Help;
-                return;
-            }
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
-                app.should_quit = true;
-                return;
-            }
-            // Scrollback
-            match key.code {
-                KeyCode::PageUp => { app.scroll_up(20); return; }
-                KeyCode::PageDown => { app.scroll_down(20); return; }
-                _ => {}
-            }
-            if key.modifiers == KeyModifiers::SHIFT {
-                match key.code {
-                    KeyCode::Up   => { app.scroll_up(3); return; }
-                    KeyCode::Down => { app.scroll_down(3); return; }
-                    _ => {}
-                }
             }
             // Pass through to PTY
             let bytes = key_to_bytes(&key);

@@ -7,6 +7,7 @@ use vt100::Parser as VtParser;
 
 use crate::config::{self, Config};
 use crate::events::AppEvent;
+use crate::keybindings::{self, Keymap};
 use crate::patterns::PatternMatcher;
 use crate::pipe::{self, Pipe, PipeTrigger, ExtractMode};
 use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_ROWS, PTY_COLS};
@@ -103,10 +104,12 @@ pub struct App {
     pub agent_writers: HashMap<usize, mpsc::Sender<String>>,
     /// Buffered pipe relays waiting for the dest session to reach READY.
     pub pending_relays: HashMap<usize, Vec<String>>,
+    pub keymap: Keymap,
 }
 
 impl App {
     pub fn new(event_tx: mpsc::Sender<AppEvent>, config: Arc<Config>) -> Self {
+        let keymap = keybindings::build_keymap(&config.keybindings);
         Self {
             sessions: Vec::new(),
             active_idx: None,
@@ -127,6 +130,7 @@ impl App {
             pending_ipc_replies: HashMap::new(),
             agent_writers: HashMap::new(),
             pending_relays: HashMap::new(),
+            keymap,
         }
     }
 

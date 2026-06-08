@@ -3,21 +3,23 @@ use std::collections::HashMap;
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
-    pub general:  GeneralConfig,
-    pub socket:   SocketConfig,
-    pub sessions: SessionsConfig,
-    pub pipe:     PipeConfig,
-    pub pricing:  PricingConfig,
+    pub general:     GeneralConfig,
+    pub socket:      SocketConfig,
+    pub sessions:    SessionsConfig,
+    pub pipe:        PipeConfig,
+    pub pricing:     PricingConfig,
+    pub keybindings: KeybindingsConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            general:  GeneralConfig::default(),
-            socket:   SocketConfig::default(),
-            sessions: SessionsConfig::default(),
-            pipe:     PipeConfig::default(),
-            pricing:  PricingConfig::default(),
+            general:     GeneralConfig::default(),
+            socket:      SocketConfig::default(),
+            sessions:    SessionsConfig::default(),
+            pipe:        PipeConfig::default(),
+            pricing:     PricingConfig::default(),
+            keybindings: KeybindingsConfig::default(),
         }
     }
 }
@@ -169,6 +171,27 @@ impl PricingConfig {
             .map(|(_, r)| r.clone())
             .unwrap_or_default()
     }
+}
+
+// ── [keybindings] ─────────────────────────────────────────────────────────
+
+/// Variable substitutions and key→action bindings.
+///
+/// In config.toml:
+///
+///   [keybindings.vars]
+///   META = "alt"
+///
+///   [keybindings.bind]
+///   "$META+n" = "new_session"
+///   "ctrl+q"  = "quit"
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct KeybindingsConfig {
+    /// Named modifier aliases, e.g. META = "alt".
+    pub vars: HashMap<String, String>,
+    /// chord → action, e.g. "$META+n" = "new_session".
+    pub bind: HashMap<String, String>,
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────
