@@ -144,6 +144,21 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::IpcFirePipe { source, dest } => {
             app.fire_manual_pipes(source, dest);
         }
+        AppEvent::IpcGroupFire { source_group } => {
+            app.handle_group_fire(&source_group);
+        }
+        AppEvent::IpcBroadcast { group, msg } => {
+            app.handle_broadcast(&group, msg);
+        }
+        AppEvent::IpcNamedAction { session_name, msg } => {
+            app.handle_named_action(session_name, msg);
+        }
+        AppEvent::IpcPipeAdd { source, dest, trigger, extract, prefix } => {
+            app.handle_ipc_pipe_add(source, dest, &trigger, &extract, prefix);
+        }
+        AppEvent::IpcPipeRemove { source, dest } => {
+            app.handle_ipc_pipe_remove(source, dest);
+        }
         AppEvent::IpcStateOverride { session_id, state } => {
             app.handle_ipc_state(session_id, state);
         }

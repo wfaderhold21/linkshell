@@ -231,10 +231,13 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let label = if name.is_empty() { format!("agent-{}", id + 1) } else { name };
-        let cwd = group.unwrap_or_else(|| ".".to_string());
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
         let (pty_rows, pty_cols) = self.pty_size;
         let mut session = Session::new(id, label, SessionKind::Shell, cwd, pty_rows, pty_cols);
         session.headless = true;
+        session.group = group;
         session.state = SessionState::Ready;
         self.sessions.push(session);
         Ok(id)
@@ -468,6 +471,7 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.state = state.clone();
             session.ipc_state = true;
+            session.ipc_state_set_at = Some(std::time::Instant::now());
         }
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
@@ -475,6 +479,94 @@ impl App {
             if state == SessionState::Ready {
                 self.flush_pending_relays(session_id);
             }
+        }
+    }
+
+    pub fn handle_named_action(&mut self, session_name: String, msg: serde_json::Value) {
+        let session_id = match self.sessions.iter().find(|s| s.name == session_name).map(|s| s.id) {
+            Some(id) => id,
+            None => return,
+        };
+        match msg["type"].as_str() {
+            Some("state") => {
+                if let Some(s) = crate::ipc::parse_session_state(msg["state"].as_str().unwrap_or("")) {
+                    if let Some(detail) = msg["detail"].as_str() {
+                        let _ = self.event_tx.try_send(AppEvent::SessionOutput {
+                            session_id,
+                            line: format!("[{}]", detail),
+                        });
+                    }
+                    self.handle_ipc_state(session_id, s);
+                }
+            }
+            Some("tokens") => {
+                use crate::session::TokenStats;
+                self.handle_ipc_tokens(session_id, TokenStats {
+                    input_tokens:   msg["input"].as_u64().unwrap_or(0),
+                    output_tokens:  msg["output"].as_u64().unwrap_or(0),
+                    total_cost_usd: msg["cost"].as_f64().unwrap_or(0.0),
+                    context_tokens: 0,
+                });
+            }
+            Some("output") => {
+                if let Some(line) = msg["line"].as_str() {
+                    let _ = self.event_tx.try_send(AppEvent::SessionOutput {
+                        session_id,
+                        line: line.to_string(),
+                    });
+                }
+            }
+            Some("fire_pipe") => {
+                let dest = msg["dest"].as_u64().map(|v| v as usize);
+                self.fire_manual_pipes(session_id, dest);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_ipc_pipe_add(&mut self, source: usize, dest: usize, trigger: &str, extract: &str, prefix: Option<String>) {
+        let trig = match trigger {
+            "on_waiting" | "waiting" => PipeTrigger::OnWaiting,
+            "manual"                 => PipeTrigger::Manual,
+            _                        => PipeTrigger::OnReady,
+        };
+        let ext = if extract == "diff" {
+            ExtractMode::Diff
+        } else if let Some(n) = extract.strip_prefix("last-n=") {
+            ExtractMode::LastN(n.parse().unwrap_or(20))
+        } else if let Some(n) = extract.strip_prefix("summarize=") {
+            ExtractMode::Summarize(n.parse().unwrap_or(150))
+        } else {
+            ExtractMode::LastBlock
+        };
+        self.pipes.push(Pipe { source, dest, trigger: trig, extract: ext, prefix, active: true, last_fired: None });
+    }
+
+    pub fn handle_ipc_pipe_remove(&mut self, source: usize, dest: Option<usize>) {
+        match dest {
+            None    => self.pipes.retain(|p| p.source != source),
+            Some(d) => self.pipes.retain(|p| !(p.source == source && p.dest == d)),
+        }
+    }
+
+    pub fn handle_broadcast(&self, group: &str, msg: serde_json::Value) {
+        let line = serde_json::to_string(&msg).unwrap_or_default() + "\n";
+        for session in &self.sessions {
+            if session.group.as_deref() == Some(group) {
+                if let Some(tx) = self.agent_writers.get(&session.id) {
+                    let _ = tx.try_send(line.clone());
+                }
+            }
+        }
+    }
+
+    pub fn handle_group_fire(&mut self, source_group: &str) {
+        let ids: Vec<usize> = self.sessions.iter()
+            .filter(|s| s.group.as_deref() == Some(source_group))
+            .map(|s| s.id)
+            .collect();
+        for id in ids {
+            self.fire_manual_pipes(id, None);
         }
     }
 
@@ -595,6 +687,49 @@ impl App {
                     }
                 }
             }
+            IpcQueryPayload::Query { what } => {
+                let resp = match what.as_str() {
+                    "sessions" => {
+                        let arr: Vec<_> = self.sessions.iter().map(|s| serde_json::json!({
+                            "id":            s.id,
+                            "name":          s.name,
+                            "kind":          s.kind.label(),
+                            "state":         s.state.label(),
+                            "group":         s.group,
+                            "input_tokens":  s.stats.input_tokens,
+                            "output_tokens": s.stats.output_tokens,
+                            "cost_usd":      s.stats.total_cost_usd,
+                        })).collect();
+                        serde_json::Value::Array(arr)
+                    }
+                    "pipes" => {
+                        let arr: Vec<_> = self.pipes.iter().map(|p| {
+                            let trigger = match p.trigger {
+                                PipeTrigger::OnReady   => "on_ready",
+                                PipeTrigger::OnWaiting => "on_waiting",
+                                PipeTrigger::Manual    => "manual",
+                            };
+                            let extract = match &p.extract {
+                                ExtractMode::LastBlock    => "last-block".to_string(),
+                                ExtractMode::LastN(n)     => format!("last-n={}", n),
+                                ExtractMode::Diff         => "diff".to_string(),
+                                ExtractMode::Summarize(n) => format!("summarize={}", n),
+                            };
+                            serde_json::json!({
+                                "source":  p.source,
+                                "dest":    p.dest,
+                                "trigger": trigger,
+                                "extract": extract,
+                                "prefix":  p.prefix,
+                                "active":  p.active,
+                            })
+                        }).collect();
+                        serde_json::Value::Array(arr)
+                    }
+                    _ => serde_json::json!({"error": "unknown query"}),
+                };
+                let _ = response_tx.send(resp);
+            }
             IpcQueryPayload::SessionInputWait { session_id, text } => {
                 if let Some(s) = self.sessions.iter().find(|s| s.id == session_id) {
                     let line_offset = s.output_lines.len();
@@ -621,6 +756,19 @@ impl App {
             session.bytes_since_last_tick = 0;
             if !session.ipc_state && session.state == SessionState::Ready && bytes > 80 {
                 session.state = SessionState::Running;
+            }
+            // Expire stale ipc_state overrides.
+            if session.ipc_state {
+                let timeout = self.config.general.ipc_state_override_timeout_secs;
+                let expired = session.ipc_state_set_at
+                    .map(|t| t.elapsed().as_secs() > timeout)
+                    .unwrap_or(false);
+                if expired {
+                    session.ipc_state = false;
+                    session.ipc_state_set_at = None;
+                    session.state = SessionState::Ready;
+                    tick_ready.push(session.id);
+                }
             }
             if !session.ipc_state {
                 if let Some(last) = session.last_output_at {

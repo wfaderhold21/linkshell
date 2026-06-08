@@ -36,6 +36,16 @@ pub enum AppEvent {
     IpcSend { session_id: usize, message: serde_json::Value },
     /// Fire manual pipes from source; dest=None fires all manual pipes from source
     IpcFirePipe { source: usize, dest: Option<usize> },
+    /// Fire all manual pipes from every session in a named group
+    IpcGroupFire { source_group: String },
+    /// Broadcast a raw JSON message to all agent_writers in the named group
+    IpcBroadcast { group: String, msg: serde_json::Value },
+    /// IPC message addressed by session name instead of numeric id
+    IpcNamedAction { session_name: String, msg: serde_json::Value },
+    /// Add a pipe declared via IPC
+    IpcPipeAdd { source: usize, dest: usize, trigger: String, extract: String, prefix: Option<String> },
+    /// Remove pipe(s) via IPC
+    IpcPipeRemove { source: usize, dest: Option<usize> },
     Tick,
 }
 
@@ -44,4 +54,6 @@ pub enum IpcQueryPayload {
     SessionCreate { kind_str: String, name: String, cwd: String },
     SessionInputWait { session_id: usize, text: String },
     Register { name: String, group: Option<String> },
+    /// Synchronous snapshot query: "sessions" or "pipes"
+    Query { what: String },
 }

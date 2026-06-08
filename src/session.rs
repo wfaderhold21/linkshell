@@ -80,6 +80,10 @@ pub struct Session {
     /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
     /// Cleared when pattern matching updates the state from PTY output.
     pub ipc_state: bool,
+    /// When ipc_state was last set; used to expire stale overrides in handle_tick.
+    pub ipc_state_set_at: Option<Instant>,
+    /// Agent group for broadcast addressing and group-triggered pipes.
+    pub group: Option<String>,
     /// vt100 screen buffer — updated with raw PTY bytes, used for display
     pub screen: vt100::Parser,
     pub stats: TokenStats,
@@ -107,6 +111,8 @@ impl Session {
             state: SessionState::Starting,
             headless: false,
             ipc_state: false,
+            ipc_state_set_at: None,
+            group: None,
             screen: vt100::Parser::new(rows, cols, 1000),
             stats: TokenStats::default(),
             pro_sub: false,
