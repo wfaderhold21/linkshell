@@ -146,6 +146,11 @@ async fn tail(
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(n) => {
+                            // If the line has no trailing newline we hit EOF mid-write.
+                            // Don't advance offset — retry the partial bytes next poll.
+                            if !line.ends_with('\n') {
+                                break;
+                            }
                             offset += n as u64;
                             let v: serde_json::Value = match serde_json::from_str(line.trim()) {
                                 Ok(v) => v,
@@ -208,21 +213,26 @@ pub fn spawn_watcher(
     tx: tokio::sync::mpsc::Sender<AppEvent>,
     config: Arc<Config>,
 ) {
+    let dir = match project_dir(&cwd) {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Snapshot existing JSONL files SYNCHRONOUSLY here, before the PTY runner is
+    // even spawned. This closes the race where Claude creates its new session file
+    // before the async watcher task gets to run on a multi-threaded executor.
+    let existing = if dir.exists() { jsonl_files(&dir) } else { HashSet::new() };
+
     tokio::spawn(async move {
-        let dir = match project_dir(&cwd) {
-            Some(d) => d,
-            None => return,
-        };
-
-        // Wait for the project dir to exist (may be first session in this cwd)
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if dir.exists() { break; }
-            if tokio::time::Instant::now() >= deadline { return; }
-            sleep(Duration::from_millis(200)).await;
+        // Wait for the project dir to exist (first session in this cwd).
+        if !dir.exists() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if dir.exists() { break; }
+                if tokio::time::Instant::now() >= deadline { return; }
+                sleep(Duration::from_millis(200)).await;
+            }
         }
-
-        let existing = jsonl_files(&dir);
 
         let jsonl = match wait_for_new_jsonl(&dir, &existing, Duration::from_secs(30)).await {
             Some(p) => p,
