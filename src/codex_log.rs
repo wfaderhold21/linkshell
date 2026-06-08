@@ -101,6 +101,7 @@ fn parse_token_count(v: &serde_json::Value, model: &str, config: &Config) -> Opt
     let last = &info["last_token_usage"];
 
     let input_tokens = total["input_tokens"].as_u64().unwrap_or(0);
+    let cached_input_tokens = total["cached_input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = total["output_tokens"].as_u64().unwrap_or(0);
     let context_tokens = last["input_tokens"].as_u64().unwrap_or(0);
 
@@ -109,7 +110,9 @@ fn parse_token_count(v: &serde_json::Value, model: &str, config: &Config) -> Opt
     }
 
     let rate = config.pricing.codex_rate(model);
-    let total_cost_usd = (input_tokens as f64 / 1_000_000.0) * rate.input
+    let billable_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    let total_cost_usd = (billable_input_tokens as f64 / 1_000_000.0) * rate.input
+        + (cached_input_tokens as f64 / 1_000_000.0) * rate.cache_read
         + (output_tokens as f64 / 1_000_000.0) * rate.output;
 
     Some(TokenStats {
@@ -232,6 +235,32 @@ mod tests {
         assert_eq!(stats.context_tokens, 31619);
         // "unknown" model rate is 0.0, so cost should be 0.
         assert_eq!(stats.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn computes_codex_token_based_credits_with_cached_input() {
+        let v: serde_json::Value = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1_000_000,
+                        "cached_input_tokens": 250_000,
+                        "output_tokens": 10_000
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 1_000_000
+                    }
+                }
+            }
+        });
+
+        let config = crate::config::Config::default();
+        let stats = parse_token_count(&v, "gpt-5.4-mini", &config).unwrap();
+
+        let expected = 0.75 * 18.75 + 0.25 * 1.875 + 0.01 * 113.0;
+        assert!((stats.total_cost_usd - expected).abs() < f64::EPSILON);
     }
 
     #[test]

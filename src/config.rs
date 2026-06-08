@@ -133,9 +133,15 @@ impl Default for PricingConfig {
         claude.insert("claude-haiku".into(),  ModelRate { input:  0.80, cache_write:  1.00, cache_read: 0.08,  output:  4.00 });
 
         let mut codex = HashMap::new();
-        codex.insert("codex-mini".into(), ModelRate { input: 1.50, cache_write: 0.0, cache_read: 0.0, output: 6.00 });
-        codex.insert("o4-mini".into(),    ModelRate { input: 1.10, cache_write: 0.0, cache_read: 0.0, output: 4.40 });
-        codex.insert("unknown".into(),    ModelRate { input: 0.00, cache_write: 0.0, cache_read: 0.0, output: 0.00 });
+        // Codex rates are credits per 1M tokens, not USD. `cache_read` is the
+        // cached-input token rate from the Codex token-based rate card.
+        codex.insert("gpt-5.5".into(),       ModelRate { input: 125.00, cache_write: 0.0, cache_read: 12.500, output: 750.00 });
+        codex.insert("gpt-5.4-mini".into(),  ModelRate { input:  18.75, cache_write: 0.0, cache_read:  1.875, output: 113.00 });
+        codex.insert("gpt-5.4".into(),       ModelRate { input:  62.50, cache_write: 0.0, cache_read:  6.250, output: 375.00 });
+        codex.insert("gpt-5.3-codex".into(), ModelRate { input:  43.75, cache_write: 0.0, cache_read:  4.375, output: 350.00 });
+        codex.insert("gpt-5.2-codex".into(), ModelRate { input:  43.75, cache_write: 0.0, cache_read:  4.375, output: 350.00 });
+        codex.insert("gpt-5.2".into(),       ModelRate { input:  43.75, cache_write: 0.0, cache_read:  4.375, output: 350.00 });
+        codex.insert("unknown".into(),       ModelRate { input:   0.00, cache_write: 0.0, cache_read:  0.000, output:   0.00 });
 
         Self { claude, codex }
     }
@@ -165,6 +171,7 @@ impl PricingConfig {
     /// Longest-prefix match on the Codex pricing table.
     /// Falls back to zero-cost "unknown" if nothing matches.
     pub fn codex_rate(&self, model: &str) -> ModelRate {
+        let model = model.to_ascii_lowercase();
         self.codex.iter()
             .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())

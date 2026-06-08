@@ -29,7 +29,7 @@ impl PatternMatcher {
             claude_ready:    Regex::new(r"^>\s*$|Human:\s*$").unwrap(),
             claude_waiting:  Regex::new(r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?|proceed\?").unwrap(),
             codex_ready:     Regex::new(r"codex>\s*$|>\s*$").unwrap(),
-            codex_waiting:   Regex::new(r"\?\s*$|Approve\?|confirm").unwrap(),
+            codex_waiting:   Regex::new(r"(?i)\b(?:approve|confirm)\b|\b(?:allow|proceed|continue)\b.*\?\s*$").unwrap(),
             generic_waiting: Regex::new(r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter").unwrap(),
             generic_error:   Regex::new(r"(?i)error:|failed:|panic!|fatal:|command not found").unwrap(),
 
@@ -133,4 +133,37 @@ fn estimate_cost(input: u64, output: u64) -> f64 {
     const OUTPUT_PER_MTK: f64 = 15.0;  // $15 / 1M output tokens
     (input  as f64 / 1_000_000.0) * INPUT_PER_MTK
         + (output as f64 / 1_000_000.0) * OUTPUT_PER_MTK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_question_text_is_not_waiting() {
+        let matcher = PatternMatcher::new();
+
+        assert_eq!(
+            matcher.infer_state("looks like for codex if i type ?", &SessionKind::Codex),
+            Some(SessionState::Running)
+        );
+    }
+
+    #[test]
+    fn codex_approval_prompts_are_waiting() {
+        let matcher = PatternMatcher::new();
+
+        for line in [
+            "Approve?",
+            "confirm",
+            "Allow command?",
+            "Do you want to continue?",
+        ] {
+            assert_eq!(
+                matcher.infer_state(line, &SessionKind::Codex),
+                Some(SessionState::Waiting),
+                "{line}"
+            );
+        }
+    }
 }

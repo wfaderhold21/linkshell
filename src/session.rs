@@ -161,6 +161,13 @@ impl Session {
             "Pro".to_string()
         } else if self.stats.total_cost_usd == 0.0 {
             "—".to_string()
+        } else if self.kind == SessionKind::Codex {
+            let credits = self.stats.total_cost_usd;
+            if credits >= 1000.0 {
+                format!("{:.1}kcr", credits / 1000.0)
+            } else {
+                format!("{:.1}cr", credits)
+            }
         } else {
             format!("${:.3}", self.stats.total_cost_usd)
         }
