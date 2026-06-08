@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 
+use crate::config::Config;
 use crate::events::AppEvent;
 use crate::session::Session;
 
@@ -67,7 +69,7 @@ pub fn extract_from_session(sessions: &[Session], id: usize, mode: &ExtractMode)
     }
 }
 
-pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>) {
+pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
     let dest_id = pipe.dest;
     let prefix = pipe.prefix.clone().unwrap_or_default();
     let extract = pipe.extract.clone();
@@ -75,7 +77,7 @@ pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
         let relay = match extract {
             ExtractMode::Summarize(max_tokens) => {
-                summarize_for_relay(&content, max_tokens).await.unwrap_or(content)
+                summarize_for_relay(&content, max_tokens, &config).await.unwrap_or(content)
             }
             _ => content,
         };
@@ -90,14 +92,14 @@ pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>) {
     });
 }
 
-async fn summarize_for_relay(content: &str, max_tokens: u32) -> anyhow::Result<String> {
+async fn summarize_for_relay(content: &str, max_tokens: u32, config: &Config) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
 
     let body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": config.pipe.summarize.model,
         "max_tokens": max_tokens,
-        "system": "Extract only the concrete output, code, or decision from this text. Be terse. No preamble.",
+        "system": config.pipe.summarize.system,
         "messages": [{ "role": "user", "content": content }]
     });
 

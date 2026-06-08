@@ -1,10 +1,12 @@
 /// Watch ~/.claude/projects/<encoded-cwd>/ for the JSONL session file that
 /// Claude CLI writes, tail it, and emit authoritative cumulative token stats.
-use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::time::{sleep, Duration};
 
+use crate::config::Config;
 use crate::events::AppEvent;
 use crate::session::TokenStats;
 
@@ -58,12 +60,17 @@ struct RawUsage {
     cache_write: u64,
     cache_read:  u64,
     output:      u64,
+    model:       String,
 }
 
 fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
     if v["type"].as_str()? != "assistant" {
         return None;
     }
+    let model = v["message"]["model"]
+        .as_str()
+        .unwrap_or("claude-sonnet")
+        .to_string();
     let usage = v["message"]["usage"].as_object()?;
     let get = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     let raw = RawUsage {
@@ -71,6 +78,7 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
         cache_write: get("cache_creation_input_tokens"),
         cache_read:  get("cache_read_input_tokens"),
         output:      get("output_tokens"),
+        model,
     };
     if raw.input == 0 && raw.cache_write == 0 && raw.cache_read == 0 && raw.output == 0 {
         return None;
@@ -78,12 +86,12 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
     Some(raw)
 }
 
-fn compute_cost(input: u64, cache_write: u64, cache_read: u64, output: u64) -> f64 {
-    // Sonnet 4.x pricing
-    (input       as f64 / 1_000_000.0) *  3.00
-        + (cache_write as f64 / 1_000_000.0) *  3.75
-        + (cache_read  as f64 / 1_000_000.0) *  0.30
-        + (output      as f64 / 1_000_000.0) * 15.00
+fn compute_cost(raw: &RawUsage, config: &Config) -> f64 {
+    let rate = config.pricing.claude_rate(&raw.model);
+    (raw.input       as f64 / 1_000_000.0) * rate.input
+        + (raw.cache_write as f64 / 1_000_000.0) * rate.cache_write
+        + (raw.cache_read  as f64 / 1_000_000.0) * rate.cache_read
+        + (raw.output      as f64 / 1_000_000.0) * rate.output
 }
 
 use crate::session::SessionState;
@@ -109,11 +117,13 @@ async fn tail(
     session_id: usize,
     path: &Path,
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
+    config: &Config,
 ) {
     let mut acc_input:       u64 = 0;
     let mut acc_cache_write: u64 = 0;
     let mut acc_cache_read:  u64 = 0;
     let mut acc_output:      u64 = 0;
+    let mut acc_cost:        f64 = 0.0;
     let mut context_tokens:  u64 = 0;
     let mut offset: u64 = 0;
 
@@ -145,6 +155,7 @@ async fn tail(
                                 }).await;
                             }
                             if let Some(raw) = parse_usage_from_value(&v) {
+                                acc_cost        += compute_cost(&raw, config);
                                 acc_input       += raw.input;
                                 acc_cache_write += raw.cache_write;
                                 acc_cache_read  += raw.cache_read;
@@ -164,7 +175,7 @@ async fn tail(
                 input_tokens:  acc_input + acc_cache_write + acc_cache_read,
                 output_tokens: acc_output,
                 context_tokens,
-                total_cost_usd: compute_cost(acc_input, acc_cache_write, acc_cache_read, acc_output),
+                total_cost_usd: acc_cost,
             };
             if tx.send(AppEvent::SessionStats { session_id, stats }).await.is_err() {
                 break;
@@ -211,6 +222,7 @@ pub fn spawn_watcher(
     session_id: usize,
     cwd: String,
     tx: tokio::sync::mpsc::Sender<AppEvent>,
+    config: Arc<Config>,
 ) {
     tokio::spawn(async move {
         let dir = match project_dir(&cwd) {
@@ -233,6 +245,6 @@ pub fn spawn_watcher(
             None => return,
         };
 
-        tail(session_id, &jsonl, &tx).await;
+        tail(session_id, &jsonl, &tx, &config).await;
     });
 }

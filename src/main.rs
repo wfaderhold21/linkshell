@@ -1,6 +1,7 @@
 mod app;
 mod claude_log;
 mod codex_log;
+mod config;
 mod events;
 mod ipc;
 mod patterns;
@@ -8,6 +9,7 @@ mod pipe;
 mod session;
 mod ui;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
@@ -24,6 +26,8 @@ use events::AppEvent;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let config = Arc::new(config::load());
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -31,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
-    let mut app = App::new(tx.clone());
+    let mut app = App::new(tx.clone(), Arc::clone(&config));
     // Seed pty_size from actual terminal dimensions (best-effort; refined on first draw)
     if let Ok((term_cols, term_rows)) = crossterm::terminal::size() {
         // Reserve rows for session bar (3) + status panel (sessions+3, assume 1 session = 4)
@@ -61,20 +65,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // IPC listener — external orchestrators connect to /tmp/linkshell.sock.
-    // Session 0 is the default target; orchestrators can override per message.
-    ipc::spawn_listener(tx.clone());
+    // IPC listener — external orchestrators connect to the per-instance socket.
+    ipc::spawn_listener(tx.clone(), Arc::clone(&config));
 
     // Optional TCP agent listener — enabled with --tcp [PORT] (default 7373).
     let tcp_port = parse_tcp_flag();
     if let Some(port) = tcp_port {
-        ipc::spawn_tcp_listener(tx.clone(), port);
+        ipc::spawn_tcp_listener(tx.clone(), port, Arc::clone(&config));
     }
 
     // Tick task
     let tick_tx = tx.clone();
+    let tick_ms = config.general.tick_interval_ms;
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(500));
+        let mut interval = time::interval(Duration::from_millis(tick_ms));
         loop {
             interval.tick().await;
             if tick_tx.send(AppEvent::Tick).await.is_err() {

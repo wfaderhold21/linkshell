@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use ratatui::layout::Rect;
 use vt100::Parser as VtParser;
 
+use crate::config::{self, Config};
 use crate::events::AppEvent;
 use crate::patterns::PatternMatcher;
 use crate::pipe::{self, Pipe, PipeTrigger, ExtractMode};
@@ -83,6 +85,7 @@ pub struct App {
     pub command_input: String,
     pub should_quit: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
+    pub config: Arc<Config>,
     pub pipes: Vec<Pipe>,
     // Current PTY size derived from the output pane (rows, cols)
     pub pty_size: (u16, u16),
@@ -103,7 +106,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(event_tx: mpsc::Sender<AppEvent>) -> Self {
+    pub fn new(event_tx: mpsc::Sender<AppEvent>, config: Arc<Config>) -> Self {
         Self {
             sessions: Vec::new(),
             active_idx: None,
@@ -112,6 +115,7 @@ impl App {
             command_input: String::new(),
             should_quit: false,
             event_tx,
+            config,
             pipes: Vec::new(),
             pty_size: (PTY_ROWS, PTY_COLS),
             output_area: Rect::default(),
@@ -155,6 +159,35 @@ impl App {
             name
         };
 
+        // Resolve CWD: caller-supplied → config default → current dir.
+        let cwd = if !cwd.is_empty() && cwd != "." {
+            cwd
+        } else if !self.config.sessions.default_cwd.is_empty() {
+            self.config.sessions.default_cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        };
+
+        // Resolve command from config overrides.
+        let cmd_str = match &kind {
+            SessionKind::Claude => self.config.sessions.commands.claude.clone(),
+            SessionKind::Codex  => self.config.sessions.commands.codex.clone(),
+            SessionKind::Shell  => {
+                let c = &self.config.sessions.commands.shell;
+                if c.is_empty() {
+                    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+                } else {
+                    c.clone()
+                }
+            }
+            SessionKind::Custom(cmd) => cmd.clone(),
+        };
+
+        // Safety: refuse any command containing forbidden flags.
+        config::validate_command(&cmd_str).map_err(|e| anyhow::anyhow!("{}", e))?;
+
         let (pty_rows, pty_cols) = self.pty_size;
         let session = Session::new(id, session_name, kind.clone(), cwd.clone(), pty_rows, pty_cols);
         let idx = self.sessions.len();
@@ -165,20 +198,21 @@ impl App {
         }
 
         let tx = self.event_tx.clone();
-        let cmd_str = kind.command();
+        let cfg = Arc::clone(&self.config);
+        let socket = crate::ipc::socket_path(&self.config);
 
         if matches!(kind, SessionKind::Claude) {
             if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
                 s.pro_sub = crate::claude_log::is_pro_subscription();
             }
-            crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone());
+            crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
         }
         if matches!(kind, SessionKind::Codex) {
-            crate::codex_log::spawn_watcher(id, cwd.clone(), tx.clone());
+            crate::codex_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
         }
 
         tokio::spawn(async move {
-            if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone()).await {
+            if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket).await {
                 let _ = tx.send(AppEvent::SessionOutput {
                     session_id: id,
                     line: format!("[error: {}]", e),
@@ -358,8 +392,9 @@ impl App {
                 PipeTrigger::Manual    => false,
             };
             if fires {
+                let cooldown = self.config.pipe.summarize.cooldown_secs as f64;
                 if let Some(last) = p.last_fired {
-                    if last.elapsed().as_secs_f64() < 2.0 {
+                    if last.elapsed().as_secs_f64() < cooldown {
                         continue;
                     }
                 }
@@ -370,7 +405,7 @@ impl App {
 
         for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
-                pipe::fire_pipe_task(p, content, self.event_tx.clone());
+                pipe::fire_pipe_task(p, content, self.event_tx.clone(), Arc::clone(&self.config));
             }
         }
     }
@@ -389,7 +424,7 @@ impl App {
 
         for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
-                pipe::fire_pipe_task(p, content, self.event_tx.clone());
+                pipe::fire_pipe_task(p, content, self.event_tx.clone(), Arc::clone(&self.config));
             }
         }
     }
@@ -940,6 +975,7 @@ async fn run_pty(
     pty_rows: u16,
     pty_cols: u16,
     tx: mpsc::Sender<AppEvent>,
+    linkshell_sock: String,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -963,7 +999,7 @@ async fn run_pty(
         command.args(cmd_args);
         command.current_dir(&cwd);
         command.env("LINKSHELL_SESSION_ID", session_id.to_string());
-        command.env("LINKSHELL_SOCK", crate::ipc::socket_path());
+        command.env("LINKSHELL_SOCK", &linkshell_sock);
         command.spawn(&pts)?
     };
 

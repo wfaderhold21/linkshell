@@ -2,10 +2,12 @@
 /// authoritative cumulative token/context stats from token_count events.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::time::{sleep, Duration};
 
+use crate::config::Config;
 use crate::events::AppEvent;
 use crate::session::TokenStats;
 
@@ -79,7 +81,13 @@ async fn wait_for_new_rollout(
     }
 }
 
-fn parse_token_count(v: &serde_json::Value) -> Option<TokenStats> {
+fn parse_model_from_session_meta(v: &serde_json::Value) -> Option<String> {
+    if v["type"].as_str()? != "session_meta" { return None; }
+    v["payload"]["model"].as_str().map(|s| s.to_string())
+        .or_else(|| v["payload"]["agent_id"].as_str().map(|s| s.to_string()))
+}
+
+fn parse_token_count(v: &serde_json::Value, model: &str, config: &Config) -> Option<TokenStats> {
     if v["type"].as_str()? != "event_msg" {
         return None;
     }
@@ -100,16 +108,33 @@ fn parse_token_count(v: &serde_json::Value) -> Option<TokenStats> {
         return None;
     }
 
+    let rate = config.pricing.codex_rate(model);
+    let total_cost_usd = (input_tokens as f64 / 1_000_000.0) * rate.input
+        + (output_tokens as f64 / 1_000_000.0) * rate.output;
+
     Some(TokenStats {
         input_tokens,
         output_tokens,
         context_tokens,
-        total_cost_usd: 0.0,
+        total_cost_usd,
     })
 }
 
-async fn tail(session_id: usize, path: &Path, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+async fn tail(session_id: usize, path: &Path, tx: &tokio::sync::mpsc::Sender<AppEvent>, config: &Config) {
     let mut offset: u64 = 0;
+    let mut model = "unknown".to_string();
+
+    // Scan the first 20 lines for session_meta to extract the model.
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        for line in content.lines().take(20) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(m) = parse_model_from_session_meta(&v) {
+                    model = m;
+                    break;
+                }
+            }
+        }
+    }
 
     loop {
         if tx.is_closed() {
@@ -131,7 +156,7 @@ async fn tail(session_id: usize, path: &Path, tx: &tokio::sync::mpsc::Sender<App
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            if let Some(stats) = parse_token_count(&v) {
+                            if let Some(stats) = parse_token_count(&v, &model, config) {
                                 if tx
                                     .send(AppEvent::SessionStats { session_id, stats })
                                     .await
@@ -152,7 +177,7 @@ async fn tail(session_id: usize, path: &Path, tx: &tokio::sync::mpsc::Sender<App
 }
 
 /// Spawn a watcher for the next Codex rollout JSONL created in this cwd.
-pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Sender<AppEvent>) {
+pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Sender<AppEvent>, config: Arc<Config>) {
     tokio::spawn(async move {
         let dir = match sessions_dir() {
             Some(d) => d,
@@ -166,7 +191,7 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
             None => return,
         };
 
-        tail(session_id, &jsonl, &tx).await;
+        tail(session_id, &jsonl, &tx, &config).await;
     });
 }
 
@@ -200,10 +225,12 @@ mod tests {
             }
         });
 
-        let stats = parse_token_count(&v).unwrap();
+        let config = crate::config::Config::default();
+        let stats = parse_token_count(&v, "unknown", &config).unwrap();
         assert_eq!(stats.input_tokens, 99975);
         assert_eq!(stats.output_tokens, 1358);
         assert_eq!(stats.context_tokens, 31619);
+        // "unknown" model rate is 0.0, so cost should be 0.
         assert_eq!(stats.total_cost_usd, 0.0);
     }
 
@@ -214,6 +241,7 @@ mod tests {
             "payload": { "type": "task_started" }
         });
 
-        assert!(parse_token_count(&v).is_none());
+        let config = crate::config::Config::default();
+        assert!(parse_token_count(&v, "unknown", &config).is_none());
     }
 }

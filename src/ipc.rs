@@ -1,18 +1,20 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
+use crate::config::Config;
 use crate::events::{AppEvent, IpcQueryPayload};
 use crate::session::{SessionState, TokenStats};
 
-pub fn socket_path() -> String {
-    format!("/tmp/linkshell-{}.sock", std::process::id())
+pub fn socket_path(config: &Config) -> String {
+    config.socket.path.replace("{pid}", &std::process::id().to_string())
 }
 
-pub fn spawn_listener(tx: mpsc::Sender<AppEvent>) {
-    let path = socket_path();
+pub fn spawn_listener(tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
+    let path = socket_path(&config);
     tokio::spawn(async move {
         let _ = std::fs::remove_file(&path);
         let listener = match UnixListener::bind(&path) {
@@ -36,7 +38,7 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>) {
     });
 }
 
-pub fn spawn_tcp_listener(tx: mpsc::Sender<AppEvent>, port: u16) {
+pub fn spawn_tcp_listener(tx: mpsc::Sender<AppEvent>, port: u16, _config: Arc<Config>) {
     tokio::spawn(async move {
         let addr = format!("127.0.0.1:{}", port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
