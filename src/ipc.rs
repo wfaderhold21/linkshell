@@ -446,3 +446,157 @@ pub fn parse_session_state(s: &str) -> Option<SessionState> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn socket_path_replaces_pid_placeholder_and_preserves_literal_paths() {
+        let mut cfg = Config::default();
+        cfg.socket.path = "/tmp/linkshell-{pid}.sock".into();
+        assert_eq!(
+            socket_path(&cfg),
+            format!("/tmp/linkshell-{}.sock", std::process::id())
+        );
+
+        cfg.socket.path = "/tmp/static.sock".into();
+        assert_eq!(socket_path(&cfg), "/tmp/static.sock");
+    }
+
+    #[test]
+    fn parse_session_state_is_case_insensitive_and_rejects_unknown_values() {
+        assert_eq!(parse_session_state("ready"), Some(SessionState::Ready));
+        assert_eq!(parse_session_state("Thinking"), Some(SessionState::Thinking));
+        assert_eq!(parse_session_state("WAITING!"), None);
+        assert_eq!(parse_session_state("dead"), None);
+    }
+
+    #[tokio::test]
+    async fn read_limited_line_reads_complete_line_under_limit() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+
+        let n = read_limited_line(&mut reader, 64, &mut line).await.unwrap();
+
+        assert_eq!(n, 12);
+        assert_eq!(line, "{\"ok\":true}\n");
+    }
+
+    #[tokio::test]
+    async fn read_limited_line_returns_zero_and_truncated_line_when_oversize() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"abcdef\n").await.unwrap();
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+
+        let n = read_limited_line(&mut reader, 3, &mut line).await.unwrap();
+
+        assert_eq!(n, 0);
+        assert_eq!(line, "abc");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_named_actions_before_numeric_id_handling() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (writer, _writer_rx) = mpsc::channel(1);
+        let msg = serde_json::json!({
+            "type": "state",
+            "session_name": "reviewer",
+            "state": "READY"
+        });
+
+        dispatch(&msg, &tx, None, &writer).await;
+
+        match rx.recv().await.unwrap() {
+            AppEvent::IpcNamedAction { session_name, msg } => {
+                assert_eq!(session_name, "reviewer");
+                assert_eq!(msg["state"], "READY");
+            }
+            _ => panic!("expected named action"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_registered_id_for_state_tokens_and_output() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let (writer, _writer_rx) = mpsc::channel(1);
+
+        dispatch(
+            &serde_json::json!({"type": "state", "state": "running", "detail": "busy"}),
+            &tx,
+            Some(9),
+            &writer,
+        )
+        .await;
+        dispatch(
+            &serde_json::json!({"type": "tokens", "input": 3, "output": 4, "cost": 1.5}),
+            &tx,
+            Some(9),
+            &writer,
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            AppEvent::IpcStateOverride { session_id, state } => {
+                assert_eq!(session_id, 9);
+                assert_eq!(state, SessionState::Running);
+            }
+            _ => panic!("expected state override"),
+        }
+        match rx.recv().await.unwrap() {
+            AppEvent::SessionOutput { session_id, line } => {
+                assert_eq!(session_id, 9);
+                assert_eq!(line, "[busy]");
+            }
+            _ => panic!("expected detail output"),
+        }
+        match rx.recv().await.unwrap() {
+            AppEvent::IpcTokenUpdate { session_id, stats } => {
+                assert_eq!(session_id, 9);
+                assert_eq!(stats.input_tokens, 3);
+                assert_eq!(stats.output_tokens, 4);
+                assert_eq!(stats.total_cost_usd, 1.5);
+            }
+            _ => panic!("expected token update"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_pipe_broadcast_and_group_fire_messages() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (writer, _writer_rx) = mpsc::channel(1);
+
+        for msg in [
+            serde_json::json!({"type": "fire_pipe", "source_group": "agents"}),
+            serde_json::json!({"type": "fire_pipe", "source": 1, "dest": 2}),
+            serde_json::json!({"type": "broadcast", "group": "agents", "message": {"hello": true}}),
+            serde_json::json!({"type": "pipe_add", "source": 1, "dest": 2, "trigger": "manual", "extract": "diff", "prefix": "p"}),
+        ] {
+            dispatch(&msg, &tx, None, &writer).await;
+        }
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::IpcGroupFire { source_group } if source_group == "agents"
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::IpcFirePipe { source: 1, dest: Some(2) }
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::IpcBroadcast { group, msg } if group == "agents" && msg["hello"] == true
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::IpcPipeAdd { source: 1, dest: 2, trigger, extract, prefix }
+                if trigger == "manual" && extract == "diff" && prefix.as_deref() == Some("p")
+        ));
+    }
+}

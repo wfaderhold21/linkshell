@@ -210,4 +210,102 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn shell_prompts_are_ready_and_non_empty_lines_are_running() {
+        let matcher = PatternMatcher::new();
+
+        assert_eq!(
+            matcher.infer_state("user@host ~/repo $ ", &SessionKind::Shell),
+            Some(SessionState::Ready)
+        );
+        assert_eq!(
+            matcher.infer_state("building project", &SessionKind::Shell),
+            Some(SessionState::Running)
+        );
+        assert_eq!(matcher.infer_state("", &SessionKind::Shell), None);
+    }
+
+    #[test]
+    fn generic_waiting_and_error_take_precedence_for_all_session_kinds() {
+        let matcher = PatternMatcher::new();
+
+        for kind in [
+            SessionKind::Claude,
+            SessionKind::Codex,
+            SessionKind::Shell,
+            SessionKind::Custom("tool".into()),
+        ] {
+            assert_eq!(
+                matcher.infer_state("Press Enter to continue", &kind),
+                Some(SessionState::Waiting)
+            );
+            assert_eq!(
+                matcher.infer_state("fatal: command not found", &kind),
+                Some(SessionState::Error)
+            );
+        }
+    }
+
+    #[test]
+    fn claude_specific_prompts_map_to_expected_states() {
+        let matcher = PatternMatcher::new();
+
+        assert_eq!(
+            matcher.infer_state("Thinking...", &SessionKind::Claude),
+            Some(SessionState::Thinking)
+        );
+        assert_eq!(
+            matcher.infer_state("Human:", &SessionKind::Claude),
+            Some(SessionState::Ready)
+        );
+        assert_eq!(
+            matcher.infer_state("shall I proceed?", &SessionKind::Claude),
+            Some(SessionState::Waiting)
+        );
+    }
+
+    #[test]
+    fn parse_stats_extracts_cost_input_and_output_tokens() {
+        let matcher = PatternMatcher::new();
+        let stats = matcher
+            .parse_screen_stats("usage: 12.3k input, 456 output, ~$0.052")
+            .unwrap();
+
+        assert_eq!(stats.input_tokens, 12_300);
+        assert_eq!(stats.output_tokens, 456);
+        assert_eq!(stats.total_cost_usd, 0.052);
+    }
+
+    #[test]
+    fn parse_stats_uses_total_tokens_when_split_counts_are_absent() {
+        let matcher = PatternMatcher::new();
+        let stats = matcher.parse_screen_stats("18.5k tokens").unwrap();
+
+        assert_eq!(stats.input_tokens, 18_500);
+        assert_eq!(stats.output_tokens, 0);
+        assert!(stats.total_cost_usd > 0.0);
+    }
+
+    #[test]
+    fn parse_stats_estimates_cost_when_no_explicit_cost_exists() {
+        let matcher = PatternMatcher::new();
+        let stats = matcher
+            .parse_screen_stats("1,000 input and 2k output")
+            .unwrap();
+
+        assert_eq!(stats.input_tokens, 1_000);
+        assert_eq!(stats.output_tokens, 2_000);
+        assert!((stats.total_cost_usd - 0.033).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_stats_returns_cost_only_when_tokens_are_missing() {
+        let matcher = PatternMatcher::new();
+        let stats = matcher.parse_screen_stats("spent $12").unwrap();
+
+        assert_eq!(stats.input_tokens, 0);
+        assert_eq!(stats.output_tokens, 0);
+        assert_eq!(stats.total_cost_usd, 12.0);
+    }
 }

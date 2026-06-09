@@ -331,3 +331,85 @@ pub fn validate_command(cmd: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_contains_expected_safe_defaults() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.socket.path, "/tmp/linkshell-{pid}.sock");
+        assert_eq!(cfg.general.scroll_buffer_lines, 2000);
+        assert_eq!(cfg.general.tick_interval_ms, 500);
+        assert_eq!(cfg.sessions.commands.claude, "claude");
+        assert_eq!(cfg.sessions.commands.codex, "codex");
+        assert_eq!(cfg.pipe.summarize.max_tokens, 150);
+        assert_eq!(cfg.pipe.summarize.cooldown_secs, 2);
+    }
+
+    #[test]
+    fn toml_overrides_only_specified_fields() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [general]
+            tick_interval_ms = 100
+
+            [sessions]
+            default_cwd = "/work"
+
+            [sessions.commands]
+            shell = "/bin/zsh"
+
+            [keybindings.vars]
+            META = "ctrl"
+
+            [keybindings.bind]
+            "$META+n" = "new_session"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.general.tick_interval_ms, 100);
+        assert_eq!(cfg.general.scroll_buffer_lines, 2000);
+        assert_eq!(cfg.sessions.default_cwd, "/work");
+        assert_eq!(cfg.sessions.commands.claude, "claude");
+        assert_eq!(cfg.sessions.commands.shell, "/bin/zsh");
+        assert_eq!(cfg.keybindings.vars["META"], "ctrl");
+        assert_eq!(cfg.keybindings.bind["$META+n"], "new_session");
+    }
+
+    #[test]
+    fn claude_rate_uses_longest_prefix_and_sonnet_fallback() {
+        let mut pricing = PricingConfig::default();
+        pricing.claude.insert(
+            "claude-sonnet-special".into(),
+            ModelRate {
+                input: 9.0,
+                cache_write: 10.0,
+                cache_read: 1.0,
+                output: 20.0,
+            },
+        );
+
+        assert_eq!(pricing.claude_rate("claude-sonnet-special-2026").input, 9.0);
+        assert_eq!(pricing.claude_rate("unlisted-model").input, 3.0);
+    }
+
+    #[test]
+    fn codex_rate_is_case_insensitive_longest_prefix_with_zero_fallback() {
+        let pricing = PricingConfig::default();
+
+        assert_eq!(pricing.codex_rate("GPT-5.4-MINI-latest").input, 18.75);
+        assert_eq!(pricing.codex_rate("gpt-5.4-mini-latest").cache_read, 1.875);
+        assert_eq!(pricing.codex_rate("missing-model").output, 0.0);
+    }
+
+    #[test]
+    fn validate_command_rejects_forbidden_flag_anywhere() {
+        assert!(validate_command("claude").is_ok());
+        let err = validate_command("claude --dangerously-skip-permissions").unwrap_err();
+        assert!(err.contains("--dangerously-skip-permissions"));
+    }
+}

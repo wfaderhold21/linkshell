@@ -257,3 +257,99 @@ pub fn spawn_watcher(
         tail(session_id, &jsonl, &tx, &config).await;
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_cwd_matches_claude_project_directory_convention() {
+        assert_eq!(encode_cwd("/tmp/linkshell"), "-tmp-linkshell");
+        assert_eq!(encode_cwd("relative/path"), "relative-path");
+    }
+
+    #[test]
+    fn parse_usage_reads_assistant_usage_and_service_tier() {
+        let v = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-5",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "output_tokens": 40,
+                    "service_tier": "standard"
+                }
+            }
+        });
+
+        let raw = parse_usage_from_value(&v).unwrap();
+
+        assert_eq!(raw.input, 10);
+        assert_eq!(raw.cache_write, 20);
+        assert_eq!(raw.cache_read, 30);
+        assert_eq!(raw.output, 40);
+        assert_eq!(raw.model, "claude-sonnet-4-5");
+        assert_eq!(raw.service_tier.as_deref(), Some("standard"));
+    }
+
+    #[test]
+    fn parse_usage_ignores_non_assistant_or_zero_usage_records() {
+        assert!(parse_usage_from_value(&serde_json::json!({"type": "user"})).is_none());
+        assert!(parse_usage_from_value(&serde_json::json!({
+            "type": "assistant",
+            "message": {"usage": {"input_tokens": 0, "output_tokens": 0}}
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn compute_cost_includes_cache_write_and_cache_read_rates() {
+        let raw = RawUsage {
+            input: 1_000_000,
+            cache_write: 1_000_000,
+            cache_read: 1_000_000,
+            output: 1_000_000,
+            model: "claude-haiku-test".into(),
+            service_tier: None,
+        };
+
+        let cost = compute_cost(&raw, &Config::default());
+
+        assert!((cost - 5.88).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_state_maps_jsonl_record_types_to_session_states() {
+        assert_eq!(
+            parse_state(&serde_json::json!({"type": "user"})),
+            Some(SessionState::Thinking)
+        );
+        assert_eq!(
+            parse_state(&serde_json::json!({"type": "tool"})),
+            Some(SessionState::Running)
+        );
+        assert_eq!(
+            parse_state(&serde_json::json!({
+                "type": "assistant",
+                "message": {"stop_reason": "tool_use"}
+            })),
+            Some(SessionState::Running)
+        );
+        assert_eq!(
+            parse_state(&serde_json::json!({
+                "type": "assistant",
+                "message": {"stop_reason": "end_turn"}
+            })),
+            Some(SessionState::Ready)
+        );
+        assert_eq!(
+            parse_state(&serde_json::json!({
+                "type": "assistant",
+                "message": {"stop_reason": "max_tokens"}
+            })),
+            None
+        );
+    }
+}
