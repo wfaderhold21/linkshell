@@ -11,7 +11,7 @@ mod session;
 mod ui;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -104,25 +104,57 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let frame_cap = Duration::from_millis(16);
+    let mut last_render = Instant::now() - frame_cap;
     loop {
-        let mut layout = ui::LayoutInfo::default();
-        terminal.draw(|f| {
-            layout = ui::draw(f, &app);
-        })?;
-        app.output_area = layout.output_area;
-        app.session_bar_area = layout.session_bar_area;
-        app.session_slot_areas = layout.session_slot_areas;
-        // Resize PTYs to match the output pane (inner area = subtract 2 for borders)
-        let pty_rows = layout.output_area.height.saturating_sub(2).max(1);
-        let pty_cols = layout.output_area.width.saturating_sub(2).max(1);
-        app.handle_resize(pty_rows, pty_cols);
+        if app.needs_redraw && last_render.elapsed() >= frame_cap {
+            let mut layout = ui::LayoutInfo::default();
+            terminal.draw(|f| {
+                layout = ui::draw(f, &app);
+            })?;
+            app.output_area = layout.output_area;
+            app.session_bar_area = layout.session_bar_area;
+            app.session_slot_areas = layout.session_slot_areas;
+            app.status_row_areas = layout.status_row_areas;
+            app.new_session_area = layout.new_session_area;
+            app.command_bar_area = layout.command_bar_area;
+            app.help_area = layout.help_area;
+            app.menu_bar_area = layout.menu_bar_area;
+            app.menu_item_areas = layout.menu_item_areas;
+            app.menu_submenu_area = layout.menu_submenu_area;
+            app.menu_submenu_item_areas = layout.menu_submenu_item_areas;
+            app.needs_redraw = false;
+            last_render = Instant::now();
 
-        if let Some(event) = rx.recv().await {
-            handle_event(&mut app, event);
+            // Resize PTYs to match the output pane (inner area = subtract 2 for borders)
+            let pty_rows = layout.output_area.height.saturating_sub(2).max(1);
+            let pty_cols = layout.output_area.width.saturating_sub(2).max(1);
+            let old_pty_size = app.pty_size;
+            app.handle_resize(pty_rows, pty_cols);
+            if app.pty_size != old_pty_size {
+                app.needs_redraw = true;
+            }
         }
 
         if app.should_quit {
             break;
+        }
+
+        let wait = if app.needs_redraw {
+            frame_cap.saturating_sub(last_render.elapsed())
+        } else {
+            Duration::from_millis(config.general.tick_interval_ms)
+        };
+
+        tokio::select! {
+            event = rx.recv() => {
+                if let Some(event) = event {
+                    handle_event(&mut app, event);
+                } else {
+                    break;
+                }
+            }
+            _ = time::sleep(wait) => {}
         }
     }
 
@@ -240,6 +272,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
     }
+    app.needs_redraw = true;
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
@@ -259,6 +292,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollDownPage => app.scroll_down(20),
                     Action::ScrollUpLine => app.scroll_up(3),
                     Action::ScrollDownLine => app.scroll_down(3),
+                    Action::OpenMenu => app.open_menu(),
                 }
                 return;
             }
@@ -325,6 +359,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Esc => {
                 app.mode = AppMode::Normal;
                 app.command_input.clear();
+                app.command_cursor = 0;
             }
             KeyCode::Enter => {
                 app.execute_command();
@@ -332,14 +367,69 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Backspace => {
                 app.command_backspace();
             }
+            KeyCode::Left => {
+                app.command_cursor_left();
+            }
+            KeyCode::Right => {
+                app.command_cursor_right();
+            }
+            KeyCode::Home => {
+                app.command_cursor_home();
+            }
+            KeyCode::End => {
+                app.command_cursor_end();
+            }
             KeyCode::Char(c) => {
                 app.command_input_char(c);
             }
             _ => {}
         },
 
-        AppMode::Help => {
+        AppMode::Help | AppMode::CommandResult => {
             app.mode = AppMode::Normal; // any key dismisses
+        }
+
+        AppMode::Menu { .. } => {
+            if app.keymap.get(&(key.modifiers, key.code)) == Some(&Action::OpenMenu) {
+                app.mode = AppMode::Normal;
+                return;
+            }
+            match key.code {
+                KeyCode::Left => app.menu_move_top(-1),
+                KeyCode::Right => app.menu_move_top(1),
+                KeyCode::Down => app.menu_open_submenu(),
+                KeyCode::Up => app.menu_close_submenu(),
+                KeyCode::Enter => app.execute_selected_menu_action(),
+                KeyCode::Esc => app.mode = AppMode::Normal,
+                KeyCode::Char(c) => match c.to_ascii_lowercase() {
+                    's' => {
+                        app.mode = AppMode::Menu {
+                            selected_top: 0,
+                            selected_sub: Some(0),
+                        }
+                    }
+                    'v' => {
+                        app.mode = AppMode::Menu {
+                            selected_top: 1,
+                            selected_sub: Some(0),
+                        }
+                    }
+                    'p' => {
+                        app.mode = AppMode::Menu {
+                            selected_top: 2,
+                            selected_sub: Some(0),
+                        }
+                    }
+                    'h' => {
+                        app.mode = AppMode::Menu {
+                            selected_top: 3,
+                            selected_sub: Some(0),
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
         }
     }
 }
@@ -471,7 +561,10 @@ mod tests {
             key_to_bytes(&key(KeyCode::Char('C'), KeyModifiers::CONTROL)),
             vec![3]
         );
-        assert_eq!(key_to_bytes(&key(KeyCode::Enter, KeyModifiers::NONE)), vec![b'\r']);
+        assert_eq!(
+            key_to_bytes(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![b'\r']
+        );
         assert_eq!(
             key_to_bytes(&key(KeyCode::Left, KeyModifiers::NONE)),
             vec![27, b'[', b'D']

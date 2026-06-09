@@ -139,6 +139,12 @@ async fn tail(
         }
 
         let mut new_stats = false;
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() == offset {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        }
         if let Ok(file) = tokio::fs::File::open(path).await {
             let mut file = file;
             if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
@@ -154,11 +160,16 @@ async fn tail(
                             if !line.ends_with('\n') {
                                 break;
                             }
-                            offset += n as u64;
-                            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                offset += n as u64;
+                                continue;
+                            }
+                            let v: serde_json::Value = match serde_json::from_str(trimmed) {
                                 Ok(v) => v,
-                                Err(_) => continue,
+                                Err(_) => break,
                             };
+                            offset += n as u64;
                             if let Some(state) = parse_state(&v) {
                                 let _ = tx
                                     .send(AppEvent::IpcStateOverride { session_id, state })

@@ -33,6 +33,7 @@ pub struct GeneralConfig {
     pub scroll_buffer_lines: usize,
     pub tick_interval_ms: u64,
     pub ipc_state_override_timeout_secs: u64,
+    pub menu_key: String,
 }
 
 impl Default for GeneralConfig {
@@ -40,8 +41,9 @@ impl Default for GeneralConfig {
         Self {
             max_ipc_message_bytes: 0,
             scroll_buffer_lines: 2000,
-            tick_interval_ms: 500,
+            tick_interval_ms: 100,
             ipc_state_override_timeout_secs: 60,
+            menu_key: "ctrl+space".to_string(),
         }
     }
 }
@@ -345,7 +347,8 @@ mod tests {
 
         assert_eq!(cfg.socket.path, "/tmp/linkshell-{pid}.sock");
         assert_eq!(cfg.general.scroll_buffer_lines, 2000);
-        assert_eq!(cfg.general.tick_interval_ms, 500);
+        assert_eq!(cfg.general.tick_interval_ms, 100);
+        assert_eq!(cfg.general.menu_key, "ctrl+space");
         assert_eq!(cfg.sessions.commands.claude, "claude");
         assert_eq!(cfg.sessions.commands.codex, "codex");
         assert_eq!(cfg.pipe.summarize.max_tokens, 150);
