@@ -4,8 +4,7 @@ use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let sock =
-        std::env::var("LINKSHELL_SOCK").unwrap_or_else(|_| "/tmp/linkshell.sock".to_string());
+    let sock = resolve_socket();
     let session_id: Option<u64> = std::env::var("LINKSHELL_SESSION_ID")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -156,6 +155,30 @@ fn main() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+fn resolve_socket() -> String {
+    std::env::var("LINKSHELL_SOCK")
+        .ok()
+        .or_else(read_last_socket)
+        .unwrap_or_else(|| "/tmp/linkshell.sock".to_string())
+}
+
+fn read_last_socket() -> Option<String> {
+    let path = linkshell_config_dir()?.join("last_socket");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn linkshell_config_dir() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(std::path::PathBuf::from(path).join("linkshell"));
+    }
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".config").join("linkshell"))
+}
+
 fn connect(sock: &str) -> UnixStream {
     UnixStream::connect(sock).unwrap_or_else(|e| {
         eprintln!("linkshell-ctl: cannot connect to {}: {}", sock, e);
@@ -202,5 +225,11 @@ fn usage() -> ! {
     eprintln!("  linkshell-ctl pipe add <src> <dst> [--extract=X] [--trigger=X] [--prefix=X]");
     eprintln!("  linkshell-ctl pipe remove <src> [dst]");
     eprintln!("  linkshell-ctl pipe fire [src] [dst]");
+    eprintln!();
+    eprintln!("environment variables:");
+    eprintln!(
+        "  LINKSHELL_SOCK        IPC socket path; defaults to last daemon socket if available"
+    );
+    eprintln!("  LINKSHELL_SESSION_ID  default session id for session-scoped commands");
     std::process::exit(1);
 }

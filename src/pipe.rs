@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::events::AppEvent;
@@ -15,7 +16,7 @@ pub enum ExtractMode {
     Summarize(u32),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipeTrigger {
     OnReady,
     OnWaiting,
@@ -89,7 +90,7 @@ pub fn fire_pipe_task(
     content: String,
     tx: mpsc::Sender<AppEvent>,
     config: Arc<Config>,
-) {
+) -> JoinHandle<()> {
     let dest_id = pipe.dest;
     let prefix = pipe.prefix.clone().unwrap_or_default();
     let extract = pipe.extract.clone();
@@ -111,7 +112,7 @@ pub fn fire_pipe_task(
         };
 
         let _ = tx.send(AppEvent::PipeRelay { dest_id, message }).await;
-    });
+    })
 }
 
 async fn summarize_for_relay(
@@ -158,6 +159,7 @@ mod tests {
             "/tmp".into(),
             PTY_ROWS,
             PTY_COLS,
+            2000,
         );
         for line in lines {
             session.push_output_line((*line).to_string());
@@ -257,12 +259,7 @@ mod tests {
             last_fired: None,
         };
 
-        fire_pipe_task(
-            pipe,
-            "payload".into(),
-            tx,
-            Arc::new(Config::default()),
-        );
+        fire_pipe_task(pipe, "payload".into(), tx, Arc::new(Config::default()));
 
         match rx.recv().await.unwrap() {
             AppEvent::PipeRelay { dest_id, message } => {

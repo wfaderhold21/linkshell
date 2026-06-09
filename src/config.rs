@@ -129,6 +129,9 @@ pub struct PricingConfig {
 
 impl Default for PricingConfig {
     fn default() -> Self {
+        // Rates as of 2026-06. Update from:
+        //   https://www.anthropic.com/pricing
+        //   https://openai.com/api/pricing
         let mut claude = HashMap::new();
         claude.insert(
             "claude-opus".into(),
