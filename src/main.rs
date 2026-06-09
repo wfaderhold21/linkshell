@@ -229,6 +229,15 @@ fn handle_event(app: &mut App, event: AppEvent) {
         } => {
             app.handle_ipc_send(session_id, message);
         }
+        AppEvent::ChatInbound {
+            from_session_id,
+            text,
+        } => {
+            app.handle_chat_inbound(from_session_id, text);
+        }
+        AppEvent::ChatOutbound { text } => {
+            app.handle_chat_outbound(text);
+        }
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
     }
@@ -237,6 +246,40 @@ fn handle_event(app: &mut App, event: AppEvent) {
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     match app.mode {
         AppMode::Normal => {
+            // Chat focus toggle: Ctrl+/
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('/') {
+                app.chat.focused = !app.chat.focused;
+                return;
+            }
+
+            // When chat is focused, route keys to chat input.
+            if app.chat.focused {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.chat.focused = false;
+                    }
+                    KeyCode::Enter => {
+                        let text = app.chat.input.clone();
+                        app.chat.input.clear();
+                        app.chat.input_cursor = 0;
+                        app.chat.scroll_offset = 0;
+                        let _ = app.event_tx.try_send(AppEvent::ChatOutbound { text });
+                    }
+                    KeyCode::Backspace => app.chat_input_backspace(),
+                    KeyCode::Left => app.chat_cursor_left(),
+                    KeyCode::Right => app.chat_cursor_right(),
+                    KeyCode::Home => app.chat_cursor_home(),
+                    KeyCode::End => app.chat_cursor_end(),
+                    KeyCode::PageUp => app.chat_scroll_up(5),
+                    KeyCode::PageDown => app.chat_scroll_down(5),
+                    KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT => {
+                        app.chat_input_char(c);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             if let Some(action) = app.keymap.get(&(key.modifiers, key.code)).cloned() {
                 match action {
                     Action::NewSession => app.open_new_session(),

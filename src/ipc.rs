@@ -449,6 +449,16 @@ async fn dispatch(
                 _ => {}
             }
         }
+        Some("chat") => {
+            if let Some(text) = msg["message"].as_str() {
+                let _ = tx
+                    .send(AppEvent::ChatInbound {
+                        from_session_id: registered_id.unwrap_or(0),
+                        text: text.to_string(),
+                    })
+                    .await;
+            }
+        }
         Some("session_input_wait") => {
             let target_sid = msg["session_id"].as_u64().unwrap_or(0) as usize;
             let text = msg["text"].as_str().unwrap_or("").to_string();

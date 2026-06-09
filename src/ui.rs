@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, NewSessionField, Selection};
+use crate::app::{App, AppMode, Chat, ChatMessage, ChatSender, NewSessionField, Selection};
 use crate::session::{SessionKind, SessionState};
 use vt100::Screen;
 
@@ -119,20 +119,42 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let size = f.size();
 
     // ── Top-level vertical split ───────────────────────────────────────────
-    // main output | session bar | status panel
-    let status_rows = app.sessions.len().max(1) as u16 + 4; // border + header + rows + socket footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),              // main output
-            Constraint::Length(3),           // session bar
-            Constraint::Length(status_rows), // status panel
-        ])
-        .split(size);
+    let status_rows = app.sessions.len().max(1) as u16 + 4;
+    let chat_h = if app.config.chat.enabled {
+        app.config.chat.pane_height.max(3)
+    } else {
+        0
+    };
 
-    draw_main_output(f, app, chunks[0]);
-    let slot_areas = draw_session_bar(f, app, chunks[1]);
-    draw_status_panel(f, app, chunks[2]);
+    let (output_area, chat_area_opt, session_bar_area, status_area) = if chat_h > 0 {
+        let c = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![
+                Constraint::Min(5),
+                Constraint::Length(chat_h),
+                Constraint::Length(3),
+                Constraint::Length(status_rows),
+            ])
+            .split(size);
+        (c[0], Some(c[1]), c[2], c[3])
+    } else {
+        let c = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![
+                Constraint::Min(5),
+                Constraint::Length(3),
+                Constraint::Length(status_rows),
+            ])
+            .split(size);
+        (c[0], None, c[1], c[2])
+    };
+
+    draw_main_output(f, app, output_area);
+    if let Some(chat_area) = chat_area_opt {
+        draw_chat_pane(f, app, chat_area);
+    }
+    let slot_areas = draw_session_bar(f, app, session_bar_area);
+    draw_status_panel(f, app, status_area);
 
     // ── Overlays ───────────────────────────────────────────────────────────
     match &app.mode {
@@ -143,8 +165,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     }
 
     LayoutInfo {
-        output_area: chunks[0],
-        session_bar_area: chunks[1],
+        output_area,
+        session_bar_area,
         session_slot_areas: slot_areas,
     }
 }
@@ -446,6 +468,180 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
         ]));
         f.render_widget(footer, footer_row);
     }
+}
+
+// ── Chat pane ──────────────────────────────────────────────────────────────
+
+fn draw_chat_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let agents: Vec<String> = app
+        .sessions
+        .iter()
+        .filter(|s| s.headless && app.agent_writers.contains_key(&s.id))
+        .map(|s| format!("[{}]", s.name))
+        .collect();
+    let title = if agents.is_empty() {
+        " ◆ Chat ".to_string()
+    } else {
+        format!(" ◆ Chat  {} ", agents.join(" "))
+    };
+
+    let focused = app.chat.focused;
+    let border_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Input row at the bottom.
+    let input_row = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
+    render_chat_input(f, &app.chat, input_row, focused);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    // Message rows above the input.
+    let msg_rows = inner.height as usize - 1;
+    let total = app.chat.messages.len();
+    let end = total.saturating_sub(app.chat.scroll_offset);
+    let start = end.saturating_sub(msg_rows);
+
+    for (i, msg) in app.chat.messages.iter().skip(start).take(end - start).enumerate() {
+        let row = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+        render_chat_message(f, msg, row);
+    }
+}
+
+fn render_chat_input(f: &mut Frame<'_>, chat: &Chat, area: Rect, focused: bool) {
+    let input = &chat.input;
+    let cursor = chat.input_cursor.min(input.len());
+    let before = &input[..cursor];
+    let (cursor_ch, after) = if cursor < input.len() {
+        let ch = input[cursor..].chars().next().unwrap();
+        let end = cursor + ch.len_utf8();
+        (input[cursor..end].to_string(), input[end..].to_string())
+    } else {
+        (" ".to_string(), String::new())
+    };
+
+    let cursor_style = if focused {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default()
+    };
+
+    // Highlight @mention tokens in yellow.
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        "> ",
+        Style::default().fg(Color::Cyan),
+    )];
+    let mention_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let text_before_cursor = before.to_string();
+    // Split at cursor point, render @mentions in the before portion.
+    let mut remaining = text_before_cursor.as_str();
+    while !remaining.is_empty() {
+        if remaining.starts_with('@') {
+            let end = remaining.find(|c: char| c.is_whitespace()).unwrap_or(remaining.len());
+            spans.push(Span::styled(remaining[..end].to_string(), mention_style));
+            remaining = &remaining[end..];
+        } else {
+            let end = remaining.find('@').unwrap_or(remaining.len());
+            spans.push(Span::raw(remaining[..end].to_string()));
+            remaining = &remaining[end..];
+        }
+    }
+    spans.push(Span::styled(cursor_ch, cursor_style));
+    // After-cursor text: also highlight @mentions.
+    let mut remaining = after.as_str();
+    while !remaining.is_empty() {
+        if remaining.starts_with('@') {
+            let end = remaining.find(|c: char| c.is_whitespace()).unwrap_or(remaining.len());
+            spans.push(Span::styled(remaining[..end].to_string(), mention_style));
+            remaining = &remaining[end..];
+        } else {
+            let end = remaining.find('@').unwrap_or(remaining.len());
+            spans.push(Span::raw(remaining[..end].to_string()));
+            remaining = &remaining[end..];
+        }
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_chat_message(f: &mut Frame<'_>, msg: &ChatMessage, area: Rect) {
+    const SENDER_W: usize = 10;
+
+    let (sender_text, sep, sender_color, msg_style) = match &msg.from {
+        ChatSender::Agent(name) => (
+            format!("{:<width$}", name, width = SENDER_W),
+            "›",
+            chat_agent_color(name),
+            Style::default(),
+        ),
+        ChatSender::User => (
+            format!("{:<width$}", "you", width = SENDER_W),
+            "→",
+            Color::Cyan,
+            Style::default().fg(Color::Cyan),
+        ),
+        ChatSender::System => (
+            format!("{:<width$}", "", width = SENDER_W),
+            "─",
+            Color::DarkGray,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    };
+
+    let line = Line::from(vec![
+        Span::styled(format!(" {}", sender_text), Style::default().fg(sender_color)),
+        Span::styled(format!(" {} ", sep), Style::default().fg(Color::DarkGray)),
+        Span::styled(msg.text.clone(), msg_style),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn chat_agent_color(name: &str) -> Color {
+    const PALETTE: &[Color] = &[
+        Color::Cyan,
+        Color::Magenta,
+        Color::Yellow,
+        Color::Green,
+        Color::LightBlue,
+        Color::LightRed,
+        Color::LightCyan,
+        Color::LightMagenta,
+    ];
+    let hash: usize = name
+        .bytes()
+        .fold(0usize, |a, b| a.wrapping_add(b as usize));
+    PALETTE[hash % PALETTE.len()]
 }
 
 // ── New session dialog ─────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ pub struct Config {
     pub pipe: PipeConfig,
     pub pricing: PricingConfig,
     pub keybindings: KeybindingsConfig,
+    pub chat: ChatConfig,
 }
 
 impl Default for Config {
@@ -20,6 +21,7 @@ impl Default for Config {
             pipe: PipeConfig::default(),
             pricing: PricingConfig::default(),
             keybindings: KeybindingsConfig::default(),
+            chat: ChatConfig::default(),
         }
     }
 }
@@ -269,6 +271,28 @@ impl PricingConfig {
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, r)| r.clone())
             .unwrap_or_default()
+    }
+}
+
+// ── [chat] ────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ChatConfig {
+    pub enabled: bool,
+    pub pane_height: u16,
+    pub history_lines: usize,
+    pub focus_key: String,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pane_height: 8,
+            history_lines: 500,
+            focus_key: "ctrl+/".to_string(),
+        }
     }
 }
 

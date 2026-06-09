@@ -12,6 +12,43 @@ use crate::patterns::PatternMatcher;
 use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
 use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS};
 
+// ── Chat data model ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum ChatSender {
+    User,
+    Agent(String),
+    System,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub from: ChatSender,
+    pub text: String,
+    pub timestamp: std::time::Instant,
+}
+
+#[derive(Debug)]
+pub struct Chat {
+    pub messages: std::collections::VecDeque<ChatMessage>,
+    pub input: String,
+    pub input_cursor: usize,
+    pub scroll_offset: usize,
+    pub focused: bool,
+}
+
+impl Default for Chat {
+    fn default() -> Self {
+        Self {
+            messages: std::collections::VecDeque::new(),
+            input: String::new(),
+            input_cursor: 0,
+            scroll_offset: 0,
+            focused: false,
+        }
+    }
+}
+
 /// Screen-coordinate selection (col, row both relative to output area inner content).
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -149,6 +186,7 @@ pub struct App {
     pub pending_relays: HashMap<usize, Vec<String>>,
     pipe_tasks: HashMap<PipeKey, JoinHandle<()>>,
     pub keymap: Keymap,
+    pub chat: Chat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -193,6 +231,7 @@ impl App {
             pending_relays: HashMap::new(),
             pipe_tasks: HashMap::new(),
             keymap,
+            chat: Chat::default(),
         }
     }
 
@@ -760,11 +799,25 @@ impl App {
         session_id: usize,
         agent_tx: mpsc::Sender<String>,
     ) {
+        let name = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("agent-{}", session_id));
         self.agent_writers.insert(session_id, agent_tx);
+        self.push_system_chat(format!("{} connected", name));
     }
 
     pub fn handle_ipc_agent_disconnected(&mut self, session_id: usize) {
+        let name = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("agent-{}", session_id));
         self.agent_writers.remove(&session_id);
+        self.push_system_chat(format!("{} disconnected", name));
         if let Some(idx) = self
             .sessions
             .iter()
@@ -1408,6 +1461,145 @@ impl App {
         }
     }
 
+    // ── Chat ───────────────────────────────────────────────────────────────
+
+    pub fn handle_chat_inbound(&mut self, from_session_id: usize, text: String) {
+        let name = self
+            .sessions
+            .iter()
+            .find(|s| s.id == from_session_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("agent-{}", from_session_id));
+        let cap = self.config.chat.history_lines;
+        self.chat.messages.push_back(ChatMessage {
+            from: ChatSender::Agent(name),
+            text,
+            timestamp: std::time::Instant::now(),
+        });
+        while self.chat.messages.len() > cap {
+            self.chat.messages.pop_front();
+        }
+    }
+
+    pub fn handle_chat_outbound(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let cap = self.config.chat.history_lines;
+        self.chat.messages.push_back(ChatMessage {
+            from: ChatSender::User,
+            text: text.clone(),
+            timestamp: std::time::Instant::now(),
+        });
+        while self.chat.messages.len() > cap {
+            self.chat.messages.pop_front();
+        }
+
+        let (targets, body) = parse_mentions(&text);
+
+        if targets.is_empty() {
+            let envelope = serde_json::json!({
+                "type":    "user_message",
+                "from":    "user",
+                "message": body,
+                "to_all":  true,
+            });
+            let line = serde_json::to_string(&envelope).unwrap_or_default() + "\n";
+            for s in self.sessions.iter().filter(|s| s.headless) {
+                if let Some(tx) = self.agent_writers.get(&s.id) {
+                    let _ = tx.try_send(line.clone());
+                }
+            }
+        } else {
+            let envelope = serde_json::json!({
+                "type":    "user_message",
+                "from":    "user",
+                "message": body,
+                "to_all":  false,
+            });
+            let line = serde_json::to_string(&envelope).unwrap_or_default() + "\n";
+            for name in &targets {
+                if let Some(s) = self
+                    .sessions
+                    .iter()
+                    .find(|s| &s.name == name && s.headless)
+                {
+                    if let Some(tx) = self.agent_writers.get(&s.id) {
+                        let _ = tx.try_send(line.clone());
+                    }
+                } else {
+                    self.push_system_chat(format!("unknown agent: {}", name));
+                }
+            }
+        }
+    }
+
+    fn push_system_chat(&mut self, text: String) {
+        let cap = self.config.chat.history_lines;
+        self.chat.messages.push_back(ChatMessage {
+            from: ChatSender::System,
+            text,
+            timestamp: std::time::Instant::now(),
+        });
+        while self.chat.messages.len() > cap {
+            self.chat.messages.pop_front();
+        }
+    }
+
+    pub fn chat_input_char(&mut self, c: char) {
+        self.chat.input.insert(self.chat.input_cursor, c);
+        self.chat.input_cursor += c.len_utf8();
+    }
+
+    pub fn chat_input_backspace(&mut self) {
+        let cursor = self.chat.input_cursor;
+        if cursor > 0 {
+            let prev = self.chat.input[..cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.chat.input.remove(prev);
+            self.chat.input_cursor = prev;
+        }
+    }
+
+    pub fn chat_cursor_left(&mut self) {
+        let cursor = self.chat.input_cursor;
+        if cursor > 0 {
+            self.chat.input_cursor = self.chat.input[..cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn chat_cursor_right(&mut self) {
+        let cursor = self.chat.input_cursor;
+        if cursor < self.chat.input.len() {
+            let ch = self.chat.input[cursor..].chars().next().unwrap();
+            self.chat.input_cursor += ch.len_utf8();
+        }
+    }
+
+    pub fn chat_cursor_home(&mut self) {
+        self.chat.input_cursor = 0;
+    }
+
+    pub fn chat_cursor_end(&mut self) {
+        self.chat.input_cursor = self.chat.input.len();
+    }
+
+    pub fn chat_scroll_up(&mut self, lines: usize) {
+        let max = self.chat.messages.len().saturating_sub(1);
+        self.chat.scroll_offset = (self.chat.scroll_offset + lines).min(max);
+    }
+
+    pub fn chat_scroll_down(&mut self, lines: usize) {
+        self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(lines);
+    }
+
     // ── Write to active PTY ────────────────────────────────────────────────
 
     pub fn write_to_active(&self, data: &[u8]) {
@@ -1415,6 +1607,22 @@ impl App {
             session.write_bytes(data.to_vec());
         }
     }
+}
+
+/// Returns `(vec_of_@mention_names, message_body_with_mentions_stripped)`.
+pub fn parse_mentions(text: &str) -> (Vec<String>, String) {
+    let mut names = Vec::new();
+    let mut words = text.split_whitespace().peekable();
+    while let Some(w) = words.peek() {
+        if let Some(name) = w.strip_prefix('@') {
+            names.push(name.to_string());
+            words.next();
+        } else {
+            break;
+        }
+    }
+    let body = words.collect::<Vec<_>>().join(" ");
+    (names, body)
 }
 
 // ── PTY runner task ────────────────────────────────────────────────────────
@@ -2133,5 +2341,165 @@ mod tests {
     #[test]
     fn strip_ansi_removes_csi_sequences_and_keeps_plain_text() {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m plain"), "red plain");
+    }
+
+    // ── Chat tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mentions_no_mentions_returns_empty_names_and_full_body() {
+        let (names, body) = parse_mentions("hello everyone");
+        assert!(names.is_empty());
+        assert_eq!(body, "hello everyone");
+    }
+
+    #[test]
+    fn parse_mentions_single_returns_one_name_and_stripped_body() {
+        let (names, body) = parse_mentions("@reviewer elaborate please");
+        assert_eq!(names, vec!["reviewer"]);
+        assert_eq!(body, "elaborate please");
+    }
+
+    #[test]
+    fn parse_mentions_multiple_returns_all_names_and_remaining_body() {
+        let (names, body) = parse_mentions("@reviewer @council sync up");
+        assert_eq!(names, vec!["reviewer", "council"]);
+        assert_eq!(body, "sync up");
+    }
+
+    #[test]
+    fn parse_mentions_only_mentions_no_body() {
+        let (names, body) = parse_mentions("@reviewer @council");
+        assert_eq!(names, vec!["reviewer", "council"]);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn chat_inbound_appends_message_with_correct_sender_name() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("council".into(), None).unwrap();
+
+        app.handle_chat_inbound(id, "hello world".into());
+
+        assert_eq!(app.chat.messages.len(), 1);
+        let msg = &app.chat.messages[0];
+        assert_eq!(msg.text, "hello world");
+        assert!(matches!(&msg.from, ChatSender::Agent(n) if n == "council"));
+    }
+
+    #[test]
+    fn chat_inbound_unknown_session_uses_fallback_name() {
+        let mut app = make_app();
+
+        app.handle_chat_inbound(99, "from unknown".into());
+
+        let msg = &app.chat.messages[0];
+        assert!(matches!(&msg.from, ChatSender::Agent(n) if n == "agent-99"));
+    }
+
+    #[test]
+    fn chat_inbound_enforces_history_cap() {
+        let mut config = Config::default();
+        config.chat.history_lines = 3;
+        let mut app = make_app_with_config(config);
+
+        for i in 0..5 {
+            app.handle_chat_inbound(0, format!("msg {}", i));
+        }
+
+        assert_eq!(app.chat.messages.len(), 3);
+        assert_eq!(app.chat.messages.back().unwrap().text, "msg 4");
+    }
+
+    #[test]
+    fn chat_outbound_empty_input_is_noop() {
+        let mut app = make_app();
+        app.handle_chat_outbound(String::new());
+        assert!(app.chat.messages.is_empty());
+    }
+
+    #[test]
+    fn chat_outbound_broadcast_delivers_to_all_headless_agents() {
+        let mut app = make_app();
+        let a = app.spawn_headless_session("agent-a".into(), None).unwrap();
+        let b = app.spawn_headless_session("agent-b".into(), None).unwrap();
+        let (a_tx, mut a_rx) = mpsc::channel(2);
+        let (b_tx, mut b_rx) = mpsc::channel(2);
+        app.agent_writers.insert(a, a_tx);
+        app.agent_writers.insert(b, b_tx);
+
+        app.handle_chat_outbound("hello everyone".into());
+
+        let a_msg: serde_json::Value =
+            serde_json::from_str(&a_rx.try_recv().unwrap()).unwrap();
+        let b_msg: serde_json::Value =
+            serde_json::from_str(&b_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(a_msg["type"], "user_message");
+        assert_eq!(a_msg["to_all"], true);
+        assert_eq!(a_msg["message"], "hello everyone");
+        assert_eq!(b_msg["type"], "user_message");
+    }
+
+    #[test]
+    fn chat_outbound_targeted_delivers_only_to_named_agent() {
+        let mut app = make_app();
+        let a = app.spawn_headless_session("reviewer".into(), None).unwrap();
+        let b = app.spawn_headless_session("council".into(), None).unwrap();
+        let (a_tx, mut a_rx) = mpsc::channel(2);
+        let (b_tx, mut b_rx) = mpsc::channel(2);
+        app.agent_writers.insert(a, a_tx);
+        app.agent_writers.insert(b, b_tx);
+
+        app.handle_chat_outbound("@reviewer elaborate please".into());
+
+        let a_msg: serde_json::Value =
+            serde_json::from_str(&a_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(a_msg["type"], "user_message");
+        assert_eq!(a_msg["to_all"], false);
+        assert_eq!(a_msg["message"], "elaborate please");
+        assert!(b_rx.try_recv().is_err(), "council should not receive the message");
+    }
+
+    #[test]
+    fn chat_outbound_unknown_target_adds_system_message() {
+        let mut app = make_app();
+
+        app.handle_chat_outbound("@nobody hello".into());
+
+        assert_eq!(app.chat.messages.len(), 2);
+        assert!(matches!(&app.chat.messages[1].from, ChatSender::System));
+        assert!(app.chat.messages[1].text.contains("nobody"));
+    }
+
+    #[test]
+    fn agent_connect_and_disconnect_emit_system_chat_messages() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("council".into(), None).unwrap();
+        let (tx, _rx) = mpsc::channel(2);
+
+        app.handle_ipc_agent_connected(id, tx);
+        assert_eq!(app.chat.messages.len(), 1);
+        assert!(matches!(&app.chat.messages[0].from, ChatSender::System));
+        assert!(app.chat.messages[0].text.contains("connected"));
+
+        app.handle_ipc_agent_disconnected(id);
+        assert_eq!(app.chat.messages.len(), 2);
+        assert!(app.chat.messages[1].text.contains("disconnected"));
+    }
+
+    #[test]
+    fn chat_cursor_editing_inserts_and_moves_correctly() {
+        let mut app = make_app();
+        app.chat_input_char('a');
+        app.chat_input_char('c');
+        app.chat_cursor_left();
+        app.chat_input_char('b');
+        assert_eq!(app.chat.input, "abc");
+        assert_eq!(app.chat.input_cursor, 2);
+        app.chat_input_backspace();
+        assert_eq!(app.chat.input, "ac");
+        app.chat_cursor_home();
+        assert_eq!(app.chat.input_cursor, 0);
+        app.chat_cursor_end();
+        assert_eq!(app.chat.input_cursor, 2);
     }
 }

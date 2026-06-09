@@ -81,6 +81,15 @@ pub enum AppEvent {
         source: usize,
         dest: Option<usize>,
     },
+    /// Agent sent a chat message via IPC.
+    ChatInbound {
+        from_session_id: usize,
+        text: String,
+    },
+    /// User submitted a line from the chat input box.
+    ChatOutbound {
+        text: String,
+    },
     /// Fire all manual pipes from every session in a named group
     IpcGroupFire {
         source_group: String,

@@ -149,6 +149,16 @@ fn main() {
             send_only(&sock, &msg);
         }
 
+        Some("chat") => {
+            let message = args[2..].join(" ");
+            if message.is_empty() {
+                eprintln!("usage: linkshell-ctl chat <message...>");
+                std::process::exit(1);
+            }
+            let msg = serde_json::json!({"type": "chat", "message": message});
+            send_only(&sock, &msg);
+        }
+
         _ => usage(),
     }
 }
@@ -225,6 +235,7 @@ fn usage() -> ! {
     eprintln!("  linkshell-ctl pipe add <src> <dst> [--extract=X] [--trigger=X] [--prefix=X]");
     eprintln!("  linkshell-ctl pipe remove <src> [dst]");
     eprintln!("  linkshell-ctl pipe fire [src] [dst]");
+    eprintln!("  linkshell-ctl chat <message...>");
     eprintln!();
     eprintln!("environment variables:");
     eprintln!(
