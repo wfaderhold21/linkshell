@@ -17,18 +17,18 @@ pub enum SessionKind {
 impl SessionKind {
     pub fn label(&self) -> &str {
         match self {
-            SessionKind::Claude    => "claude",
-            SessionKind::Codex     => "codex",
-            SessionKind::Shell     => "shell",
+            SessionKind::Claude => "claude",
+            SessionKind::Codex => "codex",
+            SessionKind::Shell => "shell",
             SessionKind::Custom(_) => "custom",
         }
     }
 
     pub fn command(&self) -> String {
         match self {
-            SessionKind::Claude    => "claude".to_string(),
-            SessionKind::Codex     => "codex".to_string(),
-            SessionKind::Shell     => {
+            SessionKind::Claude => "claude".to_string(),
+            SessionKind::Codex => "codex".to_string(),
+            SessionKind::Shell => {
                 std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
             }
             SessionKind::Custom(c) => c.clone(),
@@ -51,12 +51,12 @@ impl SessionState {
     pub fn label(&self) -> &str {
         match self {
             SessionState::Starting => "STARTING",
-            SessionState::Ready    => "READY",
+            SessionState::Ready => "READY",
             SessionState::Thinking => "THINKING",
-            SessionState::Running  => "RUNNING",
-            SessionState::Waiting  => "WAITING!",
-            SessionState::Error    => "ERROR",
-            SessionState::Dead     => "DEAD",
+            SessionState::Running => "RUNNING",
+            SessionState::Waiting => "WAITING!",
+            SessionState::Error => "ERROR",
+            SessionState::Dead => "DEAD",
         }
     }
 }
@@ -103,7 +103,14 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(id: usize, name: String, kind: SessionKind, cwd: String, rows: u16, cols: u16) -> Self {
+    pub fn new(
+        id: usize,
+        name: String,
+        kind: SessionKind,
+        cwd: String,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
         Self {
             id,
             name,
@@ -200,7 +207,7 @@ impl Session {
     /// Called once per completed output line; each turn contributes its own
     /// cost and token counts additively.
     pub fn accumulate_stats(&mut self, new: TokenStats) {
-        self.stats.input_tokens  += new.input_tokens;
+        self.stats.input_tokens += new.input_tokens;
         self.stats.output_tokens += new.output_tokens;
         self.stats.total_cost_usd += new.total_cost_usd;
     }

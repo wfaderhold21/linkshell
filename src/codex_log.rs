@@ -82,8 +82,12 @@ async fn wait_for_new_rollout(
 }
 
 fn parse_model_from_session_meta(v: &serde_json::Value) -> Option<String> {
-    if v["type"].as_str()? != "session_meta" { return None; }
-    v["payload"]["model"].as_str().map(|s| s.to_string())
+    if v["type"].as_str()? != "session_meta" {
+        return None;
+    }
+    v["payload"]["model"]
+        .as_str()
+        .map(|s| s.to_string())
         .or_else(|| v["payload"]["agent_id"].as_str().map(|s| s.to_string()))
 }
 
@@ -123,7 +127,12 @@ fn parse_token_count(v: &serde_json::Value, model: &str, config: &Config) -> Opt
     })
 }
 
-async fn tail(session_id: usize, path: &Path, tx: &tokio::sync::mpsc::Sender<AppEvent>, config: &Config) {
+async fn tail(
+    session_id: usize,
+    path: &Path,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
+    config: &Config,
+) {
     let mut offset: u64 = 0;
     let mut model = "unknown".to_string();
 
@@ -180,7 +189,12 @@ async fn tail(session_id: usize, path: &Path, tx: &tokio::sync::mpsc::Sender<App
 }
 
 /// Spawn a watcher for the next Codex rollout JSONL created in this cwd.
-pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Sender<AppEvent>, config: Arc<Config>) {
+pub fn spawn_watcher(
+    session_id: usize,
+    cwd: String,
+    tx: tokio::sync::mpsc::Sender<AppEvent>,
+    config: Arc<Config>,
+) {
     tokio::spawn(async move {
         let dir = match sessions_dir() {
             Some(d) => d,

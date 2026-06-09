@@ -18,10 +18,12 @@ fn encode_cwd(cwd: &str) -> String {
 
 fn project_dir(cwd: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home)
-        .join(".claude")
-        .join("projects")
-        .join(encode_cwd(cwd)))
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join("projects")
+            .join(encode_cwd(cwd)),
+    )
 }
 
 fn jsonl_files(dir: &Path) -> HashSet<PathBuf> {
@@ -56,11 +58,11 @@ async fn wait_for_new_jsonl(
 }
 
 struct RawUsage {
-    input:        u64,
-    cache_write:  u64,
-    cache_read:   u64,
-    output:       u64,
-    model:        String,
+    input: u64,
+    cache_write: u64,
+    cache_read: u64,
+    output: u64,
+    model: String,
     service_tier: Option<String>,
 }
 
@@ -75,12 +77,15 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
     let usage = v["message"]["usage"].as_object()?;
     let get = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     let raw = RawUsage {
-        input:        get("input_tokens"),
-        cache_write:  get("cache_creation_input_tokens"),
-        cache_read:   get("cache_read_input_tokens"),
-        output:       get("output_tokens"),
+        input: get("input_tokens"),
+        cache_write: get("cache_creation_input_tokens"),
+        cache_read: get("cache_read_input_tokens"),
+        output: get("output_tokens"),
         model,
-        service_tier: usage.get("service_tier").and_then(|v| v.as_str()).map(str::to_owned),
+        service_tier: usage
+            .get("service_tier")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
     };
     if raw.input == 0 && raw.cache_write == 0 && raw.cache_read == 0 && raw.output == 0 {
         return None;
@@ -90,10 +95,10 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
 
 fn compute_cost(raw: &RawUsage, config: &Config) -> f64 {
     let rate = config.pricing.claude_rate(&raw.model);
-    (raw.input       as f64 / 1_000_000.0) * rate.input
+    (raw.input as f64 / 1_000_000.0) * rate.input
         + (raw.cache_write as f64 / 1_000_000.0) * rate.cache_write
-        + (raw.cache_read  as f64 / 1_000_000.0) * rate.cache_read
-        + (raw.output      as f64 / 1_000_000.0) * rate.output
+        + (raw.cache_read as f64 / 1_000_000.0) * rate.cache_read
+        + (raw.output as f64 / 1_000_000.0) * rate.output
 }
 
 use crate::session::SessionState;
@@ -103,13 +108,11 @@ fn parse_state(v: &serde_json::Value) -> Option<SessionState> {
     match v["type"].as_str()? {
         "user" => Some(SessionState::Thinking),
         "tool" => Some(SessionState::Running),
-        "assistant" => {
-            match v["message"]["stop_reason"].as_str().unwrap_or("") {
-                "tool_use" => Some(SessionState::Running),
-                "end_turn" => Some(SessionState::Ready),
-                _ => None,
-            }
-        }
+        "assistant" => match v["message"]["stop_reason"].as_str().unwrap_or("") {
+            "tool_use" => Some(SessionState::Running),
+            "end_turn" => Some(SessionState::Ready),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -121,12 +124,12 @@ async fn tail(
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
     config: &Config,
 ) {
-    let mut acc_input:        u64  = 0;
-    let mut acc_cache_write:  u64  = 0;
-    let mut acc_cache_read:   u64  = 0;
-    let mut acc_output:       u64  = 0;
-    let mut acc_cost:         f64  = 0.0;
-    let mut context_tokens:   u64  = 0;
+    let mut acc_input: u64 = 0;
+    let mut acc_cache_write: u64 = 0;
+    let mut acc_cache_read: u64 = 0;
+    let mut acc_output: u64 = 0;
+    let mut acc_cost: f64 = 0.0;
+    let mut context_tokens: u64 = 0;
     let mut billing_detected: bool = false;
     let mut offset: u64 = 0;
 
@@ -157,28 +160,29 @@ async fn tail(
                                 Err(_) => continue,
                             };
                             if let Some(state) = parse_state(&v) {
-                                let _ = tx.send(AppEvent::IpcStateOverride {
-                                    session_id,
-                                    state,
-                                }).await;
+                                let _ = tx
+                                    .send(AppEvent::IpcStateOverride { session_id, state })
+                                    .await;
                             }
                             if let Some(raw) = parse_usage_from_value(&v) {
                                 if !billing_detected {
                                     if let Some(ref tier) = raw.service_tier {
                                         billing_detected = true;
                                         let is_pro = tier != "standard";
-                                        let _ = tx.send(AppEvent::SessionBillingKnown {
-                                            session_id,
-                                            is_pro,
-                                        }).await;
+                                        let _ = tx
+                                            .send(AppEvent::SessionBillingKnown {
+                                                session_id,
+                                                is_pro,
+                                            })
+                                            .await;
                                     }
                                 }
-                                acc_cost        += compute_cost(&raw, config);
-                                acc_input       += raw.input;
+                                acc_cost += compute_cost(&raw, config);
+                                acc_input += raw.input;
                                 acc_cache_write += raw.cache_write;
-                                acc_cache_read  += raw.cache_read;
-                                acc_output      += raw.output;
-                                context_tokens   = raw.input + raw.cache_write + raw.cache_read;
+                                acc_cache_read += raw.cache_read;
+                                acc_output += raw.output;
+                                context_tokens = raw.input + raw.cache_write + raw.cache_read;
                                 new_stats = true;
                             }
                         }
@@ -190,12 +194,16 @@ async fn tail(
 
         if new_stats {
             let stats = TokenStats {
-                input_tokens:  acc_input + acc_cache_write + acc_cache_read,
+                input_tokens: acc_input + acc_cache_write + acc_cache_read,
                 output_tokens: acc_output,
                 context_tokens,
                 total_cost_usd: acc_cost,
             };
-            if tx.send(AppEvent::SessionStats { session_id, stats }).await.is_err() {
+            if tx
+                .send(AppEvent::SessionStats { session_id, stats })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -203,7 +211,6 @@ async fn tail(
         sleep(Duration::from_millis(500)).await;
     }
 }
-
 
 /// Spawn a background task that watches the Claude CLI project JSONL for this
 /// session and emits `SessionStats` events with the true cumulative totals.
@@ -221,15 +228,23 @@ pub fn spawn_watcher(
     // Snapshot existing JSONL files SYNCHRONOUSLY here, before the PTY runner is
     // even spawned. This closes the race where Claude creates its new session file
     // before the async watcher task gets to run on a multi-threaded executor.
-    let existing = if dir.exists() { jsonl_files(&dir) } else { HashSet::new() };
+    let existing = if dir.exists() {
+        jsonl_files(&dir)
+    } else {
+        HashSet::new()
+    };
 
     tokio::spawn(async move {
         // Wait for the project dir to exist (first session in this cwd).
         if !dir.exists() {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
-                if dir.exists() { break; }
-                if tokio::time::Instant::now() >= deadline { return; }
+                if dir.exists() {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
                 sleep(Duration::from_millis(200)).await;
             }
         }

@@ -1,15 +1,15 @@
+use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use ratatui::layout::Rect;
 
 use crate::config::{self, Config};
 use crate::events::AppEvent;
 use crate::keybindings::{self, Keymap};
 use crate::patterns::PatternMatcher;
-use crate::pipe::{self, Pipe, PipeTrigger, ExtractMode};
-use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_ROWS, PTY_COLS};
+use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
+use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS};
 
 /// Screen-coordinate selection (col, row both relative to output area inner content).
 #[derive(Debug, Clone)]
@@ -24,16 +24,28 @@ impl Selection {
     /// Returns ((min_row, min_col), (max_row, max_col)) in reading order.
     pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
         let a = (self.start_row, self.start_col);
-        let b = (self.end_row,   self.end_col);
-        if a <= b { (a, b) } else { (b, a) }
+        let b = (self.end_row, self.end_col);
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
     }
 
     pub fn contains(&self, row: u16, col: u16) -> bool {
         let ((min_row, min_col), (max_row, max_col)) = self.normalized();
-        if row < min_row || row > max_row { return false; }
-        if row == min_row && row == max_row { return col >= min_col && col <= max_col; }
-        if row == min_row { return col >= min_col; }
-        if row == max_row { return col <= max_col; }
+        if row < min_row || row > max_row {
+            return false;
+        }
+        if row == min_row && row == max_row {
+            return col >= min_col && col <= max_col;
+        }
+        if row == min_row {
+            return col >= min_col;
+        }
+        if row == max_row {
+            return col <= max_col;
+        }
         true
     }
 }
@@ -53,18 +65,48 @@ pub struct NewSessionState {
     pub cwd: String,
     pub custom_cmd: String,
     pub active_field: NewSessionField,
+    pub name_cursor: usize,
+    pub cwd_cursor: usize,
+    pub custom_cmd_cursor: usize,
+}
+
+impl NewSessionState {
+    /// Returns the cursor position for the currently active text field.
+    /// Returns 0 for the Kind field (which has no text cursor).
+    pub fn cursor_pos(&self) -> usize {
+        match self.active_field {
+            NewSessionField::Kind => 0,
+            NewSessionField::Name => self.name_cursor,
+            NewSessionField::Cwd => self.cwd_cursor,
+            NewSessionField::CustomCmd => self.custom_cmd_cursor,
+        }
+    }
+
+    fn active_field_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+        match self.active_field {
+            NewSessionField::Kind => None,
+            NewSessionField::Name => Some((&mut self.name, &mut self.name_cursor)),
+            NewSessionField::Cwd => Some((&mut self.cwd, &mut self.cwd_cursor)),
+            NewSessionField::CustomCmd => Some((&mut self.custom_cmd, &mut self.custom_cmd_cursor)),
+        }
+    }
 }
 
 impl Default for NewSessionState {
     fn default() -> Self {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "~".to_string());
+        let cwd_cursor = cwd.len();
         Self {
             selected_kind: 0,
             name: String::new(),
-            cwd: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "~".to_string()),
+            cwd,
             custom_cmd: String::new(),
             active_field: NewSessionField::Kind,
+            name_cursor: 0,
+            cwd_cursor,
+            custom_cmd_cursor: 0,
         }
     }
 }
@@ -98,7 +140,8 @@ pub struct App {
     matcher: PatternMatcher,
     next_id: usize,
     /// Pending IPC reply channels: session_id → (oneshot sender, line offset when input was sent).
-    pub pending_ipc_replies: HashMap<usize, (tokio::sync::oneshot::Sender<serde_json::Value>, usize)>,
+    pub pending_ipc_replies:
+        HashMap<usize, (tokio::sync::oneshot::Sender<serde_json::Value>, usize)>,
     /// Write channels to connected persistent agents, keyed by session_id.
     pub agent_writers: HashMap<usize, mpsc::Sender<String>>,
     /// Buffered pipe relays waiting for the dest session to reach READY.
@@ -176,8 +219,8 @@ impl App {
         // Resolve command from config overrides.
         let cmd_str = match &kind {
             SessionKind::Claude => self.config.sessions.commands.claude.clone(),
-            SessionKind::Codex  => self.config.sessions.commands.codex.clone(),
-            SessionKind::Shell  => {
+            SessionKind::Codex => self.config.sessions.commands.codex.clone(),
+            SessionKind::Shell => {
                 let c = &self.config.sessions.commands.shell;
                 if c.is_empty() {
                     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
@@ -192,7 +235,14 @@ impl App {
         config::validate_command(&cmd_str).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let (pty_rows, pty_cols) = self.pty_size;
-        let session = Session::new(id, session_name, kind.clone(), cwd.clone(), pty_rows, pty_cols);
+        let session = Session::new(
+            id,
+            session_name,
+            kind.clone(),
+            cwd.clone(),
+            pty_rows,
+            pty_cols,
+        );
         let idx = self.sessions.len();
         self.sessions.push(session);
 
@@ -212,11 +262,14 @@ impl App {
         }
 
         tokio::spawn(async move {
-            if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket).await {
-                let _ = tx.send(AppEvent::SessionOutput {
-                    session_id: id,
-                    line: format!("[error: {}]", e),
-                }).await;
+            if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket).await
+            {
+                let _ = tx
+                    .send(AppEvent::SessionOutput {
+                        session_id: id,
+                        line: format!("[error: {}]", e),
+                    })
+                    .await;
                 let _ = tx.send(AppEvent::SessionDied { session_id: id }).await;
             }
         });
@@ -224,13 +277,21 @@ impl App {
         Ok(())
     }
 
-    pub fn spawn_headless_session(&mut self, name: String, group: Option<String>) -> anyhow::Result<usize> {
+    pub fn spawn_headless_session(
+        &mut self,
+        name: String,
+        group: Option<String>,
+    ) -> anyhow::Result<usize> {
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(anyhow::anyhow!("Maximum {} sessions reached", MAX_SESSIONS));
         }
         let id = self.next_id;
         self.next_id += 1;
-        let label = if name.is_empty() { format!("agent-{}", id + 1) } else { name };
+        let label = if name.is_empty() {
+            format!("agent-{}", id + 1)
+        } else {
+            name
+        };
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -250,16 +311,14 @@ impl App {
     }
 
     fn remove_session(&mut self, idx: usize) {
-        if idx >= self.sessions.len() { return; }
+        if idx >= self.sessions.len() {
+            return;
+        }
         // Drop the PTY write channel so the background task exits
         self.sessions[idx].pty_writer = None;
         self.sessions.remove(idx);
         let n = self.sessions.len();
-        self.active_idx = if n == 0 {
-            None
-        } else {
-            Some(idx.min(n - 1))
-        };
+        self.active_idx = if n == 0 { None } else { Some(idx.min(n - 1)) };
     }
 
     pub fn switch_to(&mut self, idx: usize) {
@@ -270,14 +329,21 @@ impl App {
 
     pub fn next_session(&mut self) {
         let n = self.sessions.len();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         self.active_idx = Some(self.active_idx.map_or(0, |i| (i + 1) % n));
     }
 
     pub fn prev_session(&mut self) {
         let n = self.sessions.len();
-        if n == 0 { return; }
-        self.active_idx = Some(self.active_idx.map_or(0, |i| if i == 0 { n - 1 } else { i - 1 }));
+        if n == 0 {
+            return;
+        }
+        self.active_idx = Some(
+            self.active_idx
+                .map_or(0, |i| if i == 0 { n - 1 } else { i - 1 }),
+        );
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -314,7 +380,11 @@ impl App {
         }
     }
 
-    pub fn handle_session_resizer(&mut self, session_id: usize, resizer_tx: mpsc::Sender<(u16, u16)>) {
+    pub fn handle_session_resizer(
+        &mut self,
+        session_id: usize,
+        resizer_tx: mpsc::Sender<(u16, u16)>,
+    ) {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             s.pty_resizer = Some(resizer_tx);
         }
@@ -322,7 +392,9 @@ impl App {
 
     /// Called from the main loop after each draw when the output area changes size.
     pub fn handle_resize(&mut self, rows: u16, cols: u16) {
-        if self.pty_size == (rows, cols) { return; }
+        if self.pty_size == (rows, cols) {
+            return;
+        }
         self.pty_size = (rows, cols);
         for session in &mut self.sessions {
             session.resize_screen(rows, cols);
@@ -337,7 +409,8 @@ impl App {
             session.process_bytes(&data);
         }
         // Auto-scroll to bottom when the active session receives new output
-        let active_is_updated = self.active_idx
+        let active_is_updated = self
+            .active_idx
             .and_then(|i| self.sessions.get(i))
             .map(|s| s.id == session_id)
             .unwrap_or(false);
@@ -388,11 +461,13 @@ impl App {
         let mut to_fire: Vec<Pipe> = Vec::new();
 
         for p in self.pipes.iter_mut() {
-            if p.source != session_id || !p.active { continue; }
+            if p.source != session_id || !p.active {
+                continue;
+            }
             let fires = match p.trigger {
-                PipeTrigger::OnReady   => *new_state == SessionState::Ready,
+                PipeTrigger::OnReady => *new_state == SessionState::Ready,
                 PipeTrigger::OnWaiting => *new_state == SessionState::Waiting,
-                PipeTrigger::Manual    => false,
+                PipeTrigger::Manual => false,
             };
             if fires {
                 let cooldown = self.config.pipe.summarize.cooldown_secs as f64;
@@ -407,7 +482,8 @@ impl App {
         }
 
         for p in to_fire {
-            if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
+            if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract)
+            {
                 pipe::fire_pipe_task(p, content, self.event_tx.clone(), Arc::clone(&self.config));
             }
         }
@@ -418,15 +494,24 @@ impl App {
         let mut to_fire: Vec<Pipe> = Vec::new();
 
         for p in self.pipes.iter_mut() {
-            if p.source != source || !p.active { continue; }
-            if p.trigger != PipeTrigger::Manual { continue; }
-            if let Some(d) = dest { if p.dest != d { continue; } }
+            if p.source != source || !p.active {
+                continue;
+            }
+            if p.trigger != PipeTrigger::Manual {
+                continue;
+            }
+            if let Some(d) = dest {
+                if p.dest != d {
+                    continue;
+                }
+            }
             p.last_fired = Some(now);
             to_fire.push(p.clone());
         }
 
         for p in to_fire {
-            if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract) {
+            if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract)
+            {
                 pipe::fire_pipe_task(p, content, self.event_tx.clone(), Arc::clone(&self.config));
             }
         }
@@ -465,7 +550,9 @@ impl App {
     }
 
     pub fn handle_ipc_state(&mut self, session_id: usize, state: SessionState) {
-        let old = self.sessions.iter()
+        let old = self
+            .sessions
+            .iter()
             .find(|s| s.id == session_id)
             .map(|s| s.state.clone());
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
@@ -483,13 +570,20 @@ impl App {
     }
 
     pub fn handle_named_action(&mut self, session_name: String, msg: serde_json::Value) {
-        let session_id = match self.sessions.iter().find(|s| s.name == session_name).map(|s| s.id) {
+        let session_id = match self
+            .sessions
+            .iter()
+            .find(|s| s.name == session_name)
+            .map(|s| s.id)
+        {
             Some(id) => id,
             None => return,
         };
         match msg["type"].as_str() {
             Some("state") => {
-                if let Some(s) = crate::ipc::parse_session_state(msg["state"].as_str().unwrap_or("")) {
+                if let Some(s) =
+                    crate::ipc::parse_session_state(msg["state"].as_str().unwrap_or(""))
+                {
                     if let Some(detail) = msg["detail"].as_str() {
                         let _ = self.event_tx.try_send(AppEvent::SessionOutput {
                             session_id,
@@ -501,12 +595,15 @@ impl App {
             }
             Some("tokens") => {
                 use crate::session::TokenStats;
-                self.handle_ipc_tokens(session_id, TokenStats {
-                    input_tokens:   msg["input"].as_u64().unwrap_or(0),
-                    output_tokens:  msg["output"].as_u64().unwrap_or(0),
-                    total_cost_usd: msg["cost"].as_f64().unwrap_or(0.0),
-                    context_tokens: 0,
-                });
+                self.handle_ipc_tokens(
+                    session_id,
+                    TokenStats {
+                        input_tokens: msg["input"].as_u64().unwrap_or(0),
+                        output_tokens: msg["output"].as_u64().unwrap_or(0),
+                        total_cost_usd: msg["cost"].as_f64().unwrap_or(0.0),
+                        context_tokens: 0,
+                    },
+                );
             }
             Some("output") => {
                 if let Some(line) = msg["line"].as_str() {
@@ -524,11 +621,18 @@ impl App {
         }
     }
 
-    pub fn handle_ipc_pipe_add(&mut self, source: usize, dest: usize, trigger: &str, extract: &str, prefix: Option<String>) {
+    pub fn handle_ipc_pipe_add(
+        &mut self,
+        source: usize,
+        dest: usize,
+        trigger: &str,
+        extract: &str,
+        prefix: Option<String>,
+    ) {
         let trig = match trigger {
             "on_waiting" | "waiting" => PipeTrigger::OnWaiting,
-            "manual"                 => PipeTrigger::Manual,
-            _                        => PipeTrigger::OnReady,
+            "manual" => PipeTrigger::Manual,
+            _ => PipeTrigger::OnReady,
         };
         let ext = if extract == "diff" {
             ExtractMode::Diff
@@ -539,12 +643,20 @@ impl App {
         } else {
             ExtractMode::LastBlock
         };
-        self.pipes.push(Pipe { source, dest, trigger: trig, extract: ext, prefix, active: true, last_fired: None });
+        self.pipes.push(Pipe {
+            source,
+            dest,
+            trigger: trig,
+            extract: ext,
+            prefix,
+            active: true,
+            last_fired: None,
+        });
     }
 
     pub fn handle_ipc_pipe_remove(&mut self, source: usize, dest: Option<usize>) {
         match dest {
-            None    => self.pipes.retain(|p| p.source != source),
+            None => self.pipes.retain(|p| p.source != source),
             Some(d) => self.pipes.retain(|p| !(p.source == source && p.dest == d)),
         }
     }
@@ -561,7 +673,9 @@ impl App {
     }
 
     pub fn handle_group_fire(&mut self, source_group: &str) {
-        let ids: Vec<usize> = self.sessions.iter()
+        let ids: Vec<usize> = self
+            .sessions
+            .iter()
             .filter(|s| s.group.as_deref() == Some(source_group))
             .map(|s| s.id)
             .collect();
@@ -576,13 +690,21 @@ impl App {
         }
     }
 
-    pub fn handle_ipc_agent_connected(&mut self, session_id: usize, agent_tx: mpsc::Sender<String>) {
+    pub fn handle_ipc_agent_connected(
+        &mut self,
+        session_id: usize,
+        agent_tx: mpsc::Sender<String>,
+    ) {
         self.agent_writers.insert(session_id, agent_tx);
     }
 
     pub fn handle_ipc_agent_disconnected(&mut self, session_id: usize) {
         self.agent_writers.remove(&session_id);
-        if let Some(idx) = self.sessions.iter().position(|s| s.id == session_id && s.headless) {
+        if let Some(idx) = self
+            .sessions
+            .iter()
+            .position(|s| s.id == session_id && s.headless)
+        {
             self.remove_session(idx);
         }
     }
@@ -613,7 +735,9 @@ impl App {
             let line = serde_json::to_string(&relay).unwrap_or_default() + "\n";
             let _ = agent_tx.try_send(line);
         }
-        let dest_ready = self.sessions.iter()
+        let dest_ready = self
+            .sessions
+            .iter()
             .find(|s| s.id == dest_id)
             .map(|s| s.state == SessionState::Ready)
             .unwrap_or(false);
@@ -622,7 +746,10 @@ impl App {
                 session.write_bytes(message.into_bytes());
             }
         } else {
-            self.pending_relays.entry(dest_id).or_default().push(message);
+            self.pending_relays
+                .entry(dest_id)
+                .or_default()
+                .push(message);
         }
     }
 
@@ -641,7 +768,8 @@ impl App {
             return;
         }
         if let Some((resp_tx, line_offset)) = self.pending_ipc_replies.remove(&session_id) {
-            let lines: Vec<String> = self.sessions
+            let lines: Vec<String> = self
+                .sessions
                 .iter()
                 .find(|s| s.id == session_id)
                 .map(|s| s.output_lines.iter().skip(line_offset).cloned().collect())
@@ -660,12 +788,16 @@ impl App {
     ) {
         use crate::events::IpcQueryPayload;
         match payload {
-            IpcQueryPayload::SessionCreate { kind_str, name, cwd } => {
+            IpcQueryPayload::SessionCreate {
+                kind_str,
+                name,
+                cwd,
+            } => {
                 let kind = match kind_str.as_str() {
                     "claude" => crate::session::SessionKind::Claude,
-                    "codex"  => crate::session::SessionKind::Codex,
-                    "shell"  => crate::session::SessionKind::Shell,
-                    other    => crate::session::SessionKind::Custom(other.to_string()),
+                    "codex" => crate::session::SessionKind::Codex,
+                    "shell" => crate::session::SessionKind::Shell,
+                    other => crate::session::SessionKind::Custom(other.to_string()),
                 };
                 let new_id = self.next_id;
                 match self.spawn_session(kind, name, cwd) {
@@ -680,7 +812,8 @@ impl App {
             IpcQueryPayload::Register { name, group } => {
                 match self.spawn_headless_session(name, group) {
                     Ok(new_id) => {
-                        let _ = response_tx.send(serde_json::json!({"type": "registered", "session_id": new_id}));
+                        let _ = response_tx
+                            .send(serde_json::json!({"type": "registered", "session_id": new_id}));
                     }
                     Err(e) => {
                         let _ = response_tx.send(serde_json::json!({"error": e.to_string()}));
@@ -690,40 +823,50 @@ impl App {
             IpcQueryPayload::Query { what } => {
                 let resp = match what.as_str() {
                     "sessions" => {
-                        let arr: Vec<_> = self.sessions.iter().map(|s| serde_json::json!({
-                            "id":            s.id,
-                            "name":          s.name,
-                            "kind":          s.kind.label(),
-                            "state":         s.state.label(),
-                            "group":         s.group,
-                            "input_tokens":  s.stats.input_tokens,
-                            "output_tokens": s.stats.output_tokens,
-                            "cost_usd":      s.stats.total_cost_usd,
-                        })).collect();
+                        let arr: Vec<_> = self
+                            .sessions
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "id":            s.id,
+                                    "name":          s.name,
+                                    "kind":          s.kind.label(),
+                                    "state":         s.state.label(),
+                                    "group":         s.group,
+                                    "input_tokens":  s.stats.input_tokens,
+                                    "output_tokens": s.stats.output_tokens,
+                                    "cost_usd":      s.stats.total_cost_usd,
+                                })
+                            })
+                            .collect();
                         serde_json::Value::Array(arr)
                     }
                     "pipes" => {
-                        let arr: Vec<_> = self.pipes.iter().map(|p| {
-                            let trigger = match p.trigger {
-                                PipeTrigger::OnReady   => "on_ready",
-                                PipeTrigger::OnWaiting => "on_waiting",
-                                PipeTrigger::Manual    => "manual",
-                            };
-                            let extract = match &p.extract {
-                                ExtractMode::LastBlock    => "last-block".to_string(),
-                                ExtractMode::LastN(n)     => format!("last-n={}", n),
-                                ExtractMode::Diff         => "diff".to_string(),
-                                ExtractMode::Summarize(n) => format!("summarize={}", n),
-                            };
-                            serde_json::json!({
-                                "source":  p.source,
-                                "dest":    p.dest,
-                                "trigger": trigger,
-                                "extract": extract,
-                                "prefix":  p.prefix,
-                                "active":  p.active,
+                        let arr: Vec<_> = self
+                            .pipes
+                            .iter()
+                            .map(|p| {
+                                let trigger = match p.trigger {
+                                    PipeTrigger::OnReady => "on_ready",
+                                    PipeTrigger::OnWaiting => "on_waiting",
+                                    PipeTrigger::Manual => "manual",
+                                };
+                                let extract = match &p.extract {
+                                    ExtractMode::LastBlock => "last-block".to_string(),
+                                    ExtractMode::LastN(n) => format!("last-n={}", n),
+                                    ExtractMode::Diff => "diff".to_string(),
+                                    ExtractMode::Summarize(n) => format!("summarize={}", n),
+                                };
+                                serde_json::json!({
+                                    "source":  p.source,
+                                    "dest":    p.dest,
+                                    "trigger": trigger,
+                                    "extract": extract,
+                                    "prefix":  p.prefix,
+                                    "active":  p.active,
+                                })
                             })
-                        }).collect();
+                            .collect();
                         serde_json::Value::Array(arr)
                     }
                     _ => serde_json::json!({"error": "unknown query"}),
@@ -736,10 +879,10 @@ impl App {
                     let mut input = text;
                     input.push('\n');
                     s.write_bytes(input.into_bytes());
-                    self.pending_ipc_replies.insert(session_id, (response_tx, line_offset));
+                    self.pending_ipc_replies
+                        .insert(session_id, (response_tx, line_offset));
                 } else {
-                    let _ = response_tx.send(
-                        serde_json::json!({"error": "session not found"}));
+                    let _ = response_tx.send(serde_json::json!({"error": "session not found"}));
                 }
             }
         }
@@ -760,7 +903,8 @@ impl App {
             // Expire stale ipc_state overrides.
             if session.ipc_state {
                 let timeout = self.config.general.ipc_state_override_timeout_secs;
-                let expired = session.ipc_state_set_at
+                let expired = session
+                    .ipc_state_set_at
                     .map(|t| t.elapsed().as_secs() > timeout)
                     .unwrap_or(false);
                 if expired {
@@ -774,7 +918,10 @@ impl App {
                 if let Some(last) = session.last_output_at {
                     let elapsed = last.elapsed();
                     if elapsed > Duration::from_secs(2)
-                        && matches!(session.state, SessionState::Running | SessionState::Thinking)
+                        && matches!(
+                            session.state,
+                            SessionState::Running | SessionState::Thinking
+                        )
                     {
                         session.state = SessionState::Ready;
                         tick_ready.push(session.id);
@@ -817,8 +964,10 @@ impl App {
                 if rect_inner_hit(self.output_area, col, row) {
                     let (c, r) = to_content_coords(self.output_area, col, row);
                     self.selection = Some(Selection {
-                        start_col: c, start_row: r,
-                        end_col:   c, end_row:   r,
+                        start_col: c,
+                        start_row: r,
+                        end_col: c,
+                        end_row: r,
                     });
                 }
             }
@@ -867,7 +1016,11 @@ impl App {
         for disp_row in min_row..=max_row {
             let vt_row = start_vt_row + disp_row;
             let col_start = if disp_row == min_row { min_col } else { 0 };
-            let col_end   = if disp_row == max_row { max_col } else { screen_cols.saturating_sub(1) };
+            let col_end = if disp_row == max_row {
+                max_col
+            } else {
+                screen_cols.saturating_sub(1)
+            };
             let mut row_text = String::new();
             for col in col_start..=col_end {
                 if let Some(cell) = screen.cell(vt_row, col) {
@@ -906,30 +1059,78 @@ impl App {
         use NewSessionField::*;
         let is_custom = self.new_session_state.selected_kind == 3;
         self.new_session_state.active_field = match self.new_session_state.active_field {
-            Kind      => Name,
-            Name      => Cwd,
-            Cwd       => if is_custom { CustomCmd } else { Kind },
+            Kind => Name,
+            Name => Cwd,
+            Cwd => {
+                if is_custom {
+                    CustomCmd
+                } else {
+                    Kind
+                }
+            }
             CustomCmd => Kind,
         };
     }
 
     pub fn new_session_input(&mut self, c: char) {
-        use NewSessionField::*;
-        match self.new_session_state.active_field {
-            Kind      => {}
-            Name      => self.new_session_state.name.push(c),
-            Cwd       => self.new_session_state.cwd.push(c),
-            CustomCmd => self.new_session_state.custom_cmd.push(c),
+        if let Some((text, cursor)) = self.new_session_state.active_field_mut() {
+            text.insert(*cursor, c);
+            *cursor += c.len_utf8();
         }
     }
 
     pub fn new_session_backspace(&mut self) {
-        use NewSessionField::*;
-        match self.new_session_state.active_field {
-            Kind      => {}
-            Name      => { self.new_session_state.name.pop(); }
-            Cwd       => { self.new_session_state.cwd.pop(); }
-            CustomCmd => { self.new_session_state.custom_cmd.pop(); }
+        if let Some((text, cursor)) = self.new_session_state.active_field_mut() {
+            if *cursor > 0 {
+                let prev = text[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                text.remove(prev);
+                *cursor = prev;
+            }
+        }
+    }
+
+    pub fn new_session_delete(&mut self) {
+        if let Some((text, cursor)) = self.new_session_state.active_field_mut() {
+            if *cursor < text.len() {
+                text.remove(*cursor);
+            }
+        }
+    }
+
+    pub fn new_session_cursor_left(&mut self) {
+        if let Some((text, cursor)) = self.new_session_state.active_field_mut() {
+            if *cursor > 0 {
+                *cursor = text[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    pub fn new_session_cursor_right(&mut self) {
+        if let Some((text, cursor)) = self.new_session_state.active_field_mut() {
+            if *cursor < text.len() {
+                let ch = text[*cursor..].chars().next().unwrap();
+                *cursor += ch.len_utf8();
+            }
+        }
+    }
+
+    pub fn new_session_cursor_home(&mut self) {
+        if let Some((_, cursor)) = self.new_session_state.active_field_mut() {
+            *cursor = 0;
+        }
+    }
+
+    pub fn new_session_cursor_end(&mut self) {
+        if let Some((text, cursor)) = self.new_session_state.active_field_mut() {
+            *cursor = text.len();
         }
     }
 
@@ -982,8 +1183,14 @@ impl App {
         // Pipe commands need the full token list; handle before the splitn block.
         let all_parts: Vec<&str> = cmd.split_whitespace().collect();
         match all_parts.first().copied() {
-            Some("pipe") => { self.execute_pipe_command(&all_parts[1..]); return; }
-            Some("unpipe") => { self.execute_unpipe_command(&all_parts[1..]); return; }
+            Some("pipe") => {
+                self.execute_pipe_command(&all_parts[1..]);
+                return;
+            }
+            Some("unpipe") => {
+                self.execute_unpipe_command(&all_parts[1..]);
+                return;
+            }
             _ => {}
         }
 
@@ -993,9 +1200,9 @@ impl App {
                 let name = rest.first().unwrap_or(&"").to_string();
                 let kind = match *kind_str {
                     "claude" => SessionKind::Claude,
-                    "codex"  => SessionKind::Codex,
-                    "shell"  => SessionKind::Shell,
-                    other    => SessionKind::Custom(other.to_string()),
+                    "codex" => SessionKind::Codex,
+                    "shell" => SessionKind::Shell,
+                    other => SessionKind::Custom(other.to_string()),
                 };
                 let cwd = std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
@@ -1017,21 +1224,33 @@ impl App {
 
     fn execute_pipe_command(&mut self, args: &[&str]) {
         if args.first() == Some(&"fire") {
-            let src_id = args.get(1).and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
-            let dst_id = args.get(2).and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
+            let src_id = args
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
+                .map(|s| s.id);
+            let dst_id = args
+                .get(2)
+                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
+                .map(|s| s.id);
             if let Some(source) = src_id {
                 self.fire_manual_pipes(source, dst_id);
             }
             return;
         }
 
-        if args.len() < 2 { return; }
-        let src_id = args[0].parse::<usize>().ok()
+        if args.len() < 2 {
+            return;
+        }
+        let src_id = args[0]
+            .parse::<usize>()
+            .ok()
             .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
             .map(|s| s.id);
-        let dst_id = args[1].parse::<usize>().ok()
+        let dst_id = args[1]
+            .parse::<usize>()
+            .ok()
             .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
             .map(|s| s.id);
 
@@ -1061,20 +1280,32 @@ impl App {
             } else if let Some(val) = flag.strip_prefix("--on=") {
                 trigger = match val {
                     "waiting" => PipeTrigger::OnWaiting,
-                    "manual"  => PipeTrigger::Manual,
-                    _         => PipeTrigger::OnReady,
+                    "manual" => PipeTrigger::Manual,
+                    _ => PipeTrigger::OnReady,
                 };
             } else if let Some(val) = flag.strip_prefix("--prefix=") {
                 // Consume rest of tokens as the prefix value
                 let rest = flags[i + 1..].join(" ");
-                let full = if rest.is_empty() { val.to_string() } else { format!("{} {}", val, rest) };
+                let full = if rest.is_empty() {
+                    val.to_string()
+                } else {
+                    format!("{} {}", val, rest)
+                };
                 prefix = Some(full.trim_matches('"').to_string());
                 break;
             }
             i += 1;
         }
 
-        self.pipes.push(Pipe { source, dest, trigger, extract, prefix, active: true, last_fired: None });
+        self.pipes.push(Pipe {
+            source,
+            dest,
+            trigger,
+            extract,
+            prefix,
+            active: true,
+            last_fired: None,
+        });
     }
 
     fn execute_unpipe_command(&mut self, args: &[&str]) {
@@ -1087,10 +1318,16 @@ impl App {
                 }
             }
             [src, dst] => {
-                let src_id = src.parse::<usize>().ok()
-                    .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
-                let dst_id = dst.parse::<usize>().ok()
-                    .and_then(|n| self.sessions.get(n.wrapping_sub(1))).map(|s| s.id);
+                let src_id = src
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
+                    .map(|s| s.id);
+                let dst_id = dst
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
+                    .map(|s| s.id);
                 if let (Some(s), Some(d)) = (src_id, dst_id) {
                     self.pipes.retain(|p| !(p.source == s && p.dest == d));
                 }
@@ -1158,11 +1395,13 @@ async fn run_pty(
     tx.send(AppEvent::SessionWriter {
         session_id,
         writer_tx: write_tx,
-    }).await?;
+    })
+    .await?;
     tx.send(AppEvent::SessionResizer {
         session_id,
         resizer_tx: resize_tx,
-    }).await?;
+    })
+    .await?;
 
     // Writer task: relay bytes and resize events from App into the PTY
     tokio::spawn(async move {
@@ -1189,10 +1428,9 @@ async fn run_pty(
     let mut pending = String::new();
 
     loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            reader.read(&mut buf),
-        ).await {
+        match tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut buf))
+            .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
                 let data = buf[..n].to_vec();
@@ -1203,7 +1441,14 @@ async fn run_pty(
                     let _ = write_tx_kitty.send(b"\x1b[?1u".to_vec()).await;
                 }
                 // Raw bytes → vt100 screen buffer for display
-                if tx.send(AppEvent::SessionBytes { session_id, data: data.clone() }).await.is_err() {
+                if tx
+                    .send(AppEvent::SessionBytes {
+                        session_id,
+                        data: data.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
                 // Line splitting → state inference only
@@ -1211,7 +1456,11 @@ async fn run_pty(
                 let (complete, partial) = split_pty_lines(&pending);
                 pending = partial;
                 for line in complete {
-                    if tx.send(AppEvent::SessionOutput { session_id, line }).await.is_err() {
+                    if tx
+                        .send(AppEvent::SessionOutput { session_id, line })
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
                 }
@@ -1219,10 +1468,14 @@ async fn run_pty(
             Ok(Err(_)) => break,
             // Timeout: update current-line display without adding to the line buffer
             Err(_) => {
-                if tx.send(AppEvent::SessionCurrentLine {
-                    session_id,
-                    text: pending.clone(),
-                }).await.is_err() {
+                if tx
+                    .send(AppEvent::SessionCurrentLine {
+                        session_id,
+                        text: pending.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -1245,35 +1498,46 @@ fn split_pty_lines(s: &str) -> (Vec<String>, String) {
         match c {
             '\r' => {
                 match chars.peek() {
-                    Some('\n') => { chars.next(); lines.push(std::mem::take(&mut current)); }
-                    Some(_)    => { current.clear(); } // bare CR: overwrite
-                    None       => { current.push('\r'); } // defer until next chunk
+                    Some('\n') => {
+                        chars.next();
+                        lines.push(std::mem::take(&mut current));
+                    }
+                    Some(_) => {
+                        current.clear();
+                    } // bare CR: overwrite
+                    None => {
+                        current.push('\r');
+                    } // defer until next chunk
                 }
             }
             '\n' => lines.push(std::mem::take(&mut current)),
-            _    => current.push(c),
+            _ => current.push(c),
         }
     }
     (lines, current)
 }
-
 
 fn rect_hit(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 fn rect_inner_hit(r: Rect, col: u16, row: u16) -> bool {
-    col > r.x && col < r.x + r.width.saturating_sub(1) &&
-    row > r.y && row < r.y + r.height.saturating_sub(1)
+    col > r.x
+        && col < r.x + r.width.saturating_sub(1)
+        && row > r.y
+        && row < r.y + r.height.saturating_sub(1)
 }
 
 /// Convert absolute terminal coords to (content_col, content_row) inside a bordered rect.
 fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
-    let c = col.saturating_sub(area.x + 1).min(area.width.saturating_sub(2));
-    let r = row.saturating_sub(area.y + 1).min(area.height.saturating_sub(2));
+    let c = col
+        .saturating_sub(area.x + 1)
+        .min(area.width.saturating_sub(2));
+    let r = row
+        .saturating_sub(area.y + 1)
+        .min(area.height.saturating_sub(2));
     (c, r)
 }
-
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1284,14 +1548,192 @@ fn strip_ansi(s: &str) -> String {
                 Some('[') => {
                     chars.next();
                     for nc in chars.by_ref() {
-                        if nc.is_ascii_alphabetic() { break; }
+                        if nc.is_ascii_alphabetic() {
+                            break;
+                        }
                     }
                 }
-                _ => { chars.next(); }
+                _ => {
+                    chars.next();
+                }
             }
         } else {
             out.push(c);
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn make_app() -> App {
+        let (tx, _rx) = mpsc::channel::<AppEvent>(8);
+        let config = Arc::new(crate::config::Config::default());
+        App::new(tx, config)
+    }
+
+    fn cursor_pos(app: &App) -> usize {
+        app.new_session_state.cursor_pos()
+    }
+
+    #[test]
+    fn initial_cursor_at_zero_for_empty_name_field() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        assert_eq!(app.new_session_state.active_field, NewSessionField::Name);
+        assert_eq!(cursor_pos(&app), 0);
+    }
+
+    #[test]
+    fn initial_cursor_at_end_of_prefilled_cwd() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_tab();
+        assert_eq!(app.new_session_state.active_field, NewSessionField::Cwd);
+        let expected = app.new_session_state.cwd.len();
+        assert_eq!(
+            cursor_pos(&app),
+            expected,
+            "cursor should be at the end of the pre-filled cwd"
+        );
+    }
+
+    #[test]
+    fn cursor_at_end_after_typing() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_input('h');
+        app.new_session_input('i');
+        assert_eq!(app.new_session_state.name, "hi");
+        assert_eq!(cursor_pos(&app), 2);
+    }
+
+    #[test]
+    fn cursor_left_moves_one_position() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_input('a');
+        app.new_session_input('b');
+        app.new_session_input('c');
+        app.new_session_cursor_left();
+        assert_eq!(cursor_pos(&app), 2);
+        app.new_session_cursor_left();
+        assert_eq!(cursor_pos(&app), 1);
+    }
+
+    #[test]
+    fn cursor_right_moves_one_position() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_input('x');
+        app.new_session_input('y');
+        app.new_session_cursor_left();
+        app.new_session_cursor_left();
+        app.new_session_cursor_right();
+        assert_eq!(cursor_pos(&app), 1);
+        app.new_session_cursor_right();
+        assert_eq!(cursor_pos(&app), 2);
+    }
+
+    #[test]
+    fn insert_at_cursor_not_at_end() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_input('a');
+        app.new_session_input('c');
+        app.new_session_cursor_left();
+        app.new_session_input('b');
+        assert_eq!(app.new_session_state.name, "abc");
+        assert_eq!(cursor_pos(&app), 2);
+    }
+
+    #[test]
+    fn backspace_deletes_char_before_cursor_not_last_char() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_input('a');
+        app.new_session_input('b');
+        app.new_session_input('c');
+        app.new_session_cursor_left();
+        app.new_session_backspace();
+        assert_eq!(app.new_session_state.name, "ac");
+        assert_eq!(cursor_pos(&app), 1);
+    }
+
+    #[test]
+    fn cursor_left_stops_at_zero() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_cursor_left();
+        assert_eq!(cursor_pos(&app), 0);
+        app.new_session_cursor_left();
+        assert_eq!(cursor_pos(&app), 0);
+    }
+
+    #[test]
+    fn cursor_right_stops_at_text_end() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab();
+        app.new_session_input('z');
+        app.new_session_cursor_right();
+        assert_eq!(cursor_pos(&app), 1);
+        app.new_session_cursor_right();
+        assert_eq!(cursor_pos(&app), 1);
+    }
+
+    #[test]
+    fn cursor_is_independent_per_field() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab(); // → Name
+        app.new_session_input('h');
+        app.new_session_input('i');
+        app.new_session_cursor_left(); // Name cursor at 1
+
+        app.new_session_tab(); // → Cwd
+        let cwd_len = app.new_session_state.cwd.len();
+        assert_eq!(cursor_pos(&app), cwd_len);
+
+        app.new_session_tab(); // → Kind
+        app.new_session_tab(); // → Name
+        assert_eq!(app.new_session_state.active_field, NewSessionField::Name);
+        assert_eq!(cursor_pos(&app), 1);
+    }
+
+    #[test]
+    fn cursor_left_on_multibyte_char() {
+        let mut app = make_app();
+        app.open_new_session();
+        app.new_session_tab(); // → Name
+        app.new_session_input('é'); // 2 bytes in UTF-8
+        assert_eq!(
+            cursor_pos(&app),
+            2,
+            "cursor should be at byte 2 after typing é"
+        );
+        app.new_session_cursor_left();
+        assert_eq!(
+            cursor_pos(&app),
+            0,
+            "cursor should land at 0, not byte 1 (which is mid-char)"
+        );
+        app.new_session_input('x'); // insert before é
+        assert_eq!(
+            app.new_session_state.name, "xé",
+            "should have xé, not corrupt string"
+        );
+    }
 }
