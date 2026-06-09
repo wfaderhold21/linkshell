@@ -16,6 +16,7 @@ pub enum Action {
     ScrollDownPage,
     ScrollUpLine,
     ScrollDownLine,
+    ToggleChat,
 }
 
 pub type Keymap = HashMap<(KeyModifiers, KeyCode), Action>;
@@ -50,6 +51,7 @@ fn default_keymap() -> Keymap {
     m.insert((alt, KeyCode::Char('c')), Action::CommandBar);
     m.insert((alt, KeyCode::Char('x')), Action::KillSession);
     m.insert((alt, KeyCode::Char('h')), Action::Help);
+    m.insert((alt, KeyCode::Char('g')), Action::ToggleChat);
     m.insert((ctrl, KeyCode::Char('q')), Action::Quit);
     m.insert((alt, KeyCode::Left), Action::PrevSession);
     m.insert((alt, KeyCode::Right), Action::NextSession);
@@ -135,6 +137,7 @@ fn parse_action(s: &str) -> Option<Action> {
         "scroll_down_page" => Some(Action::ScrollDownPage),
         "scroll_up_line" => Some(Action::ScrollUpLine),
         "scroll_down_line" => Some(Action::ScrollDownLine),
+        "toggle_chat" => Some(Action::ToggleChat),
         _ => None,
     }
 }

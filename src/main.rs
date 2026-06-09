@@ -246,17 +246,15 @@ fn handle_event(app: &mut App, event: AppEvent) {
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     match app.mode {
         AppMode::Normal => {
-            // Chat focus toggle: Ctrl+/
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('/') {
-                app.chat.focused = !app.chat.focused;
-                return;
-            }
-
             // When chat is focused, route keys to chat input.
             if app.chat.focused {
                 match key.code {
                     KeyCode::Esc => {
                         app.chat.focused = false;
+                    }
+                    _ if app.keymap.get(&(key.modifiers, key.code)) == Some(&Action::ToggleChat) => {
+                        app.chat.focused = false;
+                        return;
                     }
                     KeyCode::Enter => {
                         let text = app.chat.input.clone();
@@ -294,6 +292,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollDownPage => app.scroll_down(20),
                     Action::ScrollUpLine => app.scroll_up(3),
                     Action::ScrollDownLine => app.scroll_down(3),
+                    Action::ToggleChat => app.chat.focused = !app.chat.focused,
                 }
                 return;
             }
