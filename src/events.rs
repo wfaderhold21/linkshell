@@ -47,6 +47,13 @@ pub enum AppEvent {
         dest_id: usize,
         message: String,
     },
+    /// Direct message from one IPC-connected session to another named session.
+    AgentDirectMessage {
+        from_session_id: Option<usize>,
+        dest_name: String,
+        message: String,
+        reply_tx: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
+    },
     /// State override injected by an external orchestrator via the IPC socket
     IpcStateOverride {
         session_id: usize,
