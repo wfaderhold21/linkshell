@@ -287,4 +287,76 @@ mod tests {
         let config = crate::config::Config::default();
         assert!(parse_token_count(&v, "unknown", &config).is_none());
     }
+
+    #[test]
+    fn parses_model_from_session_meta_preferring_model_over_agent_id() {
+        let with_model = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "model": "gpt-5.4-mini",
+                "agent_id": "fallback"
+            }
+        });
+        let with_agent = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "agent_id": "gpt-5.3-codex"
+            }
+        });
+
+        assert_eq!(
+            parse_model_from_session_meta(&with_model).as_deref(),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(
+            parse_model_from_session_meta(&with_agent).as_deref(),
+            Some("gpt-5.3-codex")
+        );
+        assert!(parse_model_from_session_meta(&serde_json::json!({"type": "event_msg"})).is_none());
+    }
+
+    #[test]
+    fn token_count_ignores_zero_usage_records() {
+        let v = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 0
+                    }
+                }
+            }
+        });
+
+        assert!(parse_token_count(&v, "gpt-5.4", &Config::default()).is_none());
+    }
+
+    #[test]
+    fn rollout_cwd_reads_session_meta_from_first_twenty_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "linkshell-codex-rollout-cwd-{}.jsonl",
+            std::process::id()
+        ));
+        let content = [
+            serde_json::json!({"type": "event_msg"}).to_string(),
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"cwd": "/tmp/linkshell"}
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let cwd = rollout_cwd(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(cwd.as_deref(), Some("/tmp/linkshell"));
+    }
 }

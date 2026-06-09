@@ -791,3 +791,79 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
         height: height.min(r.height),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_display_strips_escape_sequences_and_control_chars() {
+        let raw = "ok\x1b[31m red\x1b[0m\x1b]0;title\x07\tend\x07";
+
+        assert_eq!(prepare_display(raw), "ok red  end");
+    }
+
+    #[test]
+    fn prepare_display_expands_tabs_to_eight_column_stops() {
+        assert_eq!(prepare_display("a\tb"), "a       b");
+        assert_eq!(prepare_display("12345678\tb"), "12345678        b");
+    }
+
+    #[test]
+    fn kind_color_assigns_distinct_brand_colors() {
+        assert_eq!(kind_color(&SessionKind::Claude), CLAUDE_COLOR);
+        assert_eq!(kind_color(&SessionKind::Codex), CODEX_COLOR);
+        assert_eq!(kind_color(&SessionKind::Shell), SHELL_COLOR);
+        assert_eq!(kind_color(&SessionKind::Custom("x".into())), CUSTOM_COLOR);
+    }
+
+    #[test]
+    fn state_border_style_highlights_waiting_error_and_active_states() {
+        assert_eq!(
+            state_border_style(&SessionState::Waiting, false).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            state_border_style(&SessionState::Error, false).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            state_border_style(&SessionState::Ready, true).fg,
+            Some(Color::White)
+        );
+        assert_eq!(
+            state_border_style(&SessionState::Ready, false).fg,
+            Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn style_preserves_spaces_for_background_or_reverse_styles_only() {
+        assert!(style_preserves_spaces(Style::default().bg(Color::Blue)));
+        assert!(style_preserves_spaces(
+            Style::default().add_modifier(Modifier::REVERSED)
+        ));
+        assert!(!style_preserves_spaces(Style::default().fg(Color::Green)));
+    }
+
+    #[test]
+    fn centered_rect_centers_width_and_clamps_height_to_area() {
+        let r = Rect {
+            x: 10,
+            y: 5,
+            width: 100,
+            height: 20,
+        };
+
+        assert_eq!(
+            centered_rect(50, 30, r),
+            Rect {
+                x: 35,
+                y: 5,
+                width: 50,
+                height: 20,
+            }
+        );
+    }
+
+}

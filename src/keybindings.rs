@@ -138,3 +138,84 @@ fn parse_action(s: &str) -> Option<Action> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_keymap_contains_primary_navigation_and_session_switches() {
+        let map = build_keymap(&KeybindingsConfig::default());
+
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::Char('n'))),
+            Some(&Action::NewSession)
+        );
+        assert_eq!(
+            map.get(&(KeyModifiers::CONTROL, KeyCode::Char('q'))),
+            Some(&Action::Quit)
+        );
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::Char('8'))),
+            Some(&Action::SwitchSession(7))
+        );
+    }
+
+    #[test]
+    fn custom_bindings_resolve_vars_and_override_defaults() {
+        let mut cfg = KeybindingsConfig::default();
+        cfg.vars.insert("META".into(), "ctrl".into());
+        cfg.bind.insert("$META+n".into(), "quit".into());
+        cfg.bind.insert("alt+pageup".into(), "scroll_up_page".into());
+
+        let map = build_keymap(&cfg);
+
+        assert_eq!(
+            map.get(&(KeyModifiers::CONTROL, KeyCode::Char('n'))),
+            Some(&Action::Quit)
+        );
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::PageUp)),
+            Some(&Action::ScrollUpPage)
+        );
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::Char('n'))),
+            Some(&Action::NewSession)
+        );
+    }
+
+    #[test]
+    fn invalid_custom_bindings_do_not_remove_defaults() {
+        let mut cfg = KeybindingsConfig::default();
+        cfg.bind.insert("badmod+n".into(), "quit".into());
+        cfg.bind.insert("ctrl+x".into(), "not_an_action".into());
+
+        let map = build_keymap(&cfg);
+
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::Char('n'))),
+            Some(&Action::NewSession)
+        );
+        assert!(!map.contains_key(&(KeyModifiers::CONTROL, KeyCode::Char('x'))));
+    }
+
+    #[test]
+    fn parse_chord_supports_shifted_special_keys() {
+        assert_eq!(
+            parse_chord("alt+shift+pageDown"),
+            Some((KeyModifiers::ALT | KeyModifiers::SHIFT, KeyCode::PageDown))
+        );
+        assert_eq!(
+            parse_chord("control+enter"),
+            Some((KeyModifiers::CONTROL, KeyCode::Enter))
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_only_valid_switch_ranges() {
+        assert_eq!(parse_action("switch_1"), Some(Action::SwitchSession(0)));
+        assert_eq!(parse_action("switch_8"), Some(Action::SwitchSession(7)));
+        assert_eq!(parse_action("switch_0"), None);
+        assert_eq!(parse_action("switch_9"), None);
+    }
+}

@@ -443,3 +443,42 @@ fn parse_tcp_flag() -> Option<u16> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn key_to_bytes_maps_printable_control_and_navigation_keys() {
+        assert_eq!(
+            key_to_bytes(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            b"a".to_vec()
+        );
+        assert_eq!(
+            key_to_bytes(&key(KeyCode::Char('C'), KeyModifiers::CONTROL)),
+            vec![3]
+        );
+        assert_eq!(key_to_bytes(&key(KeyCode::Enter, KeyModifiers::NONE)), vec![b'\r']);
+        assert_eq!(
+            key_to_bytes(&key(KeyCode::Left, KeyModifiers::NONE)),
+            vec![27, b'[', b'D']
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_emits_extended_sequences_for_shifted_keys() {
+        assert_eq!(
+            key_to_bytes(&key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            vec![27, b'[', b'1', b'3', b';', b'2', b'u']
+        );
+        assert_eq!(
+            key_to_bytes(&key(KeyCode::Delete, KeyModifiers::SHIFT)),
+            vec![27, b'[', b'3', b';', b'2', b'~']
+        );
+    }
+}

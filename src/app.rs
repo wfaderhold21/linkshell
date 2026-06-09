@@ -1736,4 +1736,292 @@ mod tests {
             "should have xé, not corrupt string"
         );
     }
+
+    #[test]
+    fn selection_normalizes_and_contains_single_and_multi_line_ranges() {
+        let sel = Selection {
+            start_col: 5,
+            start_row: 2,
+            end_col: 1,
+            end_row: 1,
+        };
+
+        assert_eq!(sel.normalized(), ((1, 1), (2, 5)));
+        assert!(sel.contains(1, 1));
+        assert!(sel.contains(1, 99));
+        assert!(sel.contains(2, 5));
+        assert!(!sel.contains(0, 99));
+        assert!(!sel.contains(2, 6));
+
+        let one_line = Selection {
+            start_col: 2,
+            start_row: 3,
+            end_col: 4,
+            end_row: 3,
+        };
+        assert!(one_line.contains(3, 3));
+        assert!(!one_line.contains(3, 5));
+    }
+
+    #[test]
+    fn headless_sessions_get_ids_labels_groups_and_ready_state() {
+        let mut app = make_app();
+
+        let first = app.spawn_headless_session("".into(), Some("agents".into())).unwrap();
+        let second = app.spawn_headless_session("named".into(), None).unwrap();
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(app.sessions[0].name, "agent-1");
+        assert_eq!(app.sessions[0].group.as_deref(), Some("agents"));
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+        assert_eq!(app.sessions[1].name, "named");
+    }
+
+    #[test]
+    fn switching_and_removing_sessions_keeps_active_index_valid() {
+        let mut app = make_app();
+        let _ = app.spawn_headless_session("one".into(), None).unwrap();
+        let _ = app.spawn_headless_session("two".into(), None).unwrap();
+        let _ = app.spawn_headless_session("three".into(), None).unwrap();
+
+        app.switch_to(2);
+        assert_eq!(app.active_idx, Some(2));
+        app.kill_active_session();
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.active_idx, Some(1));
+
+        app.prev_session();
+        assert_eq!(app.active_idx, Some(0));
+        app.next_session();
+        assert_eq!(app.active_idx, Some(1));
+    }
+
+    #[test]
+    fn session_output_strips_ansi_updates_state_and_accumulates_shell_stats() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("shell".into(), None).unwrap();
+        app.sessions[0].kind = SessionKind::Shell;
+
+        app.handle_session_output(id, "\x1b[31m100 input 200 output $0.01\x1b[0m".into());
+
+        assert_eq!(
+            app.sessions[0].output_lines.back().unwrap(),
+            "100 input 200 output $0.01"
+        );
+        assert_eq!(app.sessions[0].state, SessionState::Running);
+        assert_eq!(app.sessions[0].stats.input_tokens, 100);
+        assert_eq!(app.sessions[0].stats.output_tokens, 200);
+        assert_eq!(app.sessions[0].stats.total_cost_usd, 0.01);
+    }
+
+    #[test]
+    fn partial_current_line_does_not_flip_ready_session_to_running() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("shell".into(), None).unwrap();
+        app.sessions[0].state = SessionState::Ready;
+
+        app.handle_session_current_line(id, "partial output".into());
+
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+    }
+
+    #[test]
+    fn resize_updates_all_sessions_and_notifies_resizers() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("shell".into(), None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        app.handle_session_resizer(id, tx);
+
+        app.handle_resize(12, 80);
+
+        assert_eq!(app.pty_size, (12, 80));
+        assert_eq!(app.sessions[0].screen.screen().size(), (12, 80));
+        assert_eq!(rx.try_recv().unwrap(), (12, 80));
+    }
+
+    #[test]
+    fn pipe_add_parses_extract_and_trigger_variants_and_remove_filters() {
+        let mut app = make_app();
+
+        app.handle_ipc_pipe_add(1, 2, "waiting", "last-n=3", Some("p".into()));
+        app.handle_ipc_pipe_add(1, 3, "manual", "summarize=42", None);
+        app.handle_ipc_pipe_add(4, 5, "ready", "diff", None);
+
+        assert_eq!(app.pipes[0].trigger, PipeTrigger::OnWaiting);
+        assert!(matches!(app.pipes[0].extract, ExtractMode::LastN(3)));
+        assert_eq!(app.pipes[1].trigger, PipeTrigger::Manual);
+        assert!(matches!(app.pipes[1].extract, ExtractMode::Summarize(42)));
+        assert!(matches!(app.pipes[2].extract, ExtractMode::Diff));
+
+        app.handle_ipc_pipe_remove(1, Some(2));
+        assert_eq!(app.pipes.len(), 2);
+        assert!(app.pipes.iter().all(|p| !(p.source == 1 && p.dest == 2)));
+
+        app.handle_ipc_pipe_remove(1, None);
+        assert_eq!(app.pipes.len(), 1);
+        assert_eq!(app.pipes[0].source, 4);
+    }
+
+    #[test]
+    fn pipe_relay_writes_ready_dest_and_buffers_non_ready_dest_until_flush() {
+        let mut app = make_app();
+        let ready_id = app.spawn_headless_session("ready".into(), None).unwrap();
+        let waiting_id = app.spawn_headless_session("waiting".into(), None).unwrap();
+        let (ready_tx, mut ready_rx) = mpsc::channel(2);
+        let (waiting_tx, mut waiting_rx) = mpsc::channel(2);
+        app.sessions[0].pty_writer = Some(ready_tx);
+        app.sessions[1].pty_writer = Some(waiting_tx);
+        app.sessions[1].state = SessionState::Running;
+
+        app.handle_pipe_relay(ready_id, "now".into());
+        app.handle_pipe_relay(waiting_id, "later".into());
+
+        assert_eq!(ready_rx.try_recv().unwrap(), b"now".to_vec());
+        assert!(waiting_rx.try_recv().is_err());
+        assert_eq!(app.pending_relays[&waiting_id], vec!["later".to_string()]);
+
+        app.sessions[1].state = SessionState::Ready;
+        app.flush_pending_relays(waiting_id);
+
+        assert_eq!(waiting_rx.try_recv().unwrap(), b"later".to_vec());
+        assert!(!app.pending_relays.contains_key(&waiting_id));
+    }
+
+    #[test]
+    fn broadcast_and_direct_send_write_json_lines_to_connected_agents() {
+        let mut app = make_app();
+        let a = app
+            .spawn_headless_session("a".into(), Some("agents".into()))
+            .unwrap();
+        let b = app
+            .spawn_headless_session("b".into(), Some("other".into()))
+            .unwrap();
+        let (a_tx, mut a_rx) = mpsc::channel(2);
+        let (b_tx, mut b_rx) = mpsc::channel(2);
+        app.handle_ipc_agent_connected(a, a_tx);
+        app.handle_ipc_agent_connected(b, b_tx);
+
+        app.handle_broadcast("agents", serde_json::json!({"type": "ping"}));
+        app.handle_ipc_send(b, serde_json::json!({"type": "direct"}));
+
+        assert_eq!(a_rx.try_recv().unwrap(), "{\"type\":\"ping\"}\n");
+        assert_eq!(b_rx.try_recv().unwrap(), "{\"type\":\"direct\"}\n");
+        assert!(a_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ipc_query_returns_session_and_pipe_snapshots() {
+        let mut app = make_app();
+        let source = app
+            .spawn_headless_session("source".into(), Some("agents".into()))
+            .unwrap();
+        let dest = app.spawn_headless_session("dest".into(), None).unwrap();
+        app.handle_ipc_pipe_add(source, dest, "manual", "diff", Some("prefix".into()));
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        app.handle_ipc_query(
+            crate::events::IpcQueryPayload::Query {
+                what: "sessions".into(),
+            },
+            resp_tx,
+        );
+        let sessions = resp_rx.await.unwrap();
+        assert_eq!(sessions.as_array().unwrap().len(), 2);
+        assert_eq!(sessions[0]["name"], "source");
+        assert_eq!(sessions[0]["state"], "READY");
+        assert_eq!(sessions[0]["group"], "agents");
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        app.handle_ipc_query(
+            crate::events::IpcQueryPayload::Query {
+                what: "pipes".into(),
+            },
+            resp_tx,
+        );
+        let pipes = resp_rx.await.unwrap();
+        assert_eq!(pipes[0]["source"], source);
+        assert_eq!(pipes[0]["dest"], dest);
+        assert_eq!(pipes[0]["trigger"], "manual");
+        assert_eq!(pipes[0]["extract"], "diff");
+    }
+
+    #[test]
+    fn tick_turns_ready_to_running_on_large_byte_burst_and_expires_ipc_state() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("shell".into(), None).unwrap();
+        app.sessions[0].state = SessionState::Ready;
+        app.sessions[0].bytes_since_last_tick = 81;
+
+        app.handle_tick();
+
+        assert_eq!(app.sessions[0].state, SessionState::Running);
+        assert_eq!(app.sessions[0].bytes_since_last_tick, 0);
+
+        app.config = Arc::new(Config {
+            general: config::GeneralConfig {
+                ipc_state_override_timeout_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        app.handle_ipc_state(id, SessionState::Waiting);
+        app.sessions[0].ipc_state_set_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+
+        app.handle_tick();
+
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+        assert!(!app.sessions[0].ipc_state);
+    }
+
+    #[test]
+    fn session_died_replies_to_pending_wait_clears_relays_and_removes_session() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("shell".into(), None).unwrap();
+        app.pending_relays.insert(id, vec!["pending".into()]);
+        let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+        app.pending_ipc_replies.insert(id, (resp_tx, 0));
+
+        app.handle_session_died(id);
+
+        assert!(app.sessions.is_empty());
+        assert!(!app.pending_relays.contains_key(&id));
+        let resp = resp_rx.try_recv().unwrap();
+        assert_eq!(resp["error"], "session died before reaching READY");
+        assert_eq!(resp["session_id"], id);
+    }
+
+    #[test]
+    fn split_pty_lines_handles_lf_crlf_bare_cr_and_deferred_cr() {
+        let (lines, pending) = split_pty_lines("one\ntwo\r\nspinner 1\rspinner 2\r");
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(pending, "spinner 2\r");
+
+        let (lines, pending) = split_pty_lines(&(pending + "\n"));
+        assert_eq!(lines, vec!["spinner 2".to_string()]);
+        assert_eq!(pending, "");
+    }
+
+    #[test]
+    fn geometry_helpers_detect_bordered_rect_hits_and_content_coords() {
+        let rect = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
+
+        assert!(rect_hit(rect, 10, 5));
+        assert!(!rect_hit(rect, 30, 5));
+        assert!(!rect_inner_hit(rect, 10, 5));
+        assert!(rect_inner_hit(rect, 11, 6));
+        assert_eq!(to_content_coords(rect, 12, 8), (1, 2));
+        assert_eq!(to_content_coords(rect, 99, 99), (18, 8));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences_and_keeps_plain_text() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m plain"), "red plain");
+    }
 }
