@@ -10,7 +10,10 @@ use crate::events::{AppEvent, IpcQueryPayload};
 use crate::session::{SessionState, TokenStats};
 
 pub fn socket_path(config: &Config) -> String {
-    config.socket.path.replace("{pid}", &std::process::id().to_string())
+    config
+        .socket
+        .path
+        .replace("{pid}", &std::process::id().to_string())
 }
 
 pub fn spawn_listener(tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
@@ -119,7 +122,9 @@ async fn handle_stream(
             if !line.is_empty() {
                 // oversize — line was drained but truncated
                 let err = serde_json::json!({"error": "message exceeds max_ipc_message_bytes"});
-                let _ = agent_tx.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+                let _ = agent_tx
+                    .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                    .await;
             }
             return;
         }
@@ -131,7 +136,9 @@ async fn handle_stream(
         Ok(v) => v,
         Err(e) => {
             let err = serde_json::json!({"error": format!("invalid JSON: {}", e)});
-            let _ = agent_tx.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+            let _ = agent_tx
+                .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                .await;
             return;
         }
     };
@@ -144,19 +151,23 @@ async fn handle_stream(
         let name = first["name"].as_str().unwrap_or("agent").to_string();
         let group = first["group"].as_str().map(|s| s.to_string());
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(AppEvent::IpcQuery {
-            payload: IpcQueryPayload::Register { name, group },
-            response_tx: resp_tx,
-        }).await;
+        let _ = tx
+            .send(AppEvent::IpcQuery {
+                payload: IpcQueryPayload::Register { name, group },
+                response_tx: resp_tx,
+            })
+            .await;
         match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
             Ok(Ok(resp)) => {
                 let sid = resp["session_id"].as_u64().unwrap_or(0) as usize;
                 let msg = serde_json::to_string(&resp).unwrap_or_default() + "\n";
                 let _ = agent_tx.send(msg).await;
-                let _ = tx.send(AppEvent::IpcAgentConnected {
-                    session_id: sid,
-                    agent_tx: agent_tx.clone(),
-                }).await;
+                let _ = tx
+                    .send(AppEvent::IpcAgentConnected {
+                        session_id: sid,
+                        agent_tx: agent_tx.clone(),
+                    })
+                    .await;
                 Some(sid)
             }
             _ => return,
@@ -177,7 +188,9 @@ async fn handle_stream(
             Ok(0) => {
                 // Oversize message in persistent session
                 let err = serde_json::json!({"error": "message exceeds max_ipc_message_bytes"});
-                let _ = agent_tx.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+                let _ = agent_tx
+                    .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                    .await;
                 break;
             }
             Ok(_) => {
@@ -190,7 +203,9 @@ async fn handle_stream(
     }
 
     if let Some(sid) = session_id {
-        let _ = tx.send(AppEvent::IpcAgentDisconnected { session_id: sid }).await;
+        let _ = tx
+            .send(AppEvent::IpcAgentDisconnected { session_id: sid })
+            .await;
     }
 }
 
@@ -213,17 +228,23 @@ async fn dispatch_query(
 ) {
     let what = msg["what"].as_str().unwrap_or("").to_string();
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AppEvent::IpcQuery {
-        payload: IpcQueryPayload::Query { what },
-        response_tx: resp_tx,
-    }).await;
+    let _ = tx
+        .send(AppEvent::IpcQuery {
+            payload: IpcQueryPayload::Query { what },
+            response_tx: resp_tx,
+        })
+        .await;
     match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
         Ok(Ok(response)) => {
-            let _ = writer.send(serde_json::to_string(&response).unwrap_or_default() + "\n").await;
+            let _ = writer
+                .send(serde_json::to_string(&response).unwrap_or_default() + "\n")
+                .await;
         }
         _ => {
             let err = serde_json::json!({"error": "query timeout"});
-            let _ = writer.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+            let _ = writer
+                .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                .await;
         }
     }
 }
@@ -238,10 +259,12 @@ async fn dispatch(
     let has_numeric_id = msg["session_id"].as_u64().is_some();
     if !has_numeric_id {
         if let Some(name) = msg["session_name"].as_str() {
-            let _ = tx.send(AppEvent::IpcNamedAction {
-                session_name: name.to_string(),
-                msg: msg.clone(),
-            }).await;
+            let _ = tx
+                .send(AppEvent::IpcNamedAction {
+                    session_name: name.to_string(),
+                    msg: msg.clone(),
+                })
+                .await;
             return;
         }
     }
@@ -254,92 +277,130 @@ async fn dispatch(
 
     match msg["type"].as_str() {
         Some("state") => {
-            let sid = match target_id { Some(s) => s, None => return };
+            let sid = match target_id {
+                Some(s) => s,
+                None => return,
+            };
             if let Some(s) = parse_session_state(msg["state"].as_str().unwrap_or("")) {
-                let _ = tx.send(AppEvent::IpcStateOverride { session_id: sid, state: s }).await;
+                let _ = tx
+                    .send(AppEvent::IpcStateOverride {
+                        session_id: sid,
+                        state: s,
+                    })
+                    .await;
             }
             if let Some(detail) = msg["detail"].as_str() {
-                let _ = tx.send(AppEvent::SessionOutput {
-                    session_id: sid,
-                    line: format!("[{}]", detail),
-                }).await;
+                let _ = tx
+                    .send(AppEvent::SessionOutput {
+                        session_id: sid,
+                        line: format!("[{}]", detail),
+                    })
+                    .await;
             }
         }
         Some("tokens") => {
-            let sid = match target_id { Some(s) => s, None => return };
-            let _ = tx.send(AppEvent::IpcTokenUpdate {
-                session_id: sid,
-                stats: TokenStats {
-                    input_tokens:   msg["input"].as_u64().unwrap_or(0),
-                    output_tokens:  msg["output"].as_u64().unwrap_or(0),
-                    total_cost_usd: msg["cost"].as_f64().unwrap_or(0.0),
-                    context_tokens: 0,
-                },
-            }).await;
+            let sid = match target_id {
+                Some(s) => s,
+                None => return,
+            };
+            let _ = tx
+                .send(AppEvent::IpcTokenUpdate {
+                    session_id: sid,
+                    stats: TokenStats {
+                        input_tokens: msg["input"].as_u64().unwrap_or(0),
+                        output_tokens: msg["output"].as_u64().unwrap_or(0),
+                        total_cost_usd: msg["cost"].as_f64().unwrap_or(0.0),
+                        context_tokens: 0,
+                    },
+                })
+                .await;
         }
         Some("output") => {
-            let sid = match target_id { Some(s) => s, None => return };
+            let sid = match target_id {
+                Some(s) => s,
+                None => return,
+            };
             if let Some(text) = msg["line"].as_str() {
-                let _ = tx.send(AppEvent::SessionOutput {
-                    session_id: sid,
-                    line: text.to_string(),
-                }).await;
+                let _ = tx
+                    .send(AppEvent::SessionOutput {
+                        session_id: sid,
+                        line: text.to_string(),
+                    })
+                    .await;
             }
         }
         Some("fire_pipe") => {
             if let Some(grp) = msg["source_group"].as_str() {
-                let _ = tx.send(AppEvent::IpcGroupFire {
-                    source_group: grp.to_string(),
-                }).await;
+                let _ = tx
+                    .send(AppEvent::IpcGroupFire {
+                        source_group: grp.to_string(),
+                    })
+                    .await;
             } else if let Some(source) = msg["source"].as_u64() {
                 let dest = msg["dest"].as_u64().map(|v| v as usize);
-                let _ = tx.send(AppEvent::IpcFirePipe {
-                    source: source as usize,
-                    dest,
-                }).await;
+                let _ = tx
+                    .send(AppEvent::IpcFirePipe {
+                        source: source as usize,
+                        dest,
+                    })
+                    .await;
             }
         }
         Some("broadcast") => {
             if let Some(group) = msg["group"].as_str() {
                 let inner = msg["message"].clone();
-                let _ = tx.send(AppEvent::IpcBroadcast {
-                    group: group.to_string(),
-                    msg: inner,
-                }).await;
+                let _ = tx
+                    .send(AppEvent::IpcBroadcast {
+                        group: group.to_string(),
+                        msg: inner,
+                    })
+                    .await;
             }
         }
         Some("pipe_add") => {
             if let (Some(src), Some(dst)) = (msg["source"].as_u64(), msg["dest"].as_u64()) {
-                let _ = tx.send(AppEvent::IpcPipeAdd {
-                    source:  src as usize,
-                    dest:    dst as usize,
-                    trigger: msg["trigger"].as_str().unwrap_or("on_ready").to_string(),
-                    extract: msg["extract"].as_str().unwrap_or("last-block").to_string(),
-                    prefix:  msg["prefix"].as_str().map(|s| s.to_string()),
-                }).await;
+                let _ = tx
+                    .send(AppEvent::IpcPipeAdd {
+                        source: src as usize,
+                        dest: dst as usize,
+                        trigger: msg["trigger"].as_str().unwrap_or("on_ready").to_string(),
+                        extract: msg["extract"].as_str().unwrap_or("last-block").to_string(),
+                        prefix: msg["prefix"].as_str().map(|s| s.to_string()),
+                    })
+                    .await;
             }
         }
         Some("pipe_remove") => {
             if let Some(src) = msg["source"].as_u64() {
                 let dest = msg["dest"].as_u64().map(|v| v as usize);
-                let _ = tx.send(AppEvent::IpcPipeRemove {
-                    source: src as usize,
-                    dest,
-                }).await;
+                let _ = tx
+                    .send(AppEvent::IpcPipeRemove {
+                        source: src as usize,
+                        dest,
+                    })
+                    .await;
             }
         }
         Some("session_create") => {
             let kind_str = msg["kind"].as_str().unwrap_or("claude").to_string();
-            let name     = msg["name"].as_str().unwrap_or("").to_string();
-            let cwd      = msg["cwd"].as_str().unwrap_or(".").to_string();
+            let name = msg["name"].as_str().unwrap_or("").to_string();
+            let cwd = msg["cwd"].as_str().unwrap_or(".").to_string();
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(AppEvent::IpcQuery {
-                payload: IpcQueryPayload::SessionCreate { kind_str, name, cwd },
-                response_tx: resp_tx,
-            }).await;
+            let _ = tx
+                .send(AppEvent::IpcQuery {
+                    payload: IpcQueryPayload::SessionCreate {
+                        kind_str,
+                        name,
+                        cwd,
+                    },
+                    response_tx: resp_tx,
+                })
+                .await;
             match tokio::time::timeout(Duration::from_secs(10), resp_rx).await {
                 Ok(Ok(response)) => {
-                    let _ = writer.send(serde_json::to_string(&response).unwrap_or_default() + "\n").await;
+                    let _ = writer
+                        .send(serde_json::to_string(&response).unwrap_or_default() + "\n")
+                        .await;
                 }
                 _ => {}
             }
@@ -348,17 +409,26 @@ async fn dispatch(
             let target_sid = msg["session_id"].as_u64().unwrap_or(0) as usize;
             let text = msg["text"].as_str().unwrap_or("").to_string();
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(AppEvent::IpcQuery {
-                payload: IpcQueryPayload::SessionInputWait { session_id: target_sid, text },
-                response_tx: resp_tx,
-            }).await;
+            let _ = tx
+                .send(AppEvent::IpcQuery {
+                    payload: IpcQueryPayload::SessionInputWait {
+                        session_id: target_sid,
+                        text,
+                    },
+                    response_tx: resp_tx,
+                })
+                .await;
             match tokio::time::timeout(Duration::from_secs(1200), resp_rx).await {
                 Ok(Ok(response)) => {
-                    let _ = writer.send(serde_json::to_string(&response).unwrap_or_default() + "\n").await;
+                    let _ = writer
+                        .send(serde_json::to_string(&response).unwrap_or_default() + "\n")
+                        .await;
                 }
                 _ => {
                     let err = serde_json::json!({"error": "timeout waiting for session READY"});
-                    let _ = writer.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+                    let _ = writer
+                        .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                        .await;
                 }
             }
         }
@@ -368,11 +438,11 @@ async fn dispatch(
 
 pub fn parse_session_state(s: &str) -> Option<SessionState> {
     match s.to_uppercase().as_str() {
-        "READY"    => Some(SessionState::Ready),
+        "READY" => Some(SessionState::Ready),
         "THINKING" => Some(SessionState::Thinking),
-        "RUNNING"  => Some(SessionState::Running),
-        "WAITING"  => Some(SessionState::Waiting),
-        "ERROR"    => Some(SessionState::Error),
-        _          => None,
+        "RUNNING" => Some(SessionState::Running),
+        "WAITING" => Some(SessionState::Waiting),
+        "ERROR" => Some(SessionState::Error),
+        _ => None,
     }
 }

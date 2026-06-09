@@ -4,15 +4,14 @@ use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let sock = std::env::var("LINKSHELL_SOCK")
-        .unwrap_or_else(|_| "/tmp/linkshell.sock".to_string());
+    let sock =
+        std::env::var("LINKSHELL_SOCK").unwrap_or_else(|_| "/tmp/linkshell.sock".to_string());
     let session_id: Option<u64> = std::env::var("LINKSHELL_SESSION_ID")
         .ok()
         .and_then(|s| s.parse().ok());
 
     match args.get(1).map(|s| s.as_str()) {
         // ── Query commands (synchronous: send, read response, exit) ──────────
-
         Some("list") => {
             let msg = serde_json::json!({"type": "query", "what": "sessions"});
             let resp = send_and_recv(&sock, &msg, Duration::from_secs(5));
@@ -20,13 +19,16 @@ fn main() {
         }
 
         Some("wait-ready") => {
-            let session_arg = args.get(2).and_then(|s| s.parse::<u64>().ok())
+            let session_arg = args
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
                 .or(session_id)
                 .unwrap_or_else(|| {
                     eprintln!("usage: linkshell-ctl wait-ready <session_id> [--timeout=<secs>]");
                     std::process::exit(1);
                 });
-            let timeout_secs: u64 = args.iter()
+            let timeout_secs: u64 = args
+                .iter()
                 .find_map(|a| a.strip_prefix("--timeout=").and_then(|v| v.parse().ok()))
                 .unwrap_or(1200);
             let msg = serde_json::json!({
@@ -39,7 +41,6 @@ fn main() {
         }
 
         // ── Pipe sub-commands ────────────────────────────────────────────────
-
         Some("pipe") => match args.get(2).map(|s| s.as_str()) {
             Some("list") => {
                 let msg = serde_json::json!({"type": "query", "what": "pipes"});
@@ -48,10 +49,20 @@ fn main() {
             }
             Some("add") => {
                 // pipe add <src> <dst> [--extract=X] [--trigger=X] [--prefix=X]
-                let src = args.get(3).and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| { eprintln!("pipe add: missing src"); std::process::exit(1); });
-                let dst = args.get(4).and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| { eprintln!("pipe add: missing dst"); std::process::exit(1); });
+                let src = args
+                    .get(3)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("pipe add: missing src");
+                        std::process::exit(1);
+                    });
+                let dst = args
+                    .get(4)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("pipe add: missing dst");
+                        std::process::exit(1);
+                    });
                 let mut extract = "last-block".to_string();
                 let mut trigger = "on_ready".to_string();
                 let mut prefix: Option<String> = None;
@@ -89,8 +100,13 @@ fn main() {
             }
             Some("remove") => {
                 // pipe remove <src> [dst]
-                let src = args.get(3).and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| { eprintln!("pipe remove: missing src"); std::process::exit(1); });
+                let src = args
+                    .get(3)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("pipe remove: missing src");
+                        std::process::exit(1);
+                    });
                 let mut msg = serde_json::json!({"type": "pipe_remove", "source": src});
                 if let Some(dst) = args.get(4).and_then(|s| s.parse::<u64>().ok()) {
                     msg["dest"] = dst.into();
@@ -98,7 +114,8 @@ fn main() {
                 send_only(&sock, &msg);
             }
             Some("fire") => {
-                let source: u64 = args.get(3)
+                let source: u64 = args
+                    .get(3)
                     .and_then(|s| s.parse().ok())
                     .or(session_id)
                     .unwrap_or(0);
@@ -112,18 +129,24 @@ fn main() {
         },
 
         // ── Fire-and-forget commands ─────────────────────────────────────────
-
         Some("state") => {
-            let state = match args.get(2) { Some(s) => s.to_uppercase(), None => usage() };
+            let state = match args.get(2) {
+                Some(s) => s.to_uppercase(),
+                None => usage(),
+            };
             let mut msg = serde_json::json!({"type": "state", "state": state});
-            if let Some(sid) = session_id { msg["session_id"] = sid.into(); }
+            if let Some(sid) = session_id {
+                msg["session_id"] = sid.into();
+            }
             send_only(&sock, &msg);
         }
 
         Some("output") => {
             let text = args[2..].join(" ");
             let mut msg = serde_json::json!({"type": "output", "line": text});
-            if let Some(sid) = session_id { msg["session_id"] = sid.into(); }
+            if let Some(sid) = session_id {
+                msg["session_id"] = sid.into();
+            }
             send_only(&sock, &msg);
         }
 

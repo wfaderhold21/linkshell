@@ -3,22 +3,22 @@ use std::collections::HashMap;
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
-    pub general:     GeneralConfig,
-    pub socket:      SocketConfig,
-    pub sessions:    SessionsConfig,
-    pub pipe:        PipeConfig,
-    pub pricing:     PricingConfig,
+    pub general: GeneralConfig,
+    pub socket: SocketConfig,
+    pub sessions: SessionsConfig,
+    pub pipe: PipeConfig,
+    pub pricing: PricingConfig,
     pub keybindings: KeybindingsConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            general:     GeneralConfig::default(),
-            socket:      SocketConfig::default(),
-            sessions:    SessionsConfig::default(),
-            pipe:        PipeConfig::default(),
-            pricing:     PricingConfig::default(),
+            general: GeneralConfig::default(),
+            socket: SocketConfig::default(),
+            sessions: SessionsConfig::default(),
+            pipe: PipeConfig::default(),
+            pricing: PricingConfig::default(),
             keybindings: KeybindingsConfig::default(),
         }
     }
@@ -29,18 +29,18 @@ impl Default for Config {
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct GeneralConfig {
-    pub max_ipc_message_bytes:          usize,
-    pub scroll_buffer_lines:            usize,
-    pub tick_interval_ms:               u64,
+    pub max_ipc_message_bytes: usize,
+    pub scroll_buffer_lines: usize,
+    pub tick_interval_ms: u64,
     pub ipc_state_override_timeout_secs: u64,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            max_ipc_message_bytes:           0,
-            scroll_buffer_lines:          2000,
-            tick_interval_ms:              500,
+            max_ipc_message_bytes: 0,
+            scroll_buffer_lines: 2000,
+            tick_interval_ms: 500,
             ipc_state_override_timeout_secs: 60,
         }
     }
@@ -56,7 +56,9 @@ pub struct SocketConfig {
 
 impl Default for SocketConfig {
     fn default() -> Self {
-        Self { path: "/tmp/linkshell-{pid}.sock".to_string() }
+        Self {
+            path: "/tmp/linkshell-{pid}.sock".to_string(),
+        }
     }
 }
 
@@ -66,24 +68,24 @@ impl Default for SocketConfig {
 #[serde(default)]
 pub struct SessionsConfig {
     pub default_cwd: String,
-    pub commands:    SessionCommandsConfig,
+    pub commands: SessionCommandsConfig,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct SessionCommandsConfig {
     pub claude: String,
-    pub codex:  String,
+    pub codex: String,
     /// Empty string means use $SHELL.
-    pub shell:  String,
+    pub shell: String,
 }
 
 impl Default for SessionCommandsConfig {
     fn default() -> Self {
         Self {
             claude: "claude".to_string(),
-            codex:  "codex".to_string(),
-            shell:  String::new(),
+            codex: "codex".to_string(),
+            shell: String::new(),
         }
     }
 }
@@ -99,9 +101,9 @@ pub struct PipeConfig {
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct SummarizeConfig {
-    pub model:        String,
-    pub max_tokens:   u32,
-    pub system:       String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub system: String,
     pub cooldown_secs: u64,
 }
 
@@ -122,26 +124,106 @@ impl Default for SummarizeConfig {
 #[serde(default)]
 pub struct PricingConfig {
     pub claude: HashMap<String, ModelRate>,
-    pub codex:  HashMap<String, ModelRate>,
+    pub codex: HashMap<String, ModelRate>,
 }
 
 impl Default for PricingConfig {
     fn default() -> Self {
         let mut claude = HashMap::new();
-        claude.insert("claude-opus".into(),   ModelRate { input: 15.00, cache_write: 18.75, cache_read: 1.50,  output: 75.00 });
-        claude.insert("claude-sonnet".into(), ModelRate { input:  3.00, cache_write:  3.75, cache_read: 0.30,  output: 15.00 });
-        claude.insert("claude-haiku".into(),  ModelRate { input:  0.80, cache_write:  1.00, cache_read: 0.08,  output:  4.00 });
+        claude.insert(
+            "claude-opus".into(),
+            ModelRate {
+                input: 15.00,
+                cache_write: 18.75,
+                cache_read: 1.50,
+                output: 75.00,
+            },
+        );
+        claude.insert(
+            "claude-sonnet".into(),
+            ModelRate {
+                input: 3.00,
+                cache_write: 3.75,
+                cache_read: 0.30,
+                output: 15.00,
+            },
+        );
+        claude.insert(
+            "claude-haiku".into(),
+            ModelRate {
+                input: 0.80,
+                cache_write: 1.00,
+                cache_read: 0.08,
+                output: 4.00,
+            },
+        );
 
         let mut codex = HashMap::new();
         // Codex rates are credits per 1M tokens, not USD. `cache_read` is the
         // cached-input token rate from the Codex token-based rate card.
-        codex.insert("gpt-5.5".into(),       ModelRate { input: 125.00, cache_write: 0.0, cache_read: 12.500, output: 750.00 });
-        codex.insert("gpt-5.4-mini".into(),  ModelRate { input:  18.75, cache_write: 0.0, cache_read:  1.875, output: 113.00 });
-        codex.insert("gpt-5.4".into(),       ModelRate { input:  62.50, cache_write: 0.0, cache_read:  6.250, output: 375.00 });
-        codex.insert("gpt-5.3-codex".into(), ModelRate { input:  43.75, cache_write: 0.0, cache_read:  4.375, output: 350.00 });
-        codex.insert("gpt-5.2-codex".into(), ModelRate { input:  43.75, cache_write: 0.0, cache_read:  4.375, output: 350.00 });
-        codex.insert("gpt-5.2".into(),       ModelRate { input:  43.75, cache_write: 0.0, cache_read:  4.375, output: 350.00 });
-        codex.insert("unknown".into(),       ModelRate { input:   0.00, cache_write: 0.0, cache_read:  0.000, output:   0.00 });
+        codex.insert(
+            "gpt-5.5".into(),
+            ModelRate {
+                input: 125.00,
+                cache_write: 0.0,
+                cache_read: 12.500,
+                output: 750.00,
+            },
+        );
+        codex.insert(
+            "gpt-5.4-mini".into(),
+            ModelRate {
+                input: 18.75,
+                cache_write: 0.0,
+                cache_read: 1.875,
+                output: 113.00,
+            },
+        );
+        codex.insert(
+            "gpt-5.4".into(),
+            ModelRate {
+                input: 62.50,
+                cache_write: 0.0,
+                cache_read: 6.250,
+                output: 375.00,
+            },
+        );
+        codex.insert(
+            "gpt-5.3-codex".into(),
+            ModelRate {
+                input: 43.75,
+                cache_write: 0.0,
+                cache_read: 4.375,
+                output: 350.00,
+            },
+        );
+        codex.insert(
+            "gpt-5.2-codex".into(),
+            ModelRate {
+                input: 43.75,
+                cache_write: 0.0,
+                cache_read: 4.375,
+                output: 350.00,
+            },
+        );
+        codex.insert(
+            "gpt-5.2".into(),
+            ModelRate {
+                input: 43.75,
+                cache_write: 0.0,
+                cache_read: 4.375,
+                output: 350.00,
+            },
+        );
+        codex.insert(
+            "unknown".into(),
+            ModelRate {
+                input: 0.00,
+                cache_write: 0.0,
+                cache_read: 0.000,
+                output: 0.00,
+            },
+        );
 
         Self { claude, codex }
     }
@@ -149,30 +231,37 @@ impl Default for PricingConfig {
 
 #[derive(serde::Deserialize, Clone, Debug, Default)]
 pub struct ModelRate {
-    pub input:       f64,
+    pub input: f64,
     #[serde(default)]
     pub cache_write: f64,
     #[serde(default)]
-    pub cache_read:  f64,
-    pub output:      f64,
+    pub cache_read: f64,
+    pub output: f64,
 }
 
 impl PricingConfig {
     /// Longest-prefix match on the Claude pricing table.
     /// Falls back to Sonnet rates if nothing matches.
     pub fn claude_rate(&self, model: &str) -> ModelRate {
-        self.claude.iter()
+        self.claude
+            .iter()
             .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, r)| r.clone())
-            .unwrap_or_else(|| ModelRate { input: 3.0, cache_write: 3.75, cache_read: 0.30, output: 15.0 })
+            .unwrap_or_else(|| ModelRate {
+                input: 3.0,
+                cache_write: 3.75,
+                cache_read: 0.30,
+                output: 15.0,
+            })
     }
 
     /// Longest-prefix match on the Codex pricing table.
     /// Falls back to zero-cost "unknown" if nothing matches.
     pub fn codex_rate(&self, model: &str) -> ModelRate {
         let model = model.to_ascii_lowercase();
-        self.codex.iter()
+        self.codex
+            .iter()
             .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, r)| r.clone())

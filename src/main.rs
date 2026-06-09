@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture,
-        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -41,7 +41,8 @@ async fn main() -> anyhow::Result<()> {
     let kitty_supported = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-    ).is_ok();
+    )
+    .is_ok();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -64,10 +65,14 @@ async fn main() -> anyhow::Result<()> {
             if event::poll(Duration::from_millis(50)).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(key)) => {
-                        if key_tx.send(AppEvent::Key(key)).await.is_err() { break; }
+                        if key_tx.send(AppEvent::Key(key)).await.is_err() {
+                            break;
+                        }
                     }
                     Ok(Event::Mouse(mouse)) => {
-                        if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() { break; }
+                        if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() {
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -101,9 +106,11 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let mut layout = ui::LayoutInfo::default();
-        terminal.draw(|f| { layout = ui::draw(f, &app); })?;
-        app.output_area        = layout.output_area;
-        app.session_bar_area   = layout.session_bar_area;
+        terminal.draw(|f| {
+            layout = ui::draw(f, &app);
+        })?;
+        app.output_area = layout.output_area;
+        app.session_bar_area = layout.session_bar_area;
         app.session_slot_areas = layout.session_slot_areas;
         // Resize PTYs to match the output pane (inner area = subtract 2 for borders)
         let pty_rows = layout.output_area.height.saturating_sub(2).max(1);
@@ -123,7 +130,11 @@ async fn main() -> anyhow::Result<()> {
     if kitty_supported {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     Ok(())
@@ -141,10 +152,16 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::SessionCurrentLine { session_id, text } => {
             app.handle_session_current_line(session_id, text);
         }
-        AppEvent::SessionWriter { session_id, writer_tx } => {
+        AppEvent::SessionWriter {
+            session_id,
+            writer_tx,
+        } => {
             app.handle_session_writer(session_id, writer_tx);
         }
-        AppEvent::SessionResizer { session_id, resizer_tx } => {
+        AppEvent::SessionResizer {
+            session_id,
+            resizer_tx,
+        } => {
             app.handle_session_resizer(session_id, resizer_tx);
         }
         AppEvent::SessionDied { session_id } => {
@@ -173,7 +190,13 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::IpcNamedAction { session_name, msg } => {
             app.handle_named_action(session_name, msg);
         }
-        AppEvent::IpcPipeAdd { source, dest, trigger, extract, prefix } => {
+        AppEvent::IpcPipeAdd {
+            source,
+            dest,
+            trigger,
+            extract,
+            prefix,
+        } => {
             app.handle_ipc_pipe_add(source, dest, &trigger, &extract, prefix);
         }
         AppEvent::IpcPipeRemove { source, dest } => {
@@ -185,20 +208,29 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::IpcTokenUpdate { session_id, stats } => {
             app.handle_ipc_tokens(session_id, stats);
         }
-        AppEvent::IpcQuery { payload, response_tx } => {
+        AppEvent::IpcQuery {
+            payload,
+            response_tx,
+        } => {
             app.handle_ipc_query(payload, response_tx);
         }
-        AppEvent::IpcAgentConnected { session_id, agent_tx } => {
+        AppEvent::IpcAgentConnected {
+            session_id,
+            agent_tx,
+        } => {
             app.handle_ipc_agent_connected(session_id, agent_tx);
         }
         AppEvent::IpcAgentDisconnected { session_id } => {
             app.handle_ipc_agent_disconnected(session_id);
         }
-        AppEvent::IpcSend { session_id, message } => {
+        AppEvent::IpcSend {
+            session_id,
+            message,
+        } => {
             app.handle_ipc_send(session_id, message);
         }
-        AppEvent::Key(key)   => handle_key(app, key),
-        AppEvent::Mouse(ev)  => app.handle_mouse(ev),
+        AppEvent::Key(key) => handle_key(app, key),
+        AppEvent::Mouse(ev) => app.handle_mouse(ev),
     }
 }
 
@@ -207,18 +239,18 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         AppMode::Normal => {
             if let Some(action) = app.keymap.get(&(key.modifiers, key.code)).cloned() {
                 match action {
-                    Action::NewSession          => app.open_new_session(),
-                    Action::KillSession         => app.kill_active_session(),
-                    Action::CommandBar          => app.open_command_bar(),
-                    Action::Help                => app.mode = AppMode::Help,
-                    Action::Quit                => app.should_quit = true,
-                    Action::PrevSession         => app.prev_session(),
-                    Action::NextSession         => app.next_session(),
-                    Action::SwitchSession(i)    => app.switch_to(i),
-                    Action::ScrollUpPage        => app.scroll_up(20),
-                    Action::ScrollDownPage      => app.scroll_down(20),
-                    Action::ScrollUpLine        => app.scroll_up(3),
-                    Action::ScrollDownLine      => app.scroll_down(3),
+                    Action::NewSession => app.open_new_session(),
+                    Action::KillSession => app.kill_active_session(),
+                    Action::CommandBar => app.open_command_bar(),
+                    Action::Help => app.mode = AppMode::Help,
+                    Action::Quit => app.should_quit = true,
+                    Action::PrevSession => app.prev_session(),
+                    Action::NextSession => app.next_session(),
+                    Action::SwitchSession(i) => app.switch_to(i),
+                    Action::ScrollUpPage => app.scroll_up(20),
+                    Action::ScrollDownPage => app.scroll_down(20),
+                    Action::ScrollUpLine => app.scroll_up(3),
+                    Action::ScrollDownLine => app.scroll_down(3),
                 }
                 return;
             }
@@ -229,59 +261,74 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
-        AppMode::NewSession => {
-            match key.code {
-                KeyCode::Esc => { app.mode = AppMode::Normal; }
-                KeyCode::Tab => { app.new_session_tab(); }
-                KeyCode::Enter => { let _ = app.confirm_new_session(); }
-                KeyCode::Left
-                    if app.new_session_state.active_field == NewSessionField::Kind =>
-                {
-                    app.new_session_select_kind(-1);
-                }
-                KeyCode::Right
-                    if app.new_session_state.active_field == NewSessionField::Kind =>
-                {
-                    app.new_session_select_kind(1);
-                }
-                KeyCode::Char('1')
-                    if app.new_session_state.active_field == NewSessionField::Kind =>
-                {
-                    app.new_session_state.selected_kind = 0;
-                }
-                KeyCode::Char('2')
-                    if app.new_session_state.active_field == NewSessionField::Kind =>
-                {
-                    app.new_session_state.selected_kind = 1;
-                }
-                KeyCode::Char('3')
-                    if app.new_session_state.active_field == NewSessionField::Kind =>
-                {
-                    app.new_session_state.selected_kind = 2;
-                }
-                KeyCode::Char('4')
-                    if app.new_session_state.active_field == NewSessionField::Kind =>
-                {
-                    app.new_session_state.selected_kind = 3;
-                }
-                KeyCode::Backspace => { app.new_session_backspace(); }
-                KeyCode::Char(c) => { app.new_session_input(c); }
-                _ => {}
+        AppMode::NewSession => match key.code {
+            KeyCode::Esc => {
+                app.mode = AppMode::Normal;
             }
-        }
+            KeyCode::Tab => {
+                app.new_session_tab();
+            }
+            KeyCode::Enter => {
+                let _ = app.confirm_new_session();
+            }
+            KeyCode::Left if app.new_session_state.active_field == NewSessionField::Kind => {
+                app.new_session_select_kind(-1);
+            }
+            KeyCode::Left => {
+                app.new_session_cursor_left();
+            }
+            KeyCode::Right if app.new_session_state.active_field == NewSessionField::Kind => {
+                app.new_session_select_kind(1);
+            }
+            KeyCode::Right => {
+                app.new_session_cursor_right();
+            }
+            KeyCode::Home => {
+                app.new_session_cursor_home();
+            }
+            KeyCode::End => {
+                app.new_session_cursor_end();
+            }
+            KeyCode::Delete => {
+                app.new_session_delete();
+            }
+            KeyCode::Char('1') if app.new_session_state.active_field == NewSessionField::Kind => {
+                app.new_session_state.selected_kind = 0;
+            }
+            KeyCode::Char('2') if app.new_session_state.active_field == NewSessionField::Kind => {
+                app.new_session_state.selected_kind = 1;
+            }
+            KeyCode::Char('3') if app.new_session_state.active_field == NewSessionField::Kind => {
+                app.new_session_state.selected_kind = 2;
+            }
+            KeyCode::Char('4') if app.new_session_state.active_field == NewSessionField::Kind => {
+                app.new_session_state.selected_kind = 3;
+            }
+            KeyCode::Backspace => {
+                app.new_session_backspace();
+            }
+            KeyCode::Char(c) => {
+                app.new_session_input(c);
+            }
+            _ => {}
+        },
 
-        AppMode::CommandBar => {
-            match key.code {
-                KeyCode::Esc => {
-                    app.mode = AppMode::Normal;
-                    app.command_input.clear();
-                }
-                KeyCode::Enter => { app.execute_command(); }
-                KeyCode::Backspace => { app.command_backspace(); }
-                KeyCode::Char(c) => { app.command_input_char(c); }
-                _ => {}
+        AppMode::CommandBar => match key.code {
+            KeyCode::Esc => {
+                app.mode = AppMode::Normal;
+                app.command_input.clear();
             }
-        }
+            KeyCode::Enter => {
+                app.execute_command();
+            }
+            KeyCode::Backspace => {
+                app.command_backspace();
+            }
+            KeyCode::Char(c) => {
+                app.command_input_char(c);
+            }
+            _ => {}
+        },
 
         AppMode::Help => {
             app.mode = AppMode::Normal; // any key dismisses
@@ -303,21 +350,81 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
             c.encode_utf8(&mut buf).as_bytes().to_vec()
         }
         // Shift+Enter: ESC [ 13 ; 2 u (kitty/xterm extended)
-        KeyCode::Enter     => if shift { vec![27, b'[', b'1', b'3', b';', b'2', b'u'] } else { vec![b'\r'] },
+        KeyCode::Enter => {
+            if shift {
+                vec![27, b'[', b'1', b'3', b';', b'2', b'u']
+            } else {
+                vec![b'\r']
+            }
+        }
         KeyCode::Backspace => vec![127],
-        KeyCode::Tab       => vec![b'\t'],
-        KeyCode::BackTab   => vec![27, b'[', b'Z'],
-        KeyCode::Esc       => vec![27],
-        KeyCode::Up        => if shift { vec![27, b'[', b'1', b';', b'2', b'A'] } else { vec![27, b'[', b'A'] },
-        KeyCode::Down      => if shift { vec![27, b'[', b'1', b';', b'2', b'B'] } else { vec![27, b'[', b'B'] },
-        KeyCode::Right     => if shift { vec![27, b'[', b'1', b';', b'2', b'C'] } else { vec![27, b'[', b'C'] },
-        KeyCode::Left      => if shift { vec![27, b'[', b'1', b';', b'2', b'D'] } else { vec![27, b'[', b'D'] },
-        KeyCode::Home      => if shift { vec![27, b'[', b'1', b';', b'2', b'H'] } else { vec![27, b'[', b'H'] },
-        KeyCode::End       => if shift { vec![27, b'[', b'1', b';', b'2', b'F'] } else { vec![27, b'[', b'F'] },
-        KeyCode::Delete    => if shift { vec![27, b'[', b'3', b';', b'2', b'~'] } else { vec![27, b'[', b'3', b'~'] },
-        KeyCode::PageUp    => if shift { vec![27, b'[', b'5', b';', b'2', b'~'] } else { vec![27, b'[', b'5', b'~'] },
-        KeyCode::PageDown  => if shift { vec![27, b'[', b'6', b';', b'2', b'~'] } else { vec![27, b'[', b'6', b'~'] },
-        _                  => vec![],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => vec![27, b'[', b'Z'],
+        KeyCode::Esc => vec![27],
+        KeyCode::Up => {
+            if shift {
+                vec![27, b'[', b'1', b';', b'2', b'A']
+            } else {
+                vec![27, b'[', b'A']
+            }
+        }
+        KeyCode::Down => {
+            if shift {
+                vec![27, b'[', b'1', b';', b'2', b'B']
+            } else {
+                vec![27, b'[', b'B']
+            }
+        }
+        KeyCode::Right => {
+            if shift {
+                vec![27, b'[', b'1', b';', b'2', b'C']
+            } else {
+                vec![27, b'[', b'C']
+            }
+        }
+        KeyCode::Left => {
+            if shift {
+                vec![27, b'[', b'1', b';', b'2', b'D']
+            } else {
+                vec![27, b'[', b'D']
+            }
+        }
+        KeyCode::Home => {
+            if shift {
+                vec![27, b'[', b'1', b';', b'2', b'H']
+            } else {
+                vec![27, b'[', b'H']
+            }
+        }
+        KeyCode::End => {
+            if shift {
+                vec![27, b'[', b'1', b';', b'2', b'F']
+            } else {
+                vec![27, b'[', b'F']
+            }
+        }
+        KeyCode::Delete => {
+            if shift {
+                vec![27, b'[', b'3', b';', b'2', b'~']
+            } else {
+                vec![27, b'[', b'3', b'~']
+            }
+        }
+        KeyCode::PageUp => {
+            if shift {
+                vec![27, b'[', b'5', b';', b'2', b'~']
+            } else {
+                vec![27, b'[', b'5', b'~']
+            }
+        }
+        KeyCode::PageDown => {
+            if shift {
+                vec![27, b'[', b'6', b';', b'2', b'~']
+            } else {
+                vec![27, b'[', b'6', b'~']
+            }
+        }
+        _ => vec![],
     }
 }
 

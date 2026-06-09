@@ -40,36 +40,56 @@ pub fn extract_from_session(sessions: &[Session], id: usize, mode: &ExtractMode)
     match mode {
         ExtractMode::LastN(n) => {
             let start = lines.len().saturating_sub(*n);
-            Some(lines.iter().skip(start).cloned().collect::<Vec<_>>().join("\n"))
+            Some(
+                lines
+                    .iter()
+                    .skip(start)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         }
         ExtractMode::LastBlock => {
             let mut in_block = false;
             let mut block: Vec<&str> = Vec::new();
             for line in lines.iter().rev() {
                 if line.starts_with("```") {
-                    if in_block { break; }
+                    if in_block {
+                        break;
+                    }
                     in_block = true;
                 } else if in_block {
                     block.push(line.as_str());
                 }
             }
-            if block.is_empty() { None }
-            else { Some(block.into_iter().rev().collect::<Vec<_>>().join("\n")) }
+            if block.is_empty() {
+                None
+            } else {
+                Some(block.into_iter().rev().collect::<Vec<_>>().join("\n"))
+            }
         }
         ExtractMode::Diff => {
-            let diff: Vec<&str> = lines.iter()
+            let diff: Vec<&str> = lines
+                .iter()
                 .filter(|l| l.starts_with('+') || l.starts_with('-'))
                 .map(|s| s.as_str())
                 .collect();
-            if diff.is_empty() { None } else { Some(diff.join("\n")) }
+            if diff.is_empty() {
+                None
+            } else {
+                Some(diff.join("\n"))
+            }
         }
-        ExtractMode::Summarize(_) => {
-            Some(lines.iter().cloned().collect::<Vec<_>>().join("\n"))
-        }
+        ExtractMode::Summarize(_) => Some(lines.iter().cloned().collect::<Vec<_>>().join("\n")),
     }
 }
 
-pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
+pub fn fire_pipe_task(
+    pipe: Pipe,
+    content: String,
+    tx: mpsc::Sender<AppEvent>,
+    config: Arc<Config>,
+) {
     let dest_id = pipe.dest;
     let prefix = pipe.prefix.clone().unwrap_or_default();
     let extract = pipe.extract.clone();
@@ -77,7 +97,9 @@ pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>, c
     tokio::spawn(async move {
         let relay = match extract {
             ExtractMode::Summarize(max_tokens) => {
-                summarize_for_relay(&content, max_tokens, &config).await.unwrap_or(content)
+                summarize_for_relay(&content, max_tokens, &config)
+                    .await
+                    .unwrap_or(content)
             }
             _ => content,
         };
@@ -92,7 +114,11 @@ pub fn fire_pipe_task(pipe: Pipe, content: String, tx: mpsc::Sender<AppEvent>, c
     });
 }
 
-async fn summarize_for_relay(content: &str, max_tokens: u32, config: &Config) -> anyhow::Result<String> {
+async fn summarize_for_relay(
+    content: &str,
+    max_tokens: u32,
+    config: &Config,
+) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
 
@@ -113,5 +139,8 @@ async fn summarize_for_relay(content: &str, max_tokens: u32, config: &Config) ->
         .json::<serde_json::Value>()
         .await?;
 
-    Ok(resp["content"][0]["text"].as_str().unwrap_or("").to_string())
+    Ok(resp["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
