@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::config::{self, Config};
 use crate::events::AppEvent;
@@ -146,7 +147,25 @@ pub struct App {
     pub agent_writers: HashMap<usize, mpsc::Sender<String>>,
     /// Buffered pipe relays waiting for the dest session to reach READY.
     pub pending_relays: HashMap<usize, Vec<String>>,
+    pipe_tasks: HashMap<PipeKey, JoinHandle<()>>,
     pub keymap: Keymap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PipeKey {
+    source: usize,
+    dest: usize,
+    trigger: PipeTrigger,
+}
+
+impl PipeKey {
+    fn from_pipe(pipe: &Pipe) -> Self {
+        Self {
+            source: pipe.source,
+            dest: pipe.dest,
+            trigger: pipe.trigger,
+        }
+    }
 }
 
 impl App {
@@ -172,6 +191,7 @@ impl App {
             pending_ipc_replies: HashMap::new(),
             agent_writers: HashMap::new(),
             pending_relays: HashMap::new(),
+            pipe_tasks: HashMap::new(),
             keymap,
         }
     }
@@ -242,6 +262,7 @@ impl App {
             cwd.clone(),
             pty_rows,
             pty_cols,
+            self.config.general.scroll_buffer_lines,
         );
         let idx = self.sessions.len();
         self.sessions.push(session);
@@ -292,11 +313,23 @@ impl App {
         } else {
             name
         };
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let cwd = if !self.config.sessions.default_cwd.is_empty() {
+            self.config.sessions.default_cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        };
         let (pty_rows, pty_cols) = self.pty_size;
-        let mut session = Session::new(id, label, SessionKind::Shell, cwd, pty_rows, pty_cols);
+        let mut session = Session::new(
+            id,
+            label,
+            SessionKind::Shell,
+            cwd,
+            pty_rows,
+            pty_cols,
+            self.config.general.scroll_buffer_lines,
+        );
         session.headless = true;
         session.group = group;
         session.state = SessionState::Ready;
@@ -484,7 +517,7 @@ impl App {
         for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract)
             {
-                pipe::fire_pipe_task(p, content, self.event_tx.clone(), Arc::clone(&self.config));
+                self.fire_pipe_task(p, content);
             }
         }
     }
@@ -512,9 +545,23 @@ impl App {
         for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract)
             {
-                pipe::fire_pipe_task(p, content, self.event_tx.clone(), Arc::clone(&self.config));
+                self.fire_pipe_task(p, content);
             }
         }
+    }
+
+    fn fire_pipe_task(&mut self, pipe: Pipe, content: String) {
+        let key = PipeKey::from_pipe(&pipe);
+        if let Some(previous) = self.pipe_tasks.remove(&key) {
+            previous.abort();
+        }
+        let handle = pipe::fire_pipe_task(
+            pipe,
+            content,
+            self.event_tx.clone(),
+            Arc::clone(&self.config),
+        );
+        self.pipe_tasks.insert(key, handle);
     }
 
     pub fn handle_session_current_line(&mut self, session_id: usize, text: String) {
@@ -656,9 +703,27 @@ impl App {
 
     pub fn handle_ipc_pipe_remove(&mut self, source: usize, dest: Option<usize>) {
         match dest {
-            None => self.pipes.retain(|p| p.source != source),
-            Some(d) => self.pipes.retain(|p| !(p.source == source && p.dest == d)),
+            None => {
+                self.pipes.retain(|p| p.source != source);
+                self.abort_pipe_tasks(|key| key.source == source);
+            }
+            Some(d) => {
+                self.pipes.retain(|p| !(p.source == source && p.dest == d));
+                self.abort_pipe_tasks(|key| key.source == source && key.dest == d);
+            }
         }
+    }
+
+    fn abort_pipe_tasks(&mut self, mut should_abort: impl FnMut(PipeKey) -> bool) {
+        let mut keep = HashMap::new();
+        for (key, handle) in self.pipe_tasks.drain() {
+            if should_abort(key) {
+                handle.abort();
+            } else {
+                keep.insert(key, handle);
+            }
+        }
+        self.pipe_tasks = keep;
     }
 
     pub fn handle_broadcast(&self, group: &str, msg: serde_json::Value) {
@@ -797,7 +862,12 @@ impl App {
                     "claude" => crate::session::SessionKind::Claude,
                     "codex" => crate::session::SessionKind::Codex,
                     "shell" => crate::session::SessionKind::Shell,
-                    other => crate::session::SessionKind::Custom(other.to_string()),
+                    other => {
+                        let _ = response_tx.send(serde_json::json!({
+                            "error": format!("unknown session kind: {}", other)
+                        }));
+                        return;
+                    }
                 };
                 let new_id = self.next_id;
                 match self.spawn_session(kind, name, cwd) {
@@ -1314,6 +1384,7 @@ impl App {
                 if let Ok(n) = src.parse::<usize>() {
                     if let Some(id) = self.sessions.get(n.wrapping_sub(1)).map(|s| s.id) {
                         self.pipes.retain(|p| p.source != id);
+                        self.abort_pipe_tasks(|key| key.source == id);
                     }
                 }
             }
@@ -1330,6 +1401,7 @@ impl App {
                     .map(|s| s.id);
                 if let (Some(s), Some(d)) = (src_id, dst_id) {
                     self.pipes.retain(|p| !(p.source == s && p.dest == d));
+                    self.abort_pipe_tasks(|key| key.source == s && key.dest == d);
                 }
             }
             _ => {}
@@ -1576,6 +1648,11 @@ mod tests {
         App::new(tx, config)
     }
 
+    fn make_app_with_config(config: crate::config::Config) -> App {
+        let (tx, _rx) = mpsc::channel::<AppEvent>(8);
+        App::new(tx, Arc::new(config))
+    }
+
     fn cursor_pos(app: &App) -> usize {
         app.new_session_state.cursor_pos()
     }
@@ -1587,6 +1664,37 @@ mod tests {
         app.new_session_tab();
         assert_eq!(app.new_session_state.active_field, NewSessionField::Name);
         assert_eq!(cursor_pos(&app), 0);
+    }
+
+    #[test]
+    fn spawn_headless_session_uses_default_cwd() {
+        let mut config = crate::config::Config::default();
+        config.sessions.default_cwd = "/work".into();
+        let mut app = make_app_with_config(config);
+
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+
+        let session = app.sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(session.cwd, "/work");
+    }
+
+    #[test]
+    fn ipc_session_create_rejects_unknown_kind() {
+        let mut app = make_app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        app.handle_ipc_query(
+            crate::events::IpcQueryPayload::SessionCreate {
+                kind_str: "bogus".into(),
+                name: String::new(),
+                cwd: ".".into(),
+            },
+            tx,
+        );
+
+        let response = rx.blocking_recv().unwrap();
+        assert_eq!(response["error"], "unknown session kind: bogus");
+        assert!(app.sessions.is_empty());
     }
 
     #[test]
@@ -1767,7 +1875,9 @@ mod tests {
     fn headless_sessions_get_ids_labels_groups_and_ready_state() {
         let mut app = make_app();
 
-        let first = app.spawn_headless_session("".into(), Some("agents".into())).unwrap();
+        let first = app
+            .spawn_headless_session("".into(), Some("agents".into()))
+            .unwrap();
         let second = app.spawn_headless_session("named".into(), None).unwrap();
 
         assert_eq!(first, 0);

@@ -9,6 +9,8 @@ use crate::config::Config;
 use crate::events::{AppEvent, IpcQueryPayload};
 use crate::session::{SessionState, TokenStats};
 
+const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub fn socket_path(config: &Config) -> String {
     config
         .socket
@@ -29,6 +31,7 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
             }
         };
         eprintln!("[linkshell] IPC socket: {}", path);
+        write_last_socket(&path);
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -40,6 +43,32 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
             }
         }
     });
+}
+
+fn write_last_socket(path: &str) {
+    let Some(config_dir) = linkshell_config_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&config_dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(config_dir.join("last_socket"), path);
+}
+
+fn linkshell_config_dir() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(std::path::PathBuf::from(path).join("linkshell"));
+    }
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".config").join("linkshell"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReadResult {
+    Eof,
+    Line,
+    OversizeDrained,
 }
 
 pub fn spawn_tcp_listener(tx: mpsc::Sender<AppEvent>, port: u16, config: Arc<Config>) {
@@ -69,35 +98,51 @@ pub fn spawn_tcp_listener(tx: mpsc::Sender<AppEvent>, port: u16, config: Arc<Con
 
 /// Read one newline-terminated line, enforcing an optional byte limit.
 /// When max_bytes == 0, behaves identically to read_line (no limit).
-/// When the limit is exceeded, reads (and discards) the rest of the line,
-/// returns Ok(0) to signal "oversize" (distinguishable from EOF which also
-/// returns Ok(0) only when the very first read returns 0).
+/// When the limit is exceeded, reads and discards the rest of the line so the
+/// next call can resume at a frame boundary.
 async fn read_limited_line(
     reader: &mut tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>,
     max_bytes: usize,
     line: &mut String,
-) -> std::io::Result<usize> {
+) -> std::io::Result<ReadResult> {
     if max_bytes == 0 {
-        return reader.read_line(line).await;
+        return match reader.read_line(line).await? {
+            0 => Ok(ReadResult::Eof),
+            _ => Ok(ReadResult::Line),
+        };
     }
     let mut byte = [0u8; 1];
+    let mut bytes = Vec::new();
     let mut count = 0usize;
     let mut oversize = false;
     loop {
         match reader.read(&mut byte).await? {
-            0 => return Ok(count),
+            0 if count == 0 => return Ok(ReadResult::Eof),
+            0 => {
+                line.push_str(&String::from_utf8_lossy(&bytes));
+                return if oversize {
+                    Ok(ReadResult::OversizeDrained)
+                } else {
+                    Ok(ReadResult::Line)
+                };
+            }
             _ => {
                 count += 1;
                 if byte[0] == b'\n' {
                     if !oversize {
-                        line.push('\n');
+                        bytes.push(b'\n');
                     }
-                    return if oversize { Ok(0) } else { Ok(count) };
+                    line.push_str(&String::from_utf8_lossy(&bytes));
+                    return if oversize {
+                        Ok(ReadResult::OversizeDrained)
+                    } else {
+                        Ok(ReadResult::Line)
+                    };
                 }
                 if count > max_bytes {
                     oversize = true;
                 } else {
-                    line.push(byte[0] as char);
+                    bytes.push(byte[0]);
                 }
             }
         }
@@ -117,18 +162,15 @@ async fn handle_stream(
     let mut line = String::new();
 
     match read_limited_line(&mut reader, max_bytes, &mut line).await {
-        Ok(0) => {
-            // EOF or oversize on the very first message
-            if !line.is_empty() {
-                // oversize — line was drained but truncated
-                let err = serde_json::json!({"error": "message exceeds max_ipc_message_bytes"});
-                let _ = agent_tx
-                    .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
-                    .await;
-            }
+        Ok(ReadResult::Eof) => return,
+        Ok(ReadResult::OversizeDrained) => {
+            let err = serde_json::json!({"error": "message exceeds max_ipc_message_bytes"});
+            let _ = agent_tx
+                .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                .await;
             return;
         }
-        Ok(_) => {}
+        Ok(ReadResult::Line) => {}
         Err(_) => return,
     }
 
@@ -184,16 +226,15 @@ async fn handle_stream(
     loop {
         line.clear();
         match read_limited_line(&mut reader, max_bytes, &mut line).await {
-            Ok(0) if line.is_empty() => break, // EOF
-            Ok(0) => {
-                // Oversize message in persistent session
+            Ok(ReadResult::Eof) => break,
+            Ok(ReadResult::OversizeDrained) => {
                 let err = serde_json::json!({"error": "message exceeds max_ipc_message_bytes"});
                 let _ = agent_tx
                     .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
                     .await;
-                break;
+                continue;
             }
-            Ok(_) => {
+            Ok(ReadResult::Line) => {
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) {
                     dispatch(&msg, &tx, session_id, &agent_tx).await;
                 }
@@ -214,8 +255,11 @@ async fn write_loop(
     mut rx: mpsc::Receiver<String>,
 ) {
     while let Some(msg) = rx.recv().await {
-        if write_half.write_all(msg.as_bytes()).await.is_err() {
-            break;
+        match tokio::time::timeout(IPC_WRITE_TIMEOUT, write_half.write_all(msg.as_bytes())).await {
+            Ok(Ok(())) => {}
+            _ => {
+                break;
+            }
         }
     }
 }
@@ -468,7 +512,10 @@ mod tests {
     #[test]
     fn parse_session_state_is_case_insensitive_and_rejects_unknown_values() {
         assert_eq!(parse_session_state("ready"), Some(SessionState::Ready));
-        assert_eq!(parse_session_state("Thinking"), Some(SessionState::Thinking));
+        assert_eq!(
+            parse_session_state("Thinking"),
+            Some(SessionState::Thinking)
+        );
         assert_eq!(parse_session_state("WAITING!"), None);
         assert_eq!(parse_session_state("dead"), None);
     }
@@ -481,23 +528,23 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut line = String::new();
 
-        let n = read_limited_line(&mut reader, 64, &mut line).await.unwrap();
+        let result = read_limited_line(&mut reader, 64, &mut line).await.unwrap();
 
-        assert_eq!(n, 12);
+        assert_eq!(result, ReadResult::Line);
         assert_eq!(line, "{\"ok\":true}\n");
     }
 
     #[tokio::test]
-    async fn read_limited_line_returns_zero_and_truncated_line_when_oversize() {
+    async fn read_limited_line_reports_oversize_and_truncated_line_when_oversize() {
         let (mut writer, reader) = tokio::io::duplex(64);
         writer.write_all(b"abcdef\n").await.unwrap();
         drop(writer);
         let mut reader = tokio::io::BufReader::new(reader);
         let mut line = String::new();
 
-        let n = read_limited_line(&mut reader, 3, &mut line).await.unwrap();
+        let result = read_limited_line(&mut reader, 3, &mut line).await.unwrap();
 
-        assert_eq!(n, 0);
+        assert_eq!(result, ReadResult::OversizeDrained);
         assert_eq!(line, "abc");
     }
 
@@ -587,7 +634,10 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await.unwrap(),
-            AppEvent::IpcFirePipe { source: 1, dest: Some(2) }
+            AppEvent::IpcFirePipe {
+                source: 1,
+                dest: Some(2)
+            }
         ));
         assert!(matches!(
             rx.recv().await.unwrap(),
@@ -598,5 +648,42 @@ mod tests {
             AppEvent::IpcPipeAdd { source: 1, dest: 2, trigger, extract, prefix }
                 if trigger == "manual" && extract == "diff" && prefix.as_deref() == Some("p")
         ));
+    }
+
+    #[tokio::test]
+    async fn read_limited_line_reports_oversize_and_recovers_at_next_line() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        writer.write_all(b"abcdef\nok\n").await.unwrap();
+        drop(writer);
+
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        assert_eq!(
+            read_limited_line(&mut reader, 3, &mut line).await.unwrap(),
+            ReadResult::OversizeDrained
+        );
+        assert_eq!(line, "abc");
+
+        line.clear();
+        assert_eq!(
+            read_limited_line(&mut reader, 3, &mut line).await.unwrap(),
+            ReadResult::Line
+        );
+        assert_eq!(line, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn read_limited_line_reports_oversize_when_eof_precedes_newline() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        writer.write_all(b"abcdef").await.unwrap();
+        drop(writer);
+
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        assert_eq!(
+            read_limited_line(&mut reader, 3, &mut line).await.unwrap(),
+            ReadResult::OversizeDrained
+        );
+        assert_eq!(line, "abc");
     }
 }

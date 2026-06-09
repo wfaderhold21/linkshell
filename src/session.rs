@@ -97,6 +97,7 @@ pub struct Session {
     pub pty_resizer: Option<mpsc::Sender<(u16, u16)>>,
     /// Scrollback of stripped output lines for pipe extraction
     pub output_lines: VecDeque<String>,
+    pub scroll_buffer_lines: usize,
     /// Raw bytes received since the last tick — used to detect active generation
     /// without relying on newlines (Claude Code streams via cursor movement, not \n).
     pub bytes_since_last_tick: usize,
@@ -110,6 +111,7 @@ impl Session {
         cwd: String,
         rows: u16,
         cols: u16,
+        scroll_buffer_lines: usize,
     ) -> Self {
         Self {
             id,
@@ -129,6 +131,7 @@ impl Session {
             pty_writer: None,
             pty_resizer: None,
             output_lines: VecDeque::new(),
+            scroll_buffer_lines,
             bytes_since_last_tick: 0,
         }
     }
@@ -145,7 +148,7 @@ impl Session {
     pub fn push_output_line(&mut self, line: String) {
         self.last_output_at = Some(Instant::now());
         self.output_lines.push_back(line);
-        if self.output_lines.len() > 2000 {
+        if self.output_lines.len() > self.scroll_buffer_lines {
             self.output_lines.pop_front();
         }
     }
@@ -234,7 +237,15 @@ mod tests {
     use super::*;
 
     fn session(kind: SessionKind) -> Session {
-        Session::new(7, "test".into(), kind, "/tmp".into(), PTY_ROWS, PTY_COLS)
+        Session::new(
+            7,
+            "test".into(),
+            kind,
+            "/tmp".into(),
+            PTY_ROWS,
+            PTY_COLS,
+            2000,
+        )
     }
 
     #[test]
@@ -361,5 +372,25 @@ mod tests {
         s.write_bytes(b"cmd\n".to_vec());
 
         assert_eq!(rx.try_recv().unwrap(), b"cmd\n".to_vec());
+    }
+
+    #[test]
+    fn push_output_line_uses_configured_scrollback_cap() {
+        let mut session = Session::new(
+            1,
+            "test".into(),
+            SessionKind::Shell,
+            ".".into(),
+            PTY_ROWS,
+            PTY_COLS,
+            3,
+        );
+
+        for i in 0..5 {
+            session.push_output_line(format!("line-{i}"));
+        }
+
+        let lines: Vec<_> = session.output_lines.iter().cloned().collect();
+        assert_eq!(lines, vec!["line-2", "line-3", "line-4"]);
     }
 }
