@@ -16,6 +16,7 @@ pub enum Action {
     ScrollDownPage,
     ScrollUpLine,
     ScrollDownLine,
+    OpenMenu,
 }
 
 pub type Keymap = HashMap<(KeyModifiers, KeyCode), Action>;
@@ -51,6 +52,7 @@ fn default_keymap() -> Keymap {
     m.insert((alt, KeyCode::Char('x')), Action::KillSession);
     m.insert((alt, KeyCode::Char('h')), Action::Help);
     m.insert((ctrl, KeyCode::Char('q')), Action::Quit);
+    m.insert((ctrl, KeyCode::Char(' ')), Action::OpenMenu);
     m.insert((alt, KeyCode::Left), Action::PrevSession);
     m.insert((alt, KeyCode::Right), Action::NextSession);
     m.insert((alt, KeyCode::Tab), Action::NextSession);
@@ -72,7 +74,7 @@ fn default_keymap() -> Keymap {
     m
 }
 
-fn parse_chord(s: &str) -> Option<(KeyModifiers, KeyCode)> {
+pub(crate) fn parse_chord(s: &str) -> Option<(KeyModifiers, KeyCode)> {
     let s = s.trim().to_lowercase();
     let parts: Vec<&str> = s.split('+').collect();
     if parts.is_empty() {
@@ -107,6 +109,7 @@ fn parse_chord(s: &str) -> Option<(KeyModifiers, KeyCode)> {
         "end" => KeyCode::End,
         "delete" => KeyCode::Delete,
         "backspace" => KeyCode::Backspace,
+        "space" => KeyCode::Char(' '),
         s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
         _ => return None,
     };
@@ -135,6 +138,7 @@ fn parse_action(s: &str) -> Option<Action> {
         "scroll_down_page" => Some(Action::ScrollDownPage),
         "scroll_up_line" => Some(Action::ScrollUpLine),
         "scroll_down_line" => Some(Action::ScrollDownLine),
+        "open_menu" => Some(Action::OpenMenu),
         _ => None,
     }
 }
@@ -166,7 +170,8 @@ mod tests {
         let mut cfg = KeybindingsConfig::default();
         cfg.vars.insert("META".into(), "ctrl".into());
         cfg.bind.insert("$META+n".into(), "quit".into());
-        cfg.bind.insert("alt+pageup".into(), "scroll_up_page".into());
+        cfg.bind
+            .insert("alt+pageup".into(), "scroll_up_page".into());
 
         let map = build_keymap(&cfg);
 

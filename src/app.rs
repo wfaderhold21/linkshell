@@ -112,12 +112,17 @@ impl Default for NewSessionState {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
     Normal,
     NewSession,
     CommandBar,
+    CommandResult,
     Help,
+    Menu {
+        selected_top: usize,
+        selected_sub: Option<usize>,
+    },
 }
 
 pub struct App {
@@ -126,7 +131,10 @@ pub struct App {
     pub mode: AppMode,
     pub new_session_state: NewSessionState,
     pub command_input: String,
+    pub command_cursor: usize,
+    pub command_result: String,
     pub should_quit: bool,
+    pub needs_redraw: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub config: Arc<Config>,
     pub pipes: Vec<Pipe>,
@@ -136,6 +144,14 @@ pub struct App {
     pub output_area: Rect,
     pub session_bar_area: Rect,
     pub session_slot_areas: Vec<Rect>,
+    pub status_row_areas: Vec<Rect>,
+    pub new_session_area: Rect,
+    pub command_bar_area: Rect,
+    pub help_area: Rect,
+    pub menu_bar_area: Rect,
+    pub menu_item_areas: Vec<Rect>,
+    pub menu_submenu_area: Rect,
+    pub menu_submenu_item_areas: Vec<Rect>,
     // Text selection
     pub selection: Option<Selection>,
     matcher: PatternMatcher,
@@ -170,14 +186,20 @@ impl PipeKey {
 
 impl App {
     pub fn new(event_tx: mpsc::Sender<AppEvent>, config: Arc<Config>) -> Self {
-        let keymap = keybindings::build_keymap(&config.keybindings);
+        let mut keymap = keybindings::build_keymap(&config.keybindings);
+        if let Some(chord) = keybindings::parse_chord(&config.general.menu_key) {
+            keymap.insert(chord, keybindings::Action::OpenMenu);
+        }
         Self {
             sessions: Vec::new(),
             active_idx: None,
             mode: AppMode::Normal,
             new_session_state: NewSessionState::default(),
             command_input: String::new(),
+            command_cursor: 0,
+            command_result: String::new(),
             should_quit: false,
+            needs_redraw: true,
             event_tx,
             config,
             pipes: Vec::new(),
@@ -185,6 +207,14 @@ impl App {
             output_area: Rect::default(),
             session_bar_area: Rect::default(),
             session_slot_areas: Vec::new(),
+            status_row_areas: Vec::new(),
+            new_session_area: Rect::default(),
+            command_bar_area: Rect::default(),
+            help_area: Rect::default(),
+            menu_bar_area: Rect::default(),
+            menu_item_areas: Vec::new(),
+            menu_submenu_area: Rect::default(),
+            menu_submenu_item_areas: Vec::new(),
             selection: None,
             matcher: PatternMatcher::new(),
             next_id: 0,
@@ -394,6 +424,12 @@ impl App {
                 let current = session.screen.screen().scrollback();
                 session.screen.set_scrollback(current.saturating_sub(lines));
             }
+        }
+    }
+
+    pub fn clear_scroll(&mut self) {
+        if let Some(session) = self.active_session_mut() {
+            session.screen.set_scrollback(0);
         }
     }
 
@@ -1105,8 +1141,39 @@ impl App {
         let col = ev.column;
         let row = ev.row;
 
+        if matches!(self.mode, AppMode::Menu { .. }) {
+            self.handle_menu_mouse(ev.kind, col, row);
+            return;
+        }
+
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                match self.mode {
+                    AppMode::Help => {
+                        if !rect_hit(self.help_area, col, row) {
+                            self.mode = AppMode::Normal;
+                        }
+                        return;
+                    }
+                    AppMode::NewSession => {
+                        self.handle_new_session_mouse(col, row);
+                        return;
+                    }
+                    AppMode::CommandBar => {
+                        if rect_hit(self.command_bar_area, col, row) {
+                            self.set_command_cursor_from_col(col);
+                        } else {
+                            self.mode = AppMode::Normal;
+                        }
+                        return;
+                    }
+                    AppMode::CommandResult => {
+                        self.mode = AppMode::Normal;
+                        return;
+                    }
+                    AppMode::Normal | AppMode::Menu { .. } => {}
+                }
+
                 // Session bar click → switch session
                 for (i, slot) in self.session_slot_areas.iter().enumerate() {
                     if rect_hit(*slot, col, row) {
@@ -1124,6 +1191,13 @@ impl App {
                         end_col: c,
                         end_row: r,
                     });
+                }
+                for (i, row_area) in self.status_row_areas.iter().enumerate() {
+                    if rect_hit(*row_area, col, row) {
+                        self.switch_to(i);
+                        self.selection = None;
+                        return;
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1153,6 +1227,113 @@ impl App {
                     self.copy_selection();
                 }
             }
+            MouseEventKind::ScrollUp => {
+                if matches!(self.mode, AppMode::NewSession) {
+                    self.new_session_select_kind(-1);
+                } else if rect_hit(self.output_area, col, row) {
+                    self.scroll_up(3);
+                } else if rect_hit(self.session_bar_area, col, row) {
+                    self.prev_session();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if matches!(self.mode, AppMode::NewSession) {
+                    self.new_session_select_kind(1);
+                } else if rect_hit(self.output_area, col, row) {
+                    self.scroll_down(3);
+                } else if rect_hit(self.session_bar_area, col, row) {
+                    self.next_session();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_new_session_mouse(&mut self, col: u16, row: u16) {
+        if !rect_hit(self.new_session_area, col, row) {
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        let inner = inset_rect(self.new_session_area, 1);
+        let types = split_horizontal(inner.x, inner.y, inner.width, 3, 4);
+        for (idx, area) in types.iter().enumerate() {
+            if rect_hit(*area, col, row) {
+                self.new_session_state.selected_kind = idx;
+                self.new_session_state.active_field = NewSessionField::Kind;
+                return;
+            }
+        }
+
+        let fields_y = inner.y + 3;
+        let name = Rect {
+            x: inner.x,
+            y: fields_y,
+            width: inner.width,
+            height: 3,
+        };
+        let cwd = Rect {
+            x: inner.x,
+            y: fields_y + 3,
+            width: inner.width,
+            height: 3,
+        };
+        let custom = Rect {
+            x: inner.x,
+            y: fields_y + 6,
+            width: inner.width,
+            height: 3,
+        };
+
+        if rect_hit(name, col, row) {
+            self.new_session_state.active_field = NewSessionField::Name;
+            self.new_session_state.name_cursor =
+                byte_index_for_col(&self.new_session_state.name, input_col(name, col));
+        } else if rect_hit(cwd, col, row) {
+            self.new_session_state.active_field = NewSessionField::Cwd;
+            self.new_session_state.cwd_cursor =
+                byte_index_for_col(&self.new_session_state.cwd, input_col(cwd, col));
+        } else if self.new_session_state.selected_kind == 3 && rect_hit(custom, col, row) {
+            self.new_session_state.active_field = NewSessionField::CustomCmd;
+            self.new_session_state.custom_cmd_cursor =
+                byte_index_for_col(&self.new_session_state.custom_cmd, input_col(custom, col));
+        }
+    }
+
+    fn handle_menu_mouse(&mut self, kind: crossterm::event::MouseEventKind, col: u16, row: u16) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                for (idx, area) in self.menu_item_areas.iter().enumerate() {
+                    if rect_hit(*area, col, row) {
+                        self.mode = AppMode::Menu {
+                            selected_top: idx,
+                            selected_sub: Some(0),
+                        };
+                        return;
+                    }
+                }
+                if let AppMode::Menu {
+                    selected_top,
+                    selected_sub: Some(_),
+                } = self.mode
+                {
+                    for (idx, area) in self.menu_submenu_item_areas.iter().enumerate() {
+                        if rect_hit(*area, col, row) {
+                            self.execute_menu_action(selected_top, idx);
+                            return;
+                        }
+                    }
+                }
+                if !rect_hit(self.menu_bar_area, col, row)
+                    && !rect_hit(self.menu_submenu_area, col, row)
+                {
+                    self.mode = AppMode::Normal;
+                }
+            }
+            MouseEventKind::ScrollUp => self.menu_move_sub(-1),
+            MouseEventKind::ScrollDown => self.menu_move_sub(1),
             _ => {}
         }
     }
@@ -1319,21 +1500,65 @@ impl App {
 
     pub fn open_command_bar(&mut self) {
         self.command_input.clear();
+        self.command_cursor = 0;
         self.mode = AppMode::CommandBar;
     }
 
     pub fn command_input_char(&mut self, c: char) {
-        self.command_input.push(c);
+        self.command_input.insert(self.command_cursor, c);
+        self.command_cursor += c.len_utf8();
     }
 
     pub fn command_backspace(&mut self) {
-        self.command_input.pop();
+        if self.command_cursor > 0 {
+            let prev = self.command_input[..self.command_cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.command_input.remove(prev);
+            self.command_cursor = prev;
+        }
+    }
+
+    pub fn command_cursor_left(&mut self) {
+        if self.command_cursor > 0 {
+            self.command_cursor = self.command_input[..self.command_cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn command_cursor_right(&mut self) {
+        if self.command_cursor < self.command_input.len() {
+            let ch = self.command_input[self.command_cursor..]
+                .chars()
+                .next()
+                .unwrap();
+            self.command_cursor += ch.len_utf8();
+        }
+    }
+
+    pub fn command_cursor_home(&mut self) {
+        self.command_cursor = 0;
+    }
+
+    pub fn command_cursor_end(&mut self) {
+        self.command_cursor = self.command_input.len();
+    }
+
+    fn set_command_cursor_from_col(&mut self, col: u16) {
+        let content_col = col.saturating_sub(self.command_bar_area.x + 2) as usize;
+        self.command_cursor = byte_index_for_col(&self.command_input, content_col);
     }
 
     pub fn execute_command(&mut self) {
         let cmd = self.command_input.trim().to_string();
         self.mode = AppMode::Normal;
         self.command_input.clear();
+        self.command_cursor = 0;
 
         // Pipe commands need the full token list; handle before the splitn block.
         let all_parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -1500,7 +1725,127 @@ impl App {
             session.write_bytes(data.to_vec());
         }
     }
+
+    pub fn open_menu(&mut self) {
+        self.mode = AppMode::Menu {
+            selected_top: 0,
+            selected_sub: None,
+        };
+    }
+
+    pub fn menu_move_top(&mut self, delta: i32) {
+        if let AppMode::Menu {
+            selected_top,
+            selected_sub,
+        } = self.mode
+        {
+            let next = ((selected_top as i32 + delta).rem_euclid(MENU.len() as i32)) as usize;
+            self.mode = AppMode::Menu {
+                selected_top: next,
+                selected_sub,
+            };
+        }
+    }
+
+    pub fn menu_move_sub(&mut self, delta: i32) {
+        if let AppMode::Menu {
+            selected_top,
+            selected_sub,
+        } = self.mode
+        {
+            let count = MENU[selected_top].1.len() as i32;
+            let cur = selected_sub.unwrap_or(0) as i32;
+            self.mode = AppMode::Menu {
+                selected_top,
+                selected_sub: Some(((cur + delta).rem_euclid(count)) as usize),
+            };
+        }
+    }
+
+    pub fn menu_open_submenu(&mut self) {
+        if let AppMode::Menu { selected_top, .. } = self.mode {
+            self.mode = AppMode::Menu {
+                selected_top,
+                selected_sub: Some(0),
+            };
+        }
+    }
+
+    pub fn menu_close_submenu(&mut self) {
+        if let AppMode::Menu { selected_top, .. } = self.mode {
+            self.mode = AppMode::Menu {
+                selected_top,
+                selected_sub: None,
+            };
+        }
+    }
+
+    pub fn execute_selected_menu_action(&mut self) {
+        if let AppMode::Menu {
+            selected_top,
+            selected_sub,
+        } = self.mode
+        {
+            self.execute_menu_action(selected_top, selected_sub.unwrap_or(0));
+        }
+    }
+
+    fn execute_menu_action(&mut self, top: usize, sub: usize) {
+        self.mode = AppMode::Normal;
+        match (top, sub) {
+            (0, 0) => self.open_new_session(),
+            (0, 1) => self.kill_active_session(),
+            (0, 2) => self.next_session(),
+            (0, 3) => self.prev_session(),
+            (1, 0) => self.scroll_up(20),
+            (1, 1) => self.scroll_down(20),
+            (1, 2) => self.clear_scroll(),
+            (2, 0) => {
+                self.command_result = if self.pipes.is_empty() {
+                    "No active pipes".into()
+                } else {
+                    self.pipes
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{} → {}  trigger={:?}  extract={:?}{}",
+                                p.source + 1,
+                                p.dest + 1,
+                                p.trigger,
+                                p.extract,
+                                p.prefix
+                                    .as_deref()
+                                    .map(|s| format!("  prefix={:?}", s))
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                self.mode = AppMode::CommandResult;
+            }
+            (2, 1) => {
+                self.command_input = "pipe ".into();
+                self.command_cursor = self.command_input.len();
+                self.mode = AppMode::CommandBar;
+            }
+            (2, 2) => {
+                self.command_input = "unpipe ".into();
+                self.command_cursor = self.command_input.len();
+                self.mode = AppMode::CommandBar;
+            }
+            (3, 0) | (3, 1) => self.mode = AppMode::Help,
+            _ => {}
+        }
+    }
 }
+
+pub const MENU: &[(&str, &[&str])] = &[
+    ("Sessions", &["New Session", "Kill Session", "Next", "Prev"]),
+    ("View", &["Scroll Up", "Scroll Down", "Clear Scroll"]),
+    ("Pipes", &["List Pipes", "Add Pipe", "Remove Pipe"]),
+    ("Help", &["Keybindings", "About"]),
+];
 
 // ── PTY runner task ────────────────────────────────────────────────────────
 
@@ -1683,6 +2028,48 @@ fn rect_inner_hit(r: Rect, col: u16, row: u16) -> bool {
         && col < r.x + r.width.saturating_sub(1)
         && row > r.y
         && row < r.y + r.height.saturating_sub(1)
+}
+
+fn inset_rect(r: Rect, amount: u16) -> Rect {
+    Rect {
+        x: r.x.saturating_add(amount),
+        y: r.y.saturating_add(amount),
+        width: r.width.saturating_sub(amount.saturating_mul(2)),
+        height: r.height.saturating_sub(amount.saturating_mul(2)),
+    }
+}
+
+fn split_horizontal(x: u16, y: u16, width: u16, height: u16, count: usize) -> Vec<Rect> {
+    let count_u16 = count.max(1) as u16;
+    let base = width / count_u16;
+    let mut areas = Vec::with_capacity(count);
+    for i in 0..count {
+        let ix = i as u16;
+        let item_x = x + ix * base;
+        let item_width = if i + 1 == count {
+            width.saturating_sub(base * ix)
+        } else {
+            base
+        };
+        areas.push(Rect {
+            x: item_x,
+            y,
+            width: item_width,
+            height,
+        });
+    }
+    areas
+}
+
+fn input_col(area: Rect, col: u16) -> usize {
+    col.saturating_sub(area.x + 1) as usize
+}
+
+fn byte_index_for_col(text: &str, col: usize) -> usize {
+    text.char_indices()
+        .nth(col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
 }
 
 /// Convert absolute terminal coords to (content_col, content_row) inside a bordered rect.

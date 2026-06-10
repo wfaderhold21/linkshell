@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, NewSessionField, Selection};
+use crate::app::{App, AppMode, NewSessionField, Selection, MENU};
 use crate::session::{SessionKind, SessionState};
 use vt100::Screen;
 
@@ -15,6 +15,14 @@ pub struct LayoutInfo {
     pub output_area: Rect,
     pub session_bar_area: Rect,
     pub session_slot_areas: Vec<Rect>,
+    pub status_row_areas: Vec<Rect>,
+    pub new_session_area: Rect,
+    pub command_bar_area: Rect,
+    pub help_area: Rect,
+    pub menu_bar_area: Rect,
+    pub menu_item_areas: Vec<Rect>,
+    pub menu_submenu_area: Rect,
+    pub menu_submenu_item_areas: Vec<Rect>,
 }
 
 /// Strip ANSI/VT escape sequences and prepare a line for safe ratatui rendering.
@@ -117,6 +125,21 @@ fn state_border_style(state: &SessionState, active: bool) -> Style {
 
 pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let size = f.size();
+    let menu_open = matches!(app.mode, AppMode::Menu { .. });
+    let mut menu_bar_area = Rect::default();
+    let mut menu_item_areas = Vec::new();
+    let mut menu_submenu_area = Rect::default();
+    let mut menu_submenu_item_areas = Vec::new();
+    let body = if menu_open {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(size);
+        menu_bar_area = split[0];
+        split[1]
+    } else {
+        size
+    };
 
     // ── Top-level vertical split ───────────────────────────────────────────
     // main output | session bar | status panel
@@ -128,17 +151,36 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             Constraint::Length(3),           // session bar
             Constraint::Length(status_rows), // status panel
         ])
-        .split(size);
+        .split(body);
 
     draw_main_output(f, app, chunks[0]);
     let slot_areas = draw_session_bar(f, app, chunks[1]);
-    draw_status_panel(f, app, chunks[2]);
+    let status_row_areas = draw_status_panel(f, app, chunks[2]);
 
     // ── Overlays ───────────────────────────────────────────────────────────
+    let mut new_session_area = Rect::default();
+    let mut command_bar_area = Rect::default();
+    let mut help_area = Rect::default();
+
     match &app.mode {
-        AppMode::NewSession => draw_new_session_dialog(f, app, size),
-        AppMode::CommandBar => draw_command_bar(f, app, size),
-        AppMode::Help => draw_help(f, size),
+        AppMode::NewSession => {
+            new_session_area = draw_new_session_dialog(f, app, size);
+        }
+        AppMode::CommandBar => {
+            command_bar_area = draw_command_bar(f, app, size);
+        }
+        AppMode::CommandResult => {
+            draw_command_result(f, app, size);
+        }
+        AppMode::Help => {
+            help_area = draw_help(f, size);
+        }
+        AppMode::Menu { .. } => {
+            let menu = draw_menu_bar(f, app, menu_bar_area);
+            menu_item_areas = menu.0;
+            menu_submenu_area = menu.1;
+            menu_submenu_item_areas = menu.2;
+        }
         AppMode::Normal => {}
     }
 
@@ -146,6 +188,14 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         output_area: chunks[0],
         session_bar_area: chunks[1],
         session_slot_areas: slot_areas,
+        status_row_areas,
+        new_session_area,
+        command_bar_area,
+        help_area,
+        menu_bar_area,
+        menu_item_areas,
+        menu_submenu_area,
+        menu_submenu_item_areas,
     }
 }
 
@@ -291,7 +341,7 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
 // ── Status panel ───────────────────────────────────────────────────────────
 
-fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let block = Block::default()
         .title(" Status ")
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
@@ -330,6 +380,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(Line::from(header_spans)), header_row);
     }
 
+    let mut row_areas = Vec::new();
     for (i, session) in app.sessions.iter().enumerate() {
         if i + 2 >= inner.height as usize {
             break;
@@ -341,6 +392,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
             width: inner.width,
             height: 1,
         };
+        row_areas.push(row);
 
         let num_style = Style::default()
             .fg(Color::White)
@@ -446,11 +498,13 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
         ]));
         f.render_widget(footer, footer_row);
     }
+
+    row_areas
 }
 
 // ── New session dialog ─────────────────────────────────────────────────────
 
-pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) {
+pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let ns = &app.new_session_state;
     let height = if ns.selected_kind == 3 { 16 } else { 13 };
     let popup = centered_rect(50, height, area);
@@ -558,6 +612,8 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) {
             height: 1,
         },
     );
+
+    popup
 }
 
 fn draw_input_field(
@@ -605,7 +661,7 @@ fn draw_input_field(
 
 // ── Help overlay ───────────────────────────────────────────────────────────
 
-fn draw_help(f: &mut Frame<'_>, area: Rect) {
+fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
     const BINDINGS: &[(&str, &str)] = &[
         ("alt-n", "New session dialog"),
         ("alt-tab", "Next session"),
@@ -615,6 +671,7 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) {
         ("alt-x", "Kill active session"),
         ("alt-c", "Open command bar"),
         ("alt-h", "Show this help"),
+        ("ctrl-space", "Toggle menu bar"),
         ("ctrl-q", "Quit"),
         ("esc", "Dismiss overlay"),
     ];
@@ -661,11 +718,13 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) {
             height: 1,
         },
     );
+
+    popup
 }
 
 // ── Command bar ────────────────────────────────────────────────────────────
 
-fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let bar = Rect {
         x: area.x,
         y: area.y + area.height - 1,
@@ -673,9 +732,118 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         height: 1,
     };
     f.render_widget(Clear, bar);
-    let text = format!("> {}█", app.command_input);
-    let p = Paragraph::new(text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    let pos = app.command_cursor.min(app.command_input.len());
+    let (before, after) = app.command_input.split_at(pos);
+    let line = Line::from(vec![
+        Span::raw("> "),
+        Span::raw(before.to_string()),
+        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::White)),
+        Span::raw(after.to_string()),
+    ]);
+    let p = Paragraph::new(line).style(Style::default().fg(Color::White).bg(Color::DarkGray));
     f.render_widget(p, bar);
+    bar
+}
+
+fn draw_command_result(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let bar = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(Clear, bar);
+    let line = Line::from(vec![
+        Span::styled("Pipes: ", Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+        Span::raw(app.command_result.clone()),
+        Span::styled("  [any key to close]", Style::default().fg(Color::DarkGray).bg(Color::DarkGray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+        bar,
+    );
+}
+
+fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, Vec<Rect>) {
+    let (selected_top, selected_sub) = match app.mode {
+        AppMode::Menu {
+            selected_top,
+            selected_sub,
+        } => (selected_top, selected_sub),
+        _ => return (Vec::new(), Rect::default(), Vec::new()),
+    };
+
+    let mut spans = Vec::new();
+    let mut item_areas = Vec::new();
+    let mut x = area.x;
+    for (idx, (label, _)) in MENU.iter().enumerate() {
+        let text = format!(" {} ", label);
+        let width = text.len() as u16;
+        item_areas.push(Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        });
+        x = x.saturating_add(width);
+        let style = if idx == selected_top {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(text, style));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray)),
+        area,
+    );
+
+    let Some(sub_idx) = selected_sub else {
+        return (item_areas, Rect::default(), Vec::new());
+    };
+
+    let entries = MENU[selected_top].1;
+    let width = entries.iter().map(|s| s.len()).max().unwrap_or(0) as u16 + 4;
+    let x = item_areas
+        .get(selected_top)
+        .map(|r| r.x)
+        .unwrap_or(area.x)
+        .min(area.x + area.width.saturating_sub(width));
+    let popup = Rect {
+        x,
+        y: area.y + 1,
+        width,
+        height: entries.len() as u16 + 2,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let rows: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, label)| {
+            let style = if idx == sub_idx {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(format!(" {}", label), style)))
+        })
+        .collect();
+    f.render_widget(List::new(rows), inner);
+
+    let item_rows = (0..entries.len())
+        .map(|i| Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        })
+        .collect();
+
+    (item_areas, popup, item_rows)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -865,5 +1033,4 @@ mod tests {
             }
         );
     }
-
 }
