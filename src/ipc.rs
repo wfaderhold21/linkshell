@@ -320,6 +320,66 @@ async fn dispatch(
         .or(registered_id);
 
     match msg["type"].as_str() {
+        Some("agent_send") => {
+            let dest = match msg["dest"].as_str() {
+                Some(dest) if !dest.is_empty() => dest.to_string(),
+                _ => {
+                    if msg["wait"].as_bool().unwrap_or(false) {
+                        let err = serde_json::json!({"error": "agent_send requires dest"});
+                        let _ = writer
+                            .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                            .await;
+                    } else {
+                        eprintln!("agent_send dropped: missing dest");
+                    }
+                    return;
+                }
+            };
+            let message = match msg["message"].as_str() {
+                Some(message) => message.to_string(),
+                None => {
+                    if msg["wait"].as_bool().unwrap_or(false) {
+                        let err = serde_json::json!({"error": "agent_send requires message"});
+                        let _ = writer
+                            .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                            .await;
+                    } else {
+                        eprintln!("agent_send dropped: missing message");
+                    }
+                    return;
+                }
+            };
+            let wait = msg["wait"].as_bool().unwrap_or(false);
+            let (reply_tx, reply_rx) = if wait {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            let _ = tx
+                .send(AppEvent::AgentDirectMessage {
+                    from_session_id: registered_id,
+                    dest_name: dest,
+                    message,
+                    reply_tx,
+                })
+                .await;
+            if let Some(rx) = reply_rx {
+                match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                    Ok(Ok(response)) => {
+                        let _ = writer
+                            .send(serde_json::to_string(&response).unwrap_or_default() + "\n")
+                            .await;
+                    }
+                    _ => {
+                        let err = serde_json::json!({"error": "agent_send timeout"});
+                        let _ = writer
+                            .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                            .await;
+                    }
+                }
+            }
+        }
         Some("state") => {
             let sid = match target_id {
                 Some(s) => s,
@@ -648,6 +708,40 @@ mod tests {
             AppEvent::IpcPipeAdd { source: 1, dest: 2, trigger, extract, prefix }
                 if trigger == "manual" && extract == "diff" && prefix.as_deref() == Some("p")
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_agent_send_with_registered_sender_and_reply_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (writer, mut writer_rx) = mpsc::channel(1);
+        let msg = serde_json::json!({
+            "type": "agent_send",
+            "dest": "reviewer",
+            "message": "please review",
+            "wait": true,
+        });
+        let handle = tokio::spawn(async move {
+            dispatch(&msg, &tx, Some(7), &writer).await;
+        });
+
+        match rx.recv().await.unwrap() {
+            AppEvent::AgentDirectMessage {
+                from_session_id,
+                dest_name,
+                message,
+                reply_tx,
+            } => {
+                assert_eq!(from_session_id, Some(7));
+                assert_eq!(dest_name, "reviewer");
+                assert_eq!(message, "please review");
+                let _ = reply_tx
+                    .expect("wait=true should provide reply_tx")
+                    .send(serde_json::json!({"ok": true}));
+            }
+            _ => panic!("expected agent direct message"),
+        }
+        handle.await.unwrap();
+        assert_eq!(writer_rx.recv().await.unwrap(), "{\"ok\":true}\n");
     }
 
     #[tokio::test]

@@ -178,6 +178,14 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::PipeRelay { dest_id, message } => {
             app.handle_pipe_relay(dest_id, message);
         }
+        AppEvent::AgentDirectMessage {
+            from_session_id,
+            dest_name,
+            message,
+            reply_tx,
+        } => {
+            app.handle_agent_direct_message(from_session_id, &dest_name, &message, reply_tx);
+        }
         AppEvent::IpcFirePipe { source, dest } => {
             app.fire_manual_pipes(source, dest);
         }

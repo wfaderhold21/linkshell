@@ -230,6 +230,13 @@ impl Session {
             let _ = tx.try_send(data);
         }
     }
+
+    pub fn try_write_bytes(&self, data: Vec<u8>) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+        match &self.pty_writer {
+            Some(tx) => tx.try_send(data),
+            None => Err(mpsc::error::TrySendError::Closed(data)),
+        }
+    }
 }
 
 #[cfg(test)]

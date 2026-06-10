@@ -149,6 +149,32 @@ fn main() {
             send_only(&sock, &msg);
         }
 
+        Some("send") => {
+            let wait = args.get(2).map(|s| s.as_str()) == Some("--wait");
+            let dest_idx = if wait { 3 } else { 2 };
+            let dest = args.get(dest_idx).unwrap_or_else(|| {
+                eprintln!("usage: linkshell-ctl send [--wait] <dest_name> <message...>");
+                std::process::exit(1);
+            });
+            if args.len() <= dest_idx + 1 {
+                eprintln!("usage: linkshell-ctl send [--wait] <dest_name> <message...>");
+                std::process::exit(1);
+            }
+            let message = args[dest_idx + 1..].join(" ");
+            let mut msg = serde_json::json!({
+                "type": "agent_send",
+                "dest": dest,
+                "message": message,
+            });
+            if wait {
+                msg["wait"] = true.into();
+                let resp = send_and_recv(&sock, &msg, Duration::from_secs(5));
+                println!("{}", resp);
+            } else {
+                send_only(&sock, &msg);
+            }
+        }
+
         _ => usage(),
     }
 }
@@ -221,6 +247,7 @@ fn usage() -> ! {
     eprintln!("  linkshell-ctl wait-ready <session_id> [--timeout=<secs>]");
     eprintln!("  linkshell-ctl state <READY|THINKING|RUNNING|WAITING|ERROR>");
     eprintln!("  linkshell-ctl output <text...>");
+    eprintln!("  linkshell-ctl send [--wait] <dest_name> <message...>");
     eprintln!("  linkshell-ctl pipe list");
     eprintln!("  linkshell-ctl pipe add <src> <dst> [--extract=X] [--trigger=X] [--prefix=X]");
     eprintln!("  linkshell-ctl pipe remove <src> [dst]");

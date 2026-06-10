@@ -781,6 +781,91 @@ impl App {
         }
     }
 
+    pub fn handle_agent_direct_message(
+        &self,
+        from_session_id: Option<usize>,
+        dest_name: &str,
+        message: &str,
+        reply_tx: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
+    ) {
+        let from_name = from_session_id
+            .and_then(|id| self.sessions.iter().find(|s| s.id == id))
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "linkshell-ctl".to_string());
+
+        let Some(dest) = self.sessions.iter().find(|s| s.name == dest_name) else {
+            if let Some(tx) = reply_tx {
+                let _ = tx.send(serde_json::json!({
+                    "error": format!("unknown agent: {}", dest_name),
+                }));
+            }
+            return;
+        };
+
+        if dest.headless {
+            let Some(agent_tx) = self.agent_writers.get(&dest.id) else {
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(serde_json::json!({
+                        "error": format!("agent {} is not connected", dest_name),
+                    }));
+                }
+                return;
+            };
+
+            let envelope = serde_json::json!({
+                "type": "agent_message",
+                "from": from_name,
+                "message": message,
+            });
+            let line = serde_json::to_string(&envelope).unwrap_or_default() + "\n";
+            match agent_tx.try_send(line) {
+                Ok(()) => {
+                    if let Some(tx) = reply_tx {
+                        let _ = tx.send(serde_json::json!({"ok": true}));
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if let Some(tx) = reply_tx {
+                        let _ = tx.send(serde_json::json!({
+                            "error": format!("agent {} channel full — retry", dest_name),
+                        }));
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    if let Some(tx) = reply_tx {
+                        let _ = tx.send(serde_json::json!({
+                            "error": format!("agent {} is disconnected", dest_name),
+                        }));
+                    }
+                }
+            }
+            return;
+        }
+
+        let input = format!("{}\n", message).into_bytes();
+        match dest.try_write_bytes(input) {
+            Ok(()) => {
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(serde_json::json!({"ok": true}));
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(serde_json::json!({
+                        "error": format!("session {} channel full — retry", dest_name),
+                    }));
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(serde_json::json!({
+                        "error": format!("session {} is disconnected", dest_name),
+                    }));
+                }
+            }
+        }
+    }
+
     pub fn handle_session_died(&mut self, session_id: usize) {
         if let Some((resp_tx, _)) = self.pending_ipc_replies.remove(&session_id) {
             let _ = resp_tx.send(serde_json::json!({
@@ -2018,6 +2103,61 @@ mod tests {
         assert_eq!(a_rx.try_recv().unwrap(), "{\"type\":\"ping\"}\n");
         assert_eq!(b_rx.try_recv().unwrap(), "{\"type\":\"direct\"}\n");
         assert!(a_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_direct_message_writes_envelope_to_connected_headless_dest() {
+        let mut app = make_app();
+        let sender = app.spawn_headless_session("sender".into(), None).unwrap();
+        let dest = app.spawn_headless_session("dest".into(), None).unwrap();
+        let (dest_tx, mut dest_rx) = mpsc::channel(1);
+        app.handle_ipc_agent_connected(dest, dest_tx);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        app.handle_agent_direct_message(Some(sender), "dest", "hello", Some(reply_tx));
+
+        assert_eq!(reply_rx.await.unwrap(), serde_json::json!({"ok": true}));
+        let line = dest_rx.try_recv().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(envelope["type"], "agent_message");
+        assert_eq!(envelope["from"], "sender");
+        assert_eq!(envelope["message"], "hello");
+    }
+
+    #[tokio::test]
+    async fn agent_direct_message_reports_unknown_and_disconnected_dests() {
+        let mut app = make_app();
+        let _ = app.spawn_headless_session("dest".into(), None).unwrap();
+
+        let (unknown_tx, unknown_rx) = tokio::sync::oneshot::channel();
+        app.handle_agent_direct_message(None, "missing", "hello", Some(unknown_tx));
+        assert_eq!(
+            unknown_rx.await.unwrap(),
+            serde_json::json!({"error": "unknown agent: missing"})
+        );
+
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        app.handle_agent_direct_message(None, "dest", "hello", Some(closed_tx));
+        assert_eq!(
+            closed_rx.await.unwrap(),
+            serde_json::json!({"error": "agent dest is not connected"})
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_direct_message_writes_raw_text_to_pty_dest() {
+        let mut app = make_app();
+        let dest = app.spawn_headless_session("terminal".into(), None).unwrap();
+        app.sessions[0].headless = false;
+        let (pty_tx, mut pty_rx) = mpsc::channel(1);
+        app.sessions[0].pty_writer = Some(pty_tx);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        app.handle_agent_direct_message(None, "terminal", "run this", Some(reply_tx));
+
+        assert_eq!(dest, 0);
+        assert_eq!(reply_rx.await.unwrap(), serde_json::json!({"ok": true}));
+        assert_eq!(pty_rx.try_recv().unwrap(), b"run this\n".to_vec());
     }
 
     #[tokio::test]
