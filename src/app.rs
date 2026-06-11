@@ -1,5 +1,6 @@
 use ratatui::layout::Rect;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -116,6 +117,7 @@ impl Default for NewSessionState {
 pub enum AppMode {
     Normal,
     NewSession,
+    FileBrowser,
     CommandBar,
     CommandResult,
     Help,
@@ -123,6 +125,57 @@ pub enum AppMode {
         selected_top: usize,
         selected_sub: Option<usize>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct FileBrowserState {
+    pub current_dir: PathBuf,
+    pub entries: Vec<PathBuf>,
+    pub selected: usize,
+    pub scroll_offset: usize,
+}
+
+impl FileBrowserState {
+    pub fn new(start: &str) -> Self {
+        let current_dir = PathBuf::from(start)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let mut state = Self {
+            current_dir,
+            entries: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+        };
+        state.refresh();
+        state
+    }
+
+    pub fn refresh(&mut self) {
+        self.entries.clear();
+        if let Some(parent) = self.current_dir.parent() {
+            self.entries.push(parent.to_path_buf());
+        }
+        if let Ok(rd) = std::fs::read_dir(&self.current_dir) {
+            let mut dirs: Vec<PathBuf> = rd
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect();
+            dirs.sort();
+            self.entries.extend(dirs);
+        }
+    }
+
+    pub fn entry_label(&self, idx: usize) -> String {
+        let path = &self.entries[idx];
+        if Some(path.as_path()) == self.current_dir.parent() {
+            format!(".. ({})", path.display())
+        } else {
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string())
+        }
+    }
 }
 
 pub struct App {
@@ -146,6 +199,9 @@ pub struct App {
     pub session_slot_areas: Vec<Rect>,
     pub status_row_areas: Vec<Rect>,
     pub new_session_area: Rect,
+    pub browse_button_area: Rect,
+    pub file_browser_area: Rect,
+    pub file_browser_state: FileBrowserState,
     pub command_bar_area: Rect,
     pub help_area: Rect,
     pub menu_bar_area: Rect,
@@ -209,6 +265,9 @@ impl App {
             session_slot_areas: Vec::new(),
             status_row_areas: Vec::new(),
             new_session_area: Rect::default(),
+            browse_button_area: Rect::default(),
+            file_browser_area: Rect::default(),
+            file_browser_state: FileBrowserState::new("."),
             command_bar_area: Rect::default(),
             help_area: Rect::default(),
             menu_bar_area: Rect::default(),
@@ -1141,6 +1200,8 @@ impl App {
         let col = ev.column;
         let row = ev.row;
 
+        let _ = std::fs::write("/tmp/fb_mouse.txt", format!("mouse kind={:?} col={col} row={row} mode={:?}\n", ev.kind, self.mode));
+
         if matches!(self.mode, AppMode::Menu { .. }) {
             self.handle_menu_mouse(ev.kind, col, row);
             return;
@@ -1157,6 +1218,10 @@ impl App {
                     }
                     AppMode::NewSession => {
                         self.handle_new_session_mouse(col, row);
+                        return;
+                    }
+                    AppMode::FileBrowser => {
+                        self.handle_file_browser_mouse(col, row, crate::ui::FILE_BROWSER_VISIBLE_ROWS);
                         return;
                     }
                     AppMode::CommandBar => {
@@ -1285,10 +1350,16 @@ impl App {
             height: 3,
         };
 
+        let _ = std::fs::write("/tmp/fb_debug.txt", format!(
+            "mouse col={col} row={row}\nbrowse_area={:?}\ncwd_area={:?}\nnew_session_area={:?}\n",
+            self.browse_button_area, cwd, self.new_session_area
+        ));
         if rect_hit(name, col, row) {
             self.new_session_state.active_field = NewSessionField::Name;
             self.new_session_state.name_cursor =
                 byte_index_for_col(&self.new_session_state.name, input_col(name, col));
+        } else if rect_hit(self.browse_button_area, col, row) {
+            self.open_file_browser();
         } else if rect_hit(cwd, col, row) {
             self.new_session_state.active_field = NewSessionField::Cwd;
             self.new_session_state.cwd_cursor =
@@ -1494,6 +1565,87 @@ impl App {
         self.spawn_session(kind, ns.name, cwd)?;
         self.mode = AppMode::Normal;
         Ok(())
+    }
+
+    // ── File browser ───────────────────────────────────────────────────────
+
+    pub fn open_file_browser(&mut self) {
+        let start = if self.new_session_state.cwd.is_empty() {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        } else {
+            self.new_session_state.cwd.clone()
+        };
+        let _ = std::fs::write("/tmp/fb_debug.txt", format!("open: start={start:?}\n"));
+        self.file_browser_state = FileBrowserState::new(&start);
+        self.mode = AppMode::FileBrowser;
+    }
+
+    pub fn file_browser_up(&mut self) {
+        if self.file_browser_state.selected > 0 {
+            self.file_browser_state.selected -= 1;
+            if self.file_browser_state.selected < self.file_browser_state.scroll_offset {
+                self.file_browser_state.scroll_offset = self.file_browser_state.selected;
+            }
+        }
+    }
+
+    pub fn file_browser_down(&mut self, visible_rows: usize) {
+        let max = self.file_browser_state.entries.len().saturating_sub(1);
+        if self.file_browser_state.selected < max {
+            self.file_browser_state.selected += 1;
+            let bottom = self.file_browser_state.scroll_offset + visible_rows;
+            if self.file_browser_state.selected >= bottom {
+                self.file_browser_state.scroll_offset =
+                    self.file_browser_state.selected + 1 - visible_rows;
+            }
+        }
+    }
+
+    pub fn file_browser_enter(&mut self) {
+        let sel = self.file_browser_state.selected;
+        if sel >= self.file_browser_state.entries.len() {
+            return;
+        }
+        let path = self.file_browser_state.entries[sel].clone();
+        if path.is_dir() {
+            self.file_browser_state.current_dir = path;
+            self.file_browser_state.selected = 0;
+            self.file_browser_state.scroll_offset = 0;
+            self.file_browser_state.refresh();
+        }
+    }
+
+    pub fn file_browser_select(&mut self) {
+        let s = self.file_browser_state.current_dir.to_string_lossy().to_string();
+        let _ = std::fs::write("/tmp/fb_debug.txt", format!("select: current_dir={s:?}\ncwd_before={:?}\n", self.new_session_state.cwd));
+        self.new_session_state.cwd = s.clone();
+        self.new_session_state.cwd_cursor = s.len();
+        self.new_session_state.active_field = NewSessionField::Cwd;
+        self.mode = AppMode::NewSession;
+    }
+
+    pub fn file_browser_cancel(&mut self) {
+        let _ = std::fs::write("/tmp/fb_debug.txt", format!("cancel called: current_dir={:?}\n", self.file_browser_state.current_dir));
+        self.mode = AppMode::NewSession;
+    }
+
+    pub fn handle_file_browser_mouse(&mut self, col: u16, row: u16, list_visible: usize) {
+        if !rect_hit(self.file_browser_area, col, row) {
+            self.file_browser_cancel();
+            return;
+        }
+        // inner area starts 2 rows below top border (border + current-dir line)
+        let inner_y = self.file_browser_area.y + 3;
+        if row < inner_y {
+            return;
+        }
+        let idx = (row - inner_y) as usize + self.file_browser_state.scroll_offset;
+        if idx < self.file_browser_state.entries.len() {
+            self.file_browser_state.selected = idx;
+        }
+        let _ = list_visible;
     }
 
     // ── Command bar ────────────────────────────────────────────────────────

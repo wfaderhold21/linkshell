@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, NewSessionField, Selection, MENU};
+use crate::app::{App, AppMode, FileBrowserState, NewSessionField, Selection, MENU};
 use crate::session::{SessionKind, SessionState};
 use vt100::Screen;
 
@@ -17,6 +17,8 @@ pub struct LayoutInfo {
     pub session_slot_areas: Vec<Rect>,
     pub status_row_areas: Vec<Rect>,
     pub new_session_area: Rect,
+    pub browse_button_area: Rect,
+    pub file_browser_area: Rect,
     pub command_bar_area: Rect,
     pub help_area: Rect,
     pub menu_bar_area: Rect,
@@ -159,12 +161,22 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 
     // ── Overlays ───────────────────────────────────────────────────────────
     let mut new_session_area = Rect::default();
+    let mut browse_button_area = Rect::default();
+    let mut file_browser_area = Rect::default();
     let mut command_bar_area = Rect::default();
     let mut help_area = Rect::default();
 
     match &app.mode {
         AppMode::NewSession => {
-            new_session_area = draw_new_session_dialog(f, app, size);
+            let ns_result = draw_new_session_dialog(f, app, size);
+            new_session_area = ns_result.0;
+            browse_button_area = ns_result.1;
+        }
+        AppMode::FileBrowser => {
+            let ns_result = draw_new_session_dialog(f, app, size);
+            new_session_area = ns_result.0;
+            browse_button_area = ns_result.1;
+            file_browser_area = draw_file_browser(f, &app.file_browser_state, size);
         }
         AppMode::CommandBar => {
             command_bar_area = draw_command_bar(f, app, size);
@@ -190,6 +202,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         session_slot_areas: slot_areas,
         status_row_areas,
         new_session_area,
+        browse_button_area,
+        file_browser_area,
         command_bar_area,
         help_area,
         menu_bar_area,
@@ -504,7 +518,8 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
 // ── New session dialog ─────────────────────────────────────────────────────
 
-pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+/// Returns (popup_rect, browse_button_rect).
+pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rect, Rect) {
     let ns = &app.new_session_state;
     let height = if ns.selected_kind == 3 { 16 } else { 13 };
     let popup = centered_rect(50, height, area);
@@ -567,7 +582,9 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect
         ns.active_field == NewSessionField::Name,
     );
 
-    // CWD field
+    // CWD field — input shrunk to leave room for [Browse] button
+    const BROWSE_BTN_W: u16 = 10;
+    let cwd_input_w = inner.width.saturating_sub(BROWSE_BTN_W);
     draw_input_field(
         f,
         "CWD",
@@ -576,11 +593,25 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect
         Rect {
             x: inner.x,
             y: fields_y + 3,
-            width: inner.width,
+            width: cwd_input_w,
             height: 3,
         },
         ns.active_field == NewSessionField::Cwd,
     );
+
+    // [Browse] button
+    let browse_area = Rect {
+        x: inner.x + cwd_input_w,
+        y: fields_y + 3,
+        width: BROWSE_BTN_W,
+        height: 3,
+    };
+    let browse_style = Style::default().fg(Color::Cyan);
+    let browse_block = Block::default().borders(Borders::ALL).border_style(browse_style);
+    let browse_btn = Paragraph::new("Browse")
+        .block(browse_block)
+        .alignment(Alignment::Center);
+    f.render_widget(browse_btn, browse_area);
 
     // Custom cmd field (only when Custom selected)
     if ns.selected_kind == 3 {
@@ -600,11 +631,86 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect
     }
 
     // Footer hint
-    let hint = Paragraph::new(" Tab: next field  Enter: create  Esc: cancel ")
+    let hint = Paragraph::new(" Tab: next field  Alt+B: browse  Enter: create  Esc: cancel ")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     f.render_widget(
         hint,
+        Rect {
+            x: inner.x,
+            y: popup.y + popup.height - 2,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    (popup, browse_area)
+}
+
+// ── File browser overlay ───────────────────────────────────────────────────
+
+pub const FILE_BROWSER_VISIBLE_ROWS: usize = 16;
+
+pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect) -> Rect {
+    const VISIBLE_ROWS: u16 = FILE_BROWSER_VISIBLE_ROWS as u16;
+    let popup = centered_rect(60, VISIBLE_ROWS + 6, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Browse Directory ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Current path line
+    let path_str = state.current_dir.to_string_lossy();
+    let path_line = Paragraph::new(path_str.as_ref())
+        .style(Style::default().fg(Color::Yellow));
+    f.render_widget(
+        path_line,
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+    );
+
+    // Separator
+    let sep = Paragraph::new("─".repeat(inner.width as usize))
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(
+        sep,
+        Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: 1 },
+    );
+
+    // Directory list
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: VISIBLE_ROWS,
+    };
+
+    let scroll = state.scroll_offset;
+    let visible = VISIBLE_ROWS as usize;
+    let items: Vec<ListItem> = (scroll..state.entries.len().min(scroll + visible))
+        .map(|i| {
+            let label = state.entry_label(i);
+            let style = if i == state.selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(format!(" {label}")).style(style)
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, list_area);
+
+    // Footer
+    let footer = Paragraph::new(" ↑↓: navigate  Enter: open dir  Space: select current  Esc: cancel ")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(
+        footer,
         Rect {
             x: inner.x,
             y: popup.y + popup.height - 2,
