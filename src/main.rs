@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use app::{App, AppMode, NewSessionField};
+use ui::FILE_BROWSER_VISIBLE_ROWS;
 use events::AppEvent;
 use keybindings::Action;
 
@@ -117,6 +118,8 @@ async fn main() -> anyhow::Result<()> {
             app.session_slot_areas = layout.session_slot_areas;
             app.status_row_areas = layout.status_row_areas;
             app.new_session_area = layout.new_session_area;
+            app.browse_button_area = layout.browse_button_area;
+            app.file_browser_area = layout.file_browser_area;
             app.command_bar_area = layout.command_bar_area;
             app.help_area = layout.help_area;
             app.menu_bar_area = layout.menu_bar_area;
@@ -310,6 +313,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Tab => {
                 app.new_session_tab();
             }
+            KeyCode::Char('b')
+                if key.modifiers == crossterm::event::KeyModifiers::ALT
+                    && app.new_session_state.active_field == NewSessionField::Cwd =>
+            {
+                app.open_file_browser();
+            }
             KeyCode::Enter => {
                 let _ = app.confirm_new_session();
             }
@@ -351,6 +360,25 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Char(c) => {
                 app.new_session_input(c);
+            }
+            _ => {}
+        },
+
+        AppMode::FileBrowser => match key.code {
+            KeyCode::Esc => {
+                app.file_browser_cancel();
+            }
+            KeyCode::Up => {
+                app.file_browser_up();
+            }
+            KeyCode::Down => {
+                app.file_browser_down(FILE_BROWSER_VISIBLE_ROWS);
+            }
+            KeyCode::Enter => {
+                app.file_browser_enter();
+            }
+            KeyCode::Char(' ') => {
+                app.file_browser_select();
             }
             _ => {}
         },
