@@ -364,10 +364,10 @@ impl App {
         let cfg = Arc::clone(&self.config);
         let socket = crate::ipc::socket_path(&self.config);
 
-        if matches!(kind, SessionKind::Claude) {
+        if kind.is_claude_based() {
             crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
         }
-        if matches!(kind, SessionKind::Codex) {
+        if kind.is_codex_based() {
             crate::codex_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
         }
 
@@ -568,7 +568,7 @@ impl App {
                 }
             }
             // Claude and Codex stats come from their JSONL watchers; skip terminal scraping.
-            if matches!(session.kind, SessionKind::Shell | SessionKind::Custom(_)) {
+            if !session.kind.is_claude_based() && !session.kind.is_codex_based() {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
                 }
