@@ -17,13 +17,13 @@ fn encode_cwd(cwd: &str) -> String {
 }
 
 fn project_dir(cwd: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join(".claude")
-            .join("projects")
-            .join(encode_cwd(cwd)),
-    )
+    // Claude CLI writes logs to $CLAUDE_CONFIG_DIR/projects/ when that env var is
+    // set, otherwise to $HOME/.claude/projects/.
+    let config_base = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".claude")))
+        .ok()?;
+    Some(config_base.join("projects").join(encode_cwd(cwd)))
 }
 
 fn jsonl_files(dir: &Path) -> HashSet<PathBuf> {
