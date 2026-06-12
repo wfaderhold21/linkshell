@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -44,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )
     .is_ok();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -72,6 +73,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(Event::Mouse(mouse)) => {
                         if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::Paste(text)) => {
+                        if key_tx.send(AppEvent::Paste(text)).await.is_err() {
                             break;
                         }
                     }
@@ -169,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 
@@ -275,8 +282,38 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
+        AppEvent::Paste(text) => handle_paste(app, text),
     }
     app.needs_redraw = true;
+}
+
+fn handle_paste(app: &mut App, text: String) {
+    match app.mode {
+        AppMode::Normal => {
+            // Forward to PTY wrapped in bracketed paste sequences so the inner
+            // program can distinguish pasted text from typed input.
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            app.write_to_active(&bytes);
+        }
+        AppMode::CommandBar => {
+            for c in text.chars() {
+                if !c.is_control() {
+                    app.command_input_char(c);
+                }
+            }
+        }
+        AppMode::NewSession => {
+            for c in text.chars() {
+                if !c.is_control() {
+                    app.new_session_input(c);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {

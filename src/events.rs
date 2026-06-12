@@ -115,6 +115,7 @@ pub enum AppEvent {
         source: usize,
         dest: Option<usize>,
     },
+    Paste(String),
     Tick,
 }
 
