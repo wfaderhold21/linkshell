@@ -55,6 +55,14 @@ fn write_last_socket(path: &str) {
     let _ = std::fs::write(config_dir.join("last_socket"), path);
 }
 
+pub fn cleanup(config: &Config) {
+    let path = socket_path(config);
+    let _ = std::fs::remove_file(&path);
+    if let Some(config_dir) = linkshell_config_dir() {
+        let _ = std::fs::remove_file(config_dir.join("last_socket"));
+    }
+}
+
 fn linkshell_config_dir() -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(std::path::PathBuf::from(path).join("linkshell"));
