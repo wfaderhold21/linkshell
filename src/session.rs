@@ -34,6 +34,23 @@ impl SessionKind {
             SessionKind::Custom(c) => c.clone(),
         }
     }
+
+    pub fn is_claude_based(&self) -> bool {
+        matches!(self, SessionKind::Claude) || self.custom_base_name() == Some("claude")
+    }
+
+    pub fn is_codex_based(&self) -> bool {
+        matches!(self, SessionKind::Codex) || self.custom_base_name() == Some("codex")
+    }
+
+    fn custom_base_name(&self) -> Option<&str> {
+        if let SessionKind::Custom(cmd) = self {
+            let first = cmd.split_whitespace().next()?;
+            std::path::Path::new(first).file_name()?.to_str()
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
