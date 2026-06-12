@@ -1203,8 +1203,6 @@ impl App {
         let col = ev.column;
         let row = ev.row;
 
-        let _ = std::fs::write("/tmp/fb_mouse.txt", format!("mouse kind={:?} col={col} row={row} mode={:?}\n", ev.kind, self.mode));
-
         if matches!(self.mode, AppMode::Menu { .. }) {
             self.handle_menu_mouse(ev.kind, col, row);
             return;
@@ -1353,10 +1351,6 @@ impl App {
             height: 3,
         };
 
-        let _ = std::fs::write("/tmp/fb_debug.txt", format!(
-            "mouse col={col} row={row}\nbrowse_area={:?}\ncwd_area={:?}\nnew_session_area={:?}\n",
-            self.browse_button_area, cwd, self.new_session_area
-        ));
         if rect_hit(name, col, row) {
             self.new_session_state.active_field = NewSessionField::Name;
             self.new_session_state.name_cursor =
@@ -1580,7 +1574,6 @@ impl App {
         } else {
             self.new_session_state.cwd.clone()
         };
-        let _ = std::fs::write("/tmp/fb_debug.txt", format!("open: start={start:?}\n"));
         self.file_browser_state = FileBrowserState::new(&start);
         self.mode = AppMode::FileBrowser;
     }
@@ -1622,7 +1615,6 @@ impl App {
 
     pub fn file_browser_select(&mut self) {
         let s = self.file_browser_state.current_dir.to_string_lossy().to_string();
-        let _ = std::fs::write("/tmp/fb_debug.txt", format!("select: current_dir={s:?}\ncwd_before={:?}\n", self.new_session_state.cwd));
         self.new_session_state.cwd = s.clone();
         self.new_session_state.cwd_cursor = s.len();
         self.new_session_state.active_field = NewSessionField::Cwd;
@@ -1630,7 +1622,6 @@ impl App {
     }
 
     pub fn file_browser_cancel(&mut self) {
-        let _ = std::fs::write("/tmp/fb_debug.txt", format!("cancel called: current_dir={:?}\n", self.file_browser_state.current_dir));
         self.mode = AppMode::NewSession;
     }
 
