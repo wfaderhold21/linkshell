@@ -163,11 +163,21 @@ async fn tail(
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(n) => {
-                            offset += n as u64;
-                            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                            // If the line has no trailing newline we hit EOF mid-write.
+                            // Don't advance offset; retry the partial bytes next poll.
+                            if !line.ends_with('\n') {
+                                break;
+                            }
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                offset += n as u64;
+                                continue;
+                            }
+                            let v: serde_json::Value = match serde_json::from_str(trimmed) {
                                 Ok(v) => v,
-                                Err(_) => continue,
+                                Err(_) => break,
                             };
+                            offset += n as u64;
                             if let Some(stats) = parse_token_count(&v, &model, config) {
                                 if tx
                                     .send(AppEvent::SessionStats { session_id, stats })

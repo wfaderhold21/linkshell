@@ -44,12 +44,22 @@ impl PatternMatcher {
             cost_re: Regex::new(r"~?\$\s*(\d+(?:\.\d+)?)").unwrap(),
             // "12,345 input" | "input: 12,345" | "12.3k in" | "in: 12k"
             tokens_in_re: Regex::new(
-                r"(?i)(\d[\d,]*(?:\.\d+)?)\s*([kK])?\s*(?:input|in(?:put)?\b)",
+                r"(?ix)
+                (?:
+                    (\d[\d,]*(?:\.\d+)?)\s*([k])?\s*(?:input|in(?:put)?\b)
+                    |
+                    (?:input|in(?:put)?\b)\s*:?\s*(\d[\d,]*(?:\.\d+)?)\s*([k])?
+                )",
             )
             .unwrap(),
             // "3,456 output" | "output: 3,456" | "3.4k out"
             tokens_out_re: Regex::new(
-                r"(?i)(\d[\d,]*(?:\.\d+)?)\s*([kK])?\s*(?:output|out(?:put)?\b)",
+                r"(?ix)
+                (?:
+                    (\d[\d,]*(?:\.\d+)?)\s*([k])?\s*(?:output|out(?:put)?\b)
+                    |
+                    (?:output|out(?:put)?\b)\s*:?\s*(\d[\d,]*(?:\.\d+)?)\s*([k])?
+                )",
             )
             .unwrap(),
             // "18k tokens" | "18,456 tokens" | "tokens: 18456"
@@ -117,12 +127,12 @@ impl PatternMatcher {
         let input = self
             .tokens_in_re
             .captures(text)
-            .and_then(|c| parse_k_num(c.get(1)?.as_str(), c.get(2).map(|m| m.as_str())));
+            .and_then(parse_token_capture);
 
         let output = self
             .tokens_out_re
             .captures(text)
-            .and_then(|c| parse_k_num(c.get(1)?.as_str(), c.get(2).map(|m| m.as_str())));
+            .and_then(parse_token_capture);
 
         // Fall back to total token count if input/output not found separately
         let total = if input.is_none() && output.is_none() {
@@ -171,6 +181,13 @@ fn parse_k_num(digits: &str, k: Option<&str>) -> Option<u64> {
     let n: f64 = clean.parse().ok()?;
     let mult = if k.is_some() { 1000.0 } else { 1.0 };
     Some((n * mult) as u64)
+}
+
+fn parse_token_capture(c: regex::Captures<'_>) -> Option<u64> {
+    if let Some(n) = c.get(1) {
+        return parse_k_num(n.as_str(), c.get(2).map(|m| m.as_str()));
+    }
+    parse_k_num(c.get(3)?.as_str(), c.get(4).map(|m| m.as_str()))
 }
 
 fn estimate_cost(input: u64, output: u64) -> f64 {
@@ -270,6 +287,18 @@ mod tests {
         let matcher = PatternMatcher::new();
         let stats = matcher
             .parse_screen_stats("usage: 12.3k input, 456 output, ~$0.052")
+            .unwrap();
+
+        assert_eq!(stats.input_tokens, 12_300);
+        assert_eq!(stats.output_tokens, 456);
+        assert_eq!(stats.total_cost_usd, 0.052);
+    }
+
+    #[test]
+    fn parse_stats_extracts_label_first_input_and_output_tokens() {
+        let matcher = PatternMatcher::new();
+        let stats = matcher
+            .parse_screen_stats("usage: input: 12.3k, output: 456, ~$0.052")
             .unwrap();
 
         assert_eq!(stats.input_tokens, 12_300);
