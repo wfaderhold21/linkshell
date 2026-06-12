@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    ipc::cleanup(&config);
     disable_raw_mode()?;
     if kitty_supported {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
