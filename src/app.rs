@@ -2028,13 +2028,17 @@ async fn run_pty(
         let pts = pty.pts()?;
         let _ = pty.resize(pty_process::Size::new(pty_rows, pty_cols));
         let mut command = if wrap_in_shell {
-            // Run through the user's interactive shell so that aliases defined
-            // in .bashrc/.zshrc are honoured. `exec` replaces the shell with
-            // the target process so PTY lifecycle and PID tracking work correctly.
+            // Run through the user's interactive shell so aliases in .bashrc/.zshrc
+            // are honoured. We avoid `exec` because exec bypasses alias expansion —
+            // only the first word of a plain simple command gets alias-expanded.
+            // We also re-cd to the configured cwd so that any `cd` in .bashrc does
+            // not shift claude to a different directory and break the JSONL watcher.
             let shell =
                 std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let escaped_cwd = cwd.replace('\'', "'\\''");
+            let shell_cmd = format!("cd '{}' && {}", escaped_cwd, cmd);
             let mut c = pty_process::Command::new(&shell);
-            c.args(["-i", "-c", &format!("exec {}", cmd)]);
+            c.args(["-i", "-c", &shell_cmd]);
             c
         } else {
             let args: Vec<&str> = cmd.split_whitespace().collect();
