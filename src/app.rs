@@ -371,8 +371,11 @@ impl App {
             crate::codex_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
         }
 
+        let wrap_in_shell = !matches!(kind, SessionKind::Shell);
         tokio::spawn(async move {
-            if let Err(e) = run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket).await
+            if let Err(e) =
+                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, wrap_in_shell)
+                    .await
             {
                 let _ = tx
                     .send(AppEvent::SessionOutput {
@@ -2009,6 +2012,7 @@ async fn run_pty(
     pty_cols: u16,
     tx: mpsc::Sender<AppEvent>,
     linkshell_sock: String,
+    wrap_in_shell: bool,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -2023,13 +2027,25 @@ async fn run_pty(
     let _child = {
         let pts = pty.pts()?;
         let _ = pty.resize(pty_process::Size::new(pty_rows, pty_cols));
-        let args: Vec<&str> = cmd.split_whitespace().collect();
-        let (bin, cmd_args) = match args.as_slice() {
-            [first, rest @ ..] => (*first, rest),
-            [] => return Err(anyhow::anyhow!("empty command")),
+        let mut command = if wrap_in_shell {
+            // Run through the user's interactive shell so that aliases defined
+            // in .bashrc/.zshrc are honoured. `exec` replaces the shell with
+            // the target process so PTY lifecycle and PID tracking work correctly.
+            let shell =
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let mut c = pty_process::Command::new(&shell);
+            c.args(["-i", "-c", &format!("exec {}", cmd)]);
+            c
+        } else {
+            let args: Vec<&str> = cmd.split_whitespace().collect();
+            let (bin, cmd_args) = match args.as_slice() {
+                [first, rest @ ..] => (*first, rest),
+                [] => return Err(anyhow::anyhow!("empty command")),
+            };
+            let mut c = pty_process::Command::new(bin);
+            c.args(cmd_args);
+            c
         };
-        let mut command = pty_process::Command::new(bin);
-        command.args(cmd_args);
         command.current_dir(&cwd);
         command.env("LINKSHELL_SESSION_ID", session_id.to_string());
         command.env("LINKSHELL_SOCK", &linkshell_sock);
