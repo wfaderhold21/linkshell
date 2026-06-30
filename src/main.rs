@@ -3,6 +3,7 @@ mod auth;
 mod claude_log;
 mod codex_log;
 mod config;
+mod council;
 mod events;
 mod ipc;
 mod keybindings;

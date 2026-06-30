@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 
 use crate::auth::CapSet;
 use crate::config::{self, Config};
+use crate::council::CouncilRouter;
 use crate::events::AppEvent;
 use crate::keybindings::{self, Keymap};
 use crate::patterns::PatternMatcher;
@@ -226,6 +227,8 @@ pub struct App {
     pub tokens: HashMap<String, usize>,
     /// session_id -> granted capabilities
     pub caps: HashMap<usize, CapSet>,
+    /// Optional council router for multi-agent orchestration
+    pub council: Option<CouncilRouter>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -289,6 +292,7 @@ impl App {
             keymap,
             tokens: HashMap::new(),
             caps: HashMap::new(),
+            council: None,
         }
     }
 
@@ -591,6 +595,14 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.check_pipes(session_id, &after);
+                let council_relays = if let Some(router) = &mut self.council {
+                    router.on_state(&self.sessions, session_id, &after)
+                } else {
+                    vec![]
+                };
+                for (dest, payload) in council_relays {
+                    self.handle_pipe_relay(dest, payload);
+                }
                 self.check_ipc_replies(session_id, &after);
                 if after == SessionState::Ready {
                     self.flush_pending_relays(session_id);
@@ -719,6 +731,14 @@ impl App {
         }
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
+            let council_relays = if let Some(router) = &mut self.council {
+                router.on_state(&self.sessions, session_id, &state)
+            } else {
+                vec![]
+            };
+            for (dest, payload) in council_relays {
+                self.handle_pipe_relay(dest, payload);
+            }
             self.check_ipc_replies(session_id, &state);
             if state == SessionState::Ready {
                 self.flush_pending_relays(session_id);
@@ -1241,6 +1261,14 @@ impl App {
 
         for id in tick_ready {
             self.check_pipes(id, &SessionState::Ready);
+            let council_relays = if let Some(router) = &mut self.council {
+                router.on_state(&self.sessions, id, &SessionState::Ready)
+            } else {
+                vec![]
+            };
+            for (dest, payload) in council_relays {
+                self.handle_pipe_relay(dest, payload);
+            }
             self.check_ipc_replies(id, &SessionState::Ready);
             self.flush_pending_relays(id);
         }
@@ -2043,6 +2071,78 @@ pub const MENU: &[(&str, &[&str])] = &[
     ("Pipes", &["List Pipes", "Add Pipe", "Remove Pipe"]),
     ("Help", &["Keybindings", "About"]),
 ];
+
+// ── Council ───────────────────────────────────────────────────────────────────
+
+impl App {
+    pub fn launch_council(
+        &mut self,
+        cfg: crate::council::CouncilConfig,
+    ) -> anyhow::Result<()> {
+        let group = cfg.council.name.clone();
+        let mut name_to_id: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for a in &cfg.agent {
+            let kind = parse_kind(&a.kind);
+            let id_before = self.next_id;
+            self.spawn_session(kind, a.name.clone(), a.cwd.clone().unwrap_or_default())?;
+            name_to_id.insert(a.name.clone(), id_before);
+            // Tighten capabilities: council members only report state.
+            self.caps.insert(id_before, crate::auth::council_caps());
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id_before) {
+                s.group = Some(group.clone());
+            }
+            // Seed system prompt as the first relay once the agent reaches READY.
+            if let Some(sys) = &a.system {
+                self.pending_relays
+                    .entry(id_before)
+                    .or_default()
+                    .push(sys.clone());
+            }
+        }
+
+        let mut router = crate::council::CouncilRouter::new(&cfg.council, &group);
+        for r in &cfg.route {
+            let from: Vec<usize> = r
+                .from
+                .iter()
+                .filter_map(|n| name_to_id.get(n).copied())
+                .collect();
+            let to: Vec<usize> = r
+                .to
+                .iter()
+                .filter_map(|n| name_to_id.get(n).copied())
+                .collect();
+            router.add_route(from, to, r);
+        }
+
+        // Seed the task into the entry agent (first 'from' of the first route).
+        if let Some(&entry) = cfg
+            .route
+            .first()
+            .and_then(|r| r.from.first())
+            .and_then(|n| name_to_id.get(n))
+        {
+            self.pending_relays
+                .entry(entry)
+                .or_default()
+                .push(cfg.council.task.clone());
+        }
+
+        self.council = Some(router);
+        Ok(())
+    }
+}
+
+fn parse_kind(s: &str) -> crate::session::SessionKind {
+    match s {
+        "claude" => crate::session::SessionKind::Claude,
+        "codex" => crate::session::SessionKind::Codex,
+        "shell" => crate::session::SessionKind::Shell,
+        other => crate::session::SessionKind::Custom(other.to_string()),
+    }
+}
 
 // ── PTY runner task ────────────────────────────────────────────────────────
 
