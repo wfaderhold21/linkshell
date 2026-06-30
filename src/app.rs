@@ -578,8 +578,13 @@ impl App {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&line);
             session.push_output_line(stripped.clone());
-            if !session.ipc_state {
-                if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+                // When JSONL is active it owns Thinking/Running/Ready transitions, but it
+                // cannot see permission prompts or question text, so Waiting and Error must
+                // still come from terminal pattern matching.
+                if !session.ipc_state
+                    || matches!(new_state, SessionState::Waiting | SessionState::Error)
+                {
                     session.state = new_state;
                 }
             }
@@ -693,13 +698,16 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&text);
-            if !session.ipc_state {
-                if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
-                    // Partial lines can detect Thinking/Waiting/Ready but must not
-                    // flip to Running — that requires a complete line.
-                    if new_state != SessionState::Running {
-                        session.state = new_state;
-                    }
+            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+                // Partial lines can detect Thinking/Waiting/Ready but must not
+                // flip to Running — that requires a complete line.
+                // Even with JSONL active, Waiting and Error must pass through because
+                // JSONL has no record for permission prompts or question text.
+                if new_state != SessionState::Running
+                    && (!session.ipc_state
+                        || matches!(new_state, SessionState::Waiting | SessionState::Error))
+                {
+                    session.state = new_state;
                 }
             }
             state_after = Some(session.state.clone());
