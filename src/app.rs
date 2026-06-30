@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::auth::CapSet;
 use crate::config::{self, Config};
+use crate::council::CouncilRouter;
 use crate::events::AppEvent;
 use crate::keybindings::{self, Keymap};
 use crate::patterns::PatternMatcher;
@@ -221,6 +223,12 @@ pub struct App {
     pub pending_relays: HashMap<usize, Vec<String>>,
     pipe_tasks: HashMap<PipeKey, JoinHandle<()>>,
     pub keymap: Keymap,
+    /// token -> session_id mapping for capability lookup
+    pub tokens: HashMap<String, usize>,
+    /// session_id -> granted capabilities
+    pub caps: HashMap<usize, CapSet>,
+    /// Optional council router for multi-agent orchestration
+    pub council: Option<CouncilRouter>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -282,6 +290,9 @@ impl App {
             pending_relays: HashMap::new(),
             pipe_tasks: HashMap::new(),
             keymap,
+            tokens: HashMap::new(),
+            caps: HashMap::new(),
+            council: None,
         }
     }
 
@@ -360,6 +371,11 @@ impl App {
             self.active_idx = Some(idx);
         }
 
+        // Mint a capability token for this session.
+        let token = crate::auth::mint_token();
+        self.tokens.insert(token.clone(), id);
+        self.caps.insert(id, crate::auth::worker_caps());
+
         let tx = self.event_tx.clone();
         let cfg = Arc::clone(&self.config);
         let socket = crate::ipc::socket_path(&self.config);
@@ -374,7 +390,7 @@ impl App {
         let wrap_in_shell = !matches!(kind, SessionKind::Shell);
         tokio::spawn(async move {
             if let Err(e) =
-                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, wrap_in_shell)
+                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, token, wrap_in_shell)
                     .await
             {
                 let _ = tx
@@ -579,6 +595,14 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.check_pipes(session_id, &after);
+                let council_relays = if let Some(router) = &mut self.council {
+                    router.on_state(&self.sessions, session_id, &after)
+                } else {
+                    vec![]
+                };
+                for (dest, payload) in council_relays {
+                    self.handle_pipe_relay(dest, payload);
+                }
                 self.check_ipc_replies(session_id, &after);
                 if after == SessionState::Ready {
                     self.flush_pending_relays(session_id);
@@ -707,6 +731,14 @@ impl App {
         }
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
+            let council_relays = if let Some(router) = &mut self.council {
+                router.on_state(&self.sessions, session_id, &state)
+            } else {
+                vec![]
+            };
+            for (dest, payload) in council_relays {
+                self.handle_pipe_relay(dest, payload);
+            }
             self.check_ipc_replies(session_id, &state);
             if state == SessionState::Ready {
                 self.flush_pending_relays(session_id);
@@ -1141,6 +1173,45 @@ impl App {
         }
     }
 
+    /// Resolve an IPC connection's identity: returns (session_id, caps) or None for rejection.
+    pub fn handle_authenticate(
+        &mut self,
+        token: Option<String>,
+        transport: crate::ipc::Transport,
+        name: Option<String>,
+        group: Option<String>,
+        response_tx: tokio::sync::oneshot::Sender<Option<(Option<usize>, CapSet)>>,
+    ) {
+        use crate::ipc::Transport;
+
+        let result: Option<(Option<usize>, CapSet)> = if let Some(tok) = token {
+            if let Some(&sid) = self.tokens.get(&tok) {
+                let caps = self.caps.get(&sid).cloned().unwrap_or_else(crate::auth::worker_caps);
+                Some((Some(sid), caps))
+            } else {
+                None
+            }
+        } else if transport == Transport::Unix {
+            if name.as_ref().map(|n| !n.is_empty()).unwrap_or(false) {
+                match self.spawn_headless_session(name.unwrap_or_default(), group) {
+                    Ok(id) => {
+                        let caps = crate::auth::operator_caps();
+                        self.caps.insert(id, caps.clone());
+                        Some((Some(id), caps))
+                    }
+                    Err(_) => Some((None, crate::auth::operator_caps())),
+                }
+            } else {
+                Some((None, crate::auth::operator_caps()))
+            }
+        } else {
+            // TCP with no token → reject
+            None
+        };
+
+        let _ = response_tx.send(result);
+    }
+
     pub fn handle_tick(&mut self) {
         let mut tick_ready: Vec<usize> = Vec::new();
 
@@ -1190,6 +1261,14 @@ impl App {
 
         for id in tick_ready {
             self.check_pipes(id, &SessionState::Ready);
+            let council_relays = if let Some(router) = &mut self.council {
+                router.on_state(&self.sessions, id, &SessionState::Ready)
+            } else {
+                vec![]
+            };
+            for (dest, payload) in council_relays {
+                self.handle_pipe_relay(dest, payload);
+            }
             self.check_ipc_replies(id, &SessionState::Ready);
             self.flush_pending_relays(id);
         }
@@ -1993,6 +2072,78 @@ pub const MENU: &[(&str, &[&str])] = &[
     ("Help", &["Keybindings", "About"]),
 ];
 
+// ── Council ───────────────────────────────────────────────────────────────────
+
+impl App {
+    pub fn launch_council(
+        &mut self,
+        cfg: crate::council::CouncilConfig,
+    ) -> anyhow::Result<()> {
+        let group = cfg.council.name.clone();
+        let mut name_to_id: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for a in &cfg.agent {
+            let kind = parse_kind(&a.kind);
+            let id_before = self.next_id;
+            self.spawn_session(kind, a.name.clone(), a.cwd.clone().unwrap_or_default())?;
+            name_to_id.insert(a.name.clone(), id_before);
+            // Tighten capabilities: council members only report state.
+            self.caps.insert(id_before, crate::auth::council_caps());
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id_before) {
+                s.group = Some(group.clone());
+            }
+            // Seed system prompt as the first relay once the agent reaches READY.
+            if let Some(sys) = &a.system {
+                self.pending_relays
+                    .entry(id_before)
+                    .or_default()
+                    .push(sys.clone());
+            }
+        }
+
+        let mut router = crate::council::CouncilRouter::new(&cfg.council, &group);
+        for r in &cfg.route {
+            let from: Vec<usize> = r
+                .from
+                .iter()
+                .filter_map(|n| name_to_id.get(n).copied())
+                .collect();
+            let to: Vec<usize> = r
+                .to
+                .iter()
+                .filter_map(|n| name_to_id.get(n).copied())
+                .collect();
+            router.add_route(from, to, r);
+        }
+
+        // Seed the task into the entry agent (first 'from' of the first route).
+        if let Some(&entry) = cfg
+            .route
+            .first()
+            .and_then(|r| r.from.first())
+            .and_then(|n| name_to_id.get(n))
+        {
+            self.pending_relays
+                .entry(entry)
+                .or_default()
+                .push(cfg.council.task.clone());
+        }
+
+        self.council = Some(router);
+        Ok(())
+    }
+}
+
+fn parse_kind(s: &str) -> crate::session::SessionKind {
+    match s {
+        "claude" => crate::session::SessionKind::Claude,
+        "codex" => crate::session::SessionKind::Codex,
+        "shell" => crate::session::SessionKind::Shell,
+        other => crate::session::SessionKind::Custom(other.to_string()),
+    }
+}
+
 // ── PTY runner task ────────────────────────────────────────────────────────
 
 async fn run_pty(
@@ -2003,6 +2154,7 @@ async fn run_pty(
     pty_cols: u16,
     tx: mpsc::Sender<AppEvent>,
     linkshell_sock: String,
+    linkshell_token: String,
     wrap_in_shell: bool,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -2044,6 +2196,7 @@ async fn run_pty(
         command.current_dir(&cwd);
         command.env("LINKSHELL_SESSION_ID", session_id.to_string());
         command.env("LINKSHELL_SOCK", &linkshell_sock);
+        command.env("LINKSHELL_TOKEN", &linkshell_token);
         command.spawn(&pts)?
     };
 

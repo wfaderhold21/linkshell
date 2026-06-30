@@ -212,10 +212,31 @@ fn connect(sock: &str) -> UnixStream {
     })
 }
 
+/// Send the Hello handshake and read the Welcome response.
+fn do_handshake(stream: &UnixStream) {
+    let hello = serde_json::json!({"msg": {"type": "hello", "protocol": 1}});
+    let hello_line = serde_json::to_string(&hello).unwrap() + "\n";
+    {
+        let mut w = stream;
+        w.write_all(hello_line.as_bytes()).unwrap_or_else(|e| {
+            eprintln!("linkshell-ctl: handshake write failed: {}", e);
+            std::process::exit(1);
+        });
+    }
+    // Read Welcome response (discard it — we just need the handshake to complete)
+    let mut reader = BufReader::new(stream);
+    let mut welcome = String::new();
+    reader.read_line(&mut welcome).ok();
+}
+
 fn send_only(sock: &str, msg: &serde_json::Value) {
-    let mut stream = connect(sock);
-    let line = serde_json::to_string(msg).unwrap() + "\n";
-    stream.write_all(line.as_bytes()).unwrap_or_else(|e| {
+    let stream = connect(sock);
+    // Perform Hello/Welcome handshake first.
+    do_handshake(&stream);
+    let wrapped = serde_json::json!({"msg": msg});
+    let line = serde_json::to_string(&wrapped).unwrap() + "\n";
+    let mut w = &stream;
+    w.write_all(line.as_bytes()).unwrap_or_else(|e| {
         eprintln!("linkshell-ctl: write failed: {}", e);
         std::process::exit(1);
     });
@@ -224,9 +245,12 @@ fn send_only(sock: &str, msg: &serde_json::Value) {
 fn send_and_recv(sock: &str, msg: &serde_json::Value, timeout: Duration) -> String {
     let stream = connect(sock);
     stream.set_read_timeout(Some(timeout)).ok();
+    // Perform Hello/Welcome handshake first (no timeout on handshake read).
+    do_handshake(&stream);
     {
         let mut w = &stream;
-        let line = serde_json::to_string(msg).unwrap() + "\n";
+        let wrapped = serde_json::json!({"id": 1, "msg": msg});
+        let line = serde_json::to_string(&wrapped).unwrap() + "\n";
         w.write_all(line.as_bytes()).unwrap_or_else(|e| {
             eprintln!("linkshell-ctl: write failed: {}", e);
             std::process::exit(1);

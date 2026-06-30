@@ -117,6 +117,14 @@ pub enum AppEvent {
     },
     Paste(String),
     Tick,
+    /// IPC handshake: resolve a token (or Unix peer) to a session_id + CapSet.
+    Authenticate {
+        token: Option<String>,
+        transport: crate::ipc::Transport,
+        name: Option<String>,
+        group: Option<String>,
+        response_tx: tokio::sync::oneshot::Sender<Option<(Option<usize>, crate::auth::CapSet)>>,
+    },
 }
 
 #[derive(Debug)]
