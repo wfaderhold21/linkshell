@@ -1153,6 +1153,45 @@ impl App {
         }
     }
 
+    /// Resolve an IPC connection's identity: returns (session_id, caps) or None for rejection.
+    pub fn handle_authenticate(
+        &mut self,
+        token: Option<String>,
+        transport: crate::ipc::Transport,
+        name: Option<String>,
+        group: Option<String>,
+        response_tx: tokio::sync::oneshot::Sender<Option<(Option<usize>, CapSet)>>,
+    ) {
+        use crate::ipc::Transport;
+
+        let result: Option<(Option<usize>, CapSet)> = if let Some(tok) = token {
+            if let Some(&sid) = self.tokens.get(&tok) {
+                let caps = self.caps.get(&sid).cloned().unwrap_or_else(crate::auth::worker_caps);
+                Some((Some(sid), caps))
+            } else {
+                None
+            }
+        } else if transport == Transport::Unix {
+            if name.as_ref().map(|n| !n.is_empty()).unwrap_or(false) {
+                match self.spawn_headless_session(name.unwrap_or_default(), group) {
+                    Ok(id) => {
+                        let caps = crate::auth::operator_caps();
+                        self.caps.insert(id, caps.clone());
+                        Some((Some(id), caps))
+                    }
+                    Err(_) => Some((None, crate::auth::operator_caps())),
+                }
+            } else {
+                Some((None, crate::auth::operator_caps()))
+            }
+        } else {
+            // TCP with no token → reject
+            None
+        };
+
+        let _ = response_tx.send(result);
+    }
+
     pub fn handle_tick(&mut self) {
         let mut tick_ready: Vec<usize> = Vec::new();
 

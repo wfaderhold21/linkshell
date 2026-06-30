@@ -8,6 +8,7 @@ mod ipc;
 mod keybindings;
 mod patterns;
 mod pipe;
+mod protocol;
 mod session;
 mod ui;
 
@@ -284,6 +285,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
         AppEvent::Paste(text) => handle_paste(app, text),
+        AppEvent::Authenticate { token, transport, name, group, response_tx } => {
+            app.handle_authenticate(token, transport, name, group, response_tx);
+        }
     }
     app.needs_redraw = true;
 }
