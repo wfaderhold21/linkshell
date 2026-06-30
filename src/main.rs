@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod claude_log;
 mod codex_log;
 mod config;

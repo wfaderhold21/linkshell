@@ -719,6 +719,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "crossterm",
+ "libc",
  "pty-process",
  "ratatui",
  "regex",

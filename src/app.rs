@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::auth::CapSet;
 use crate::config::{self, Config};
 use crate::events::AppEvent;
 use crate::keybindings::{self, Keymap};
@@ -221,6 +222,10 @@ pub struct App {
     pub pending_relays: HashMap<usize, Vec<String>>,
     pipe_tasks: HashMap<PipeKey, JoinHandle<()>>,
     pub keymap: Keymap,
+    /// token -> session_id mapping for capability lookup
+    pub tokens: HashMap<String, usize>,
+    /// session_id -> granted capabilities
+    pub caps: HashMap<usize, CapSet>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -282,6 +287,8 @@ impl App {
             pending_relays: HashMap::new(),
             pipe_tasks: HashMap::new(),
             keymap,
+            tokens: HashMap::new(),
+            caps: HashMap::new(),
         }
     }
 
@@ -360,6 +367,11 @@ impl App {
             self.active_idx = Some(idx);
         }
 
+        // Mint a capability token for this session.
+        let token = crate::auth::mint_token();
+        self.tokens.insert(token.clone(), id);
+        self.caps.insert(id, crate::auth::worker_caps());
+
         let tx = self.event_tx.clone();
         let cfg = Arc::clone(&self.config);
         let socket = crate::ipc::socket_path(&self.config);
@@ -374,7 +386,7 @@ impl App {
         let wrap_in_shell = !matches!(kind, SessionKind::Shell);
         tokio::spawn(async move {
             if let Err(e) =
-                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, wrap_in_shell)
+                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, token, wrap_in_shell)
                     .await
             {
                 let _ = tx
@@ -2003,6 +2015,7 @@ async fn run_pty(
     pty_cols: u16,
     tx: mpsc::Sender<AppEvent>,
     linkshell_sock: String,
+    linkshell_token: String,
     wrap_in_shell: bool,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -2044,6 +2057,7 @@ async fn run_pty(
         command.current_dir(&cwd);
         command.env("LINKSHELL_SESSION_ID", session_id.to_string());
         command.env("LINKSHELL_SOCK", &linkshell_sock);
+        command.env("LINKSHELL_TOKEN", &linkshell_token);
         command.spawn(&pts)?
     };
 
