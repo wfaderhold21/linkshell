@@ -113,6 +113,10 @@ fn parse_state(v: &serde_json::Value) -> Option<SessionState> {
             "end_turn" => Some(SessionState::Ready),
             _ => None,
         },
+        "system" => match v["subtype"].as_str().unwrap_or("") {
+            "api_error" => Some(SessionState::Error),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -360,6 +364,14 @@ mod tests {
                 "type": "assistant",
                 "message": {"stop_reason": "max_tokens"}
             })),
+            None
+        );
+        assert_eq!(
+            parse_state(&serde_json::json!({"type": "system", "subtype": "api_error"})),
+            Some(SessionState::Error)
+        );
+        assert_eq!(
+            parse_state(&serde_json::json!({"type": "system", "subtype": "turn_duration"})),
             None
         );
     }
