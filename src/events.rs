@@ -78,11 +78,6 @@ pub enum AppEvent {
     IpcAgentDisconnected {
         session_id: usize,
     },
-    /// Push a JSON message to a connected agent
-    IpcSend {
-        session_id: usize,
-        message: serde_json::Value,
-    },
     /// Fire manual pipes from source; dest=None fires all manual pipes from source
     IpcFirePipe {
         source: usize,
@@ -137,10 +132,6 @@ pub enum IpcQueryPayload {
     SessionInputWait {
         session_id: usize,
         text: String,
-    },
-    Register {
-        name: String,
-        group: Option<String>,
     },
     /// Synchronous snapshot query: "sessions" or "pipes"
     Query {

@@ -98,6 +98,14 @@ pub enum Message {
         #[serde(default)]
         cwd: Option<String>,
     },
+    /// Write `text` into a session's PTY and block until it returns to READY.
+    /// Sent by `linkshell-ctl wait-ready` (with empty text) and by orchestrators
+    /// that want synchronous prompt→response semantics.
+    SessionInputWait {
+        session_id: usize,
+        #[serde(default)]
+        text: String,
+    },
     Query {
         what: String,
     },
@@ -139,7 +147,103 @@ pub fn required_cap(m: &Message) -> Option<Capability> {
         Message::PipeAdd { .. } | Message::PipeRemove { .. } => ManagePipes,
         Message::Broadcast { .. } => Broadcast,
         Message::SessionCreate { .. } => CreateSession,
+        Message::SessionInputWait { .. } => InjectInput,
         // handshake + server-origin messages need no capability
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_round_trips_the_documented_wire_format() {
+        let wire = r#"{"id":7,"msg":{"type":"state","state":"READY"}}"#;
+        let env: Envelope = serde_json::from_str(wire).unwrap();
+        assert_eq!(env.id, Some(7));
+        assert!(matches!(
+            env.msg,
+            Message::State { state: SessionState::Ready, .. }
+        ));
+        // id is omitted from fire-and-forget messages when serialized
+        let out = serde_json::to_string(&Envelope {
+            id: None,
+            msg: Message::Query { what: "sessions".into() },
+        })
+        .unwrap();
+        assert!(!out.contains("\"id\""));
+        assert!(out.contains("\"type\":\"query\""));
+    }
+
+    #[test]
+    fn hello_accepts_optional_fields_and_session_input_wait_defaults_text() {
+        let hello: Envelope =
+            serde_json::from_str(r#"{"msg":{"type":"hello","protocol":1}}"#).unwrap();
+        assert!(matches!(
+            hello.msg,
+            Message::Hello { protocol: 1, token: None, name: None, group: None }
+        ));
+
+        let wait: Envelope = serde_json::from_str(
+            r#"{"id":1,"msg":{"type":"session_input_wait","session_id":3}}"#,
+        )
+        .unwrap();
+        match wait.msg {
+            Message::SessionInputWait { session_id, text } => {
+                assert_eq!(session_id, 3);
+                assert!(text.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn required_cap_gates_every_privileged_message() {
+        use crate::auth::Capability::*;
+        let cases: Vec<(Message, Option<crate::auth::Capability>)> = vec![
+            (Message::Query { what: "sessions".into() }, Some(Query)),
+            (
+                Message::SessionInputWait { session_id: 0, text: String::new() },
+                Some(InjectInput),
+            ),
+            (
+                Message::SessionCreate { kind: "shell".into(), name: None, cwd: None },
+                Some(CreateSession),
+            ),
+            (
+                Message::Hello { protocol: 1, token: None, name: None, group: None },
+                None,
+            ),
+            (Message::Relay { content: String::new() }, None),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(required_cap(&msg), expected);
+        }
+    }
+
+    #[test]
+    fn worker_caps_cannot_inject_input_or_create_sessions() {
+        let worker = crate::auth::worker_caps();
+        assert!(!worker.contains(&crate::auth::Capability::InjectInput));
+        assert!(!worker.contains(&crate::auth::Capability::CreateSession));
+        assert!(worker.contains(&crate::auth::Capability::SignalState));
+
+        let council = crate::auth::council_caps();
+        assert_eq!(council.len(), 1);
+        assert!(council.contains(&crate::auth::Capability::SignalState));
+
+        let op = crate::auth::operator_caps();
+        assert!(worker.is_subset(&op));
+        assert!(council.is_subset(&worker));
+    }
+
+    #[test]
+    fn minted_tokens_are_32_hex_chars_and_unique() {
+        let a = crate::auth::mint_token();
+        let b = crate::auth::mint_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 }

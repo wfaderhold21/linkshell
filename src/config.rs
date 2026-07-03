@@ -71,6 +71,28 @@ impl Default for SocketConfig {
 pub struct SessionsConfig {
     pub default_cwd: String,
     pub commands: SessionCommandsConfig,
+    /// Map a command basename to a claude/codex identity, for wrapper scripts
+    /// and shell aliases the classifier can't see through:
+    ///
+    ///   [sessions.aliases.claude-work]
+    ///   kind = "claude"
+    ///   config_dir = "~/.claude-work"   # exported as CLAUDE_CONFIG_DIR
+    ///
+    ///   [sessions.aliases.cx]
+    ///   kind = "codex"
+    ///   config_dir = "~/.codex-personal"  # exported as CODEX_HOME
+    pub aliases: HashMap<String, SessionAlias>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+pub struct SessionAlias {
+    /// "claude" or "codex"
+    pub kind: String,
+    /// Optional config home for this identity. Injected into the session's
+    /// environment (CLAUDE_CONFIG_DIR / CODEX_HOME) and used by the JSONL
+    /// watcher to find the right log directory. Supports a leading `~`.
+    #[serde(default)]
+    pub config_dir: Option<String>,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -418,4 +440,26 @@ mod tests {
         let err = validate_command("claude --dangerously-skip-permissions").unwrap_err();
         assert!(err.contains("--dangerously-skip-permissions"));
     }
+    #[test]
+    fn sessions_aliases_parse_kind_and_config_dir() {
+        let toml = r#"
+[sessions.aliases.claude-work]
+kind = "claude"
+config_dir = "~/.claude-work"
+
+[sessions.aliases.cx]
+kind = "codex"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let a = &cfg.sessions.aliases["claude-work"];
+        assert_eq!(a.kind, "claude");
+        assert_eq!(a.config_dir.as_deref(), Some("~/.claude-work"));
+        let b = &cfg.sessions.aliases["cx"];
+        assert_eq!(b.kind, "codex");
+        assert!(b.config_dir.is_none());
+        // absent table defaults to empty
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(empty.sessions.aliases.is_empty());
+    }
+
 }

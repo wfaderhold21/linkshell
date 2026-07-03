@@ -473,6 +473,25 @@ async fn dispatch_msg(
                 let _ = writer.send(serde_json::to_string(&response).unwrap_or_default() + "\n").await;
             }
         }
+        Message::SessionInputWait { session_id, text } => {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(AppEvent::IpcQuery {
+                payload: IpcQueryPayload::SessionInputWait { session_id, text },
+                response_tx: resp_tx,
+            }).await;
+            // Long-poll: the reply is held until the session returns to READY
+            // (or errors). The client sets its own read timeout; cap ours at
+            // 30 minutes so a dead session can't pin the connection forever.
+            match tokio::time::timeout(Duration::from_secs(1800), resp_rx).await {
+                Ok(Ok(response)) => {
+                    let _ = writer.send(serde_json::to_string(&response).unwrap_or_default() + "\n").await;
+                }
+                _ => {
+                    let err = serde_json::json!({"error": "input_wait timeout"});
+                    let _ = writer.send(serde_json::to_string(&err).unwrap_or_default() + "\n").await;
+                }
+            }
+        }
         Message::Query { what } => {
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             let _ = tx.send(AppEvent::IpcQuery {

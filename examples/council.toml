@@ -1,0 +1,42 @@
+# Example linkshell council: an author/critic review loop.
+#
+#   linkshell --council examples/council.toml
+#
+# or from the command bar (alt-c):
+#
+#   council examples/council.toml
+
+[council]
+name = "review"                 # group name; also shown in the status panel
+task = "Implement a bounded LRU cache in Rust with unit tests."
+max_rounds = 4                  # stop after this many completed all-join rounds
+done_signal = "LGTM"            # optional marker an agent can emit to finish early
+
+# Up to 8 agents total (shared with any sessions already open).
+# kind: claude | codex | shell | any custom command line
+[[agent]]
+name = "author"
+kind = "claude"
+system = "You are the implementer. Write the code and revise it based on review feedback."
+
+[[agent]]
+name = "critic"
+kind = "codex"
+system = "You are the reviewer. Find bugs and API problems. Reply LGTM when the code is acceptable."
+
+# Routes fire when a source session transitions state.
+#   on:      ready (default) | waiting | manual
+#   join:    any (default: each source relays independently) | all (wait for every source)
+#   extract: last-block (default) | last-n=N | diff | summarize=N
+[[route]]
+from = "author"
+to = "critic"
+extract = "last-block"
+prefix = "Review this implementation:"
+
+[[route]]
+from = "critic"
+to = "author"
+extract = "last-block"
+prefix = "Reviewer feedback:"
+unless_signal = "LGTM"          # critic saying LGTM ends the council

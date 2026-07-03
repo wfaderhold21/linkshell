@@ -214,7 +214,16 @@ fn connect(sock: &str) -> UnixStream {
 
 /// Send the Hello handshake and read the Welcome response.
 fn do_handshake(stream: &UnixStream) {
-    let hello = serde_json::json!({"msg": {"type": "hello", "protocol": 1}});
+    // Present this session's capability token if we were spawned by linkshell.
+    // Without it a same-uid Unix peer is treated as the operator; with it the
+    // connection is bound to the owning session and its granted capabilities.
+    let mut hello_msg = serde_json::json!({"type": "hello", "protocol": 1});
+    if let Ok(token) = std::env::var("LINKSHELL_TOKEN") {
+        if !token.is_empty() {
+            hello_msg["token"] = token.into();
+        }
+    }
+    let hello = serde_json::json!({"msg": hello_msg});
     let hello_line = serde_json::to_string(&hello).unwrap() + "\n";
     {
         let mut w = stream;

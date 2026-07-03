@@ -23,14 +23,22 @@ Linkshell is a terminal multiplexer TUI built for AI coding agents. It manages u
 
 | File | Responsibility |
 |------|---------------|
-| `main.rs` | Async event loop, terminal init/cleanup, key routing |
-| `app.rs` | App state, session lifecycle, all event handlers |
-| `session.rs` | Session model: PTY, vt100 screen, state, token stats |
+| `main.rs` | Async event loop, terminal init/cleanup, key routing, `--tcp`/`--council` flags |
+| `app.rs` | App state, session lifecycle, all event handlers, council launch, command bar |
+| `session.rs` | Session model: PTY, vt100 screen, state, token stats, `BaseKind` identity resolution |
 | `events.rs` | Event enum shared between tasks and the main loop |
 | `ui.rs` | Ratatui rendering — output pane, session bar, status panel, overlays |
-| `patterns.rs` | Pattern matching for session state inference and token/cost parsing |
+| `patterns.rs` | Pattern matching for session state inference (dispatched on `BaseKind`) and token/cost parsing |
 | `pipe.rs` | Pipe definitions, extraction logic, trigger evaluation, Haiku summarizer |
-| `ipc.rs` | Unix socket listener for external orchestrator integration |
+| `ipc.rs` | Unix socket + optional TCP listener, handshake, capability enforcement |
+| `protocol.rs` | Typed wire protocol: `Envelope`/`Message`, error codes, per-message capability requirements |
+| `auth.rs` | Capability tiers (operator / worker / council) and token minting |
+| `council.rs` | council.toml parsing and the multi-agent routing engine (`CouncilRouter`) |
+| `claude_log.rs` | Watch `$CLAUDE_CONFIG_DIR/projects` JSONL for cumulative token/cost stats |
+| `codex_log.rs` | Watch `$CODEX_HOME/sessions` rollout JSONL for token/context stats |
+| `config.rs` | linkshell.toml: commands, aliases, pricing, socket, keybindings |
+| `keybindings.rs` | Configurable key chord parsing |
+| `bin/ctl.rs` | `linkshell-ctl` — CLI client speaking the typed protocol |
 
 ### Data Flow
 
