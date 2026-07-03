@@ -4,6 +4,8 @@ use regex::Regex;
 pub struct PatternMatcher {
     // Shell/generic ready prompts
     shell_ready: Regex,
+    local_thinking: Regex,
+    local_ready: Regex,
     // Claude-specific patterns
     claude_thinking: Regex,
     claude_ready: Regex,
@@ -25,6 +27,14 @@ impl PatternMatcher {
     pub fn new() -> Self {
         Self {
             shell_ready: Regex::new(r"[\$#%>]\s*$").unwrap(),
+            // opencode / omp / pi / aider / llama-cli: braille spinners, an
+            // explicit working verb, or "esc to interrupt" style hints.
+            local_thinking: Regex::new(
+                r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|(?i)\b(thinking|working|generating|reasoning)\b\.\.\.|esc to interrupt|ctrl\+c to interrupt",
+            )
+            .unwrap(),
+            // idle prompt markers used by local agent TUIs and llama-cli
+            local_ready: Regex::new(r"^[>❯]\s*$|^\(\S+\)>\s*$").unwrap(),
             claude_thinking: Regex::new(r"(Thinking|Processing|Analyzing)\.\.\.|⠋|⠙|⠹|⠸").unwrap(),
             claude_ready: Regex::new(r"^>\s*$|Human:\s*$").unwrap(),
             claude_waiting: Regex::new(
@@ -97,6 +107,17 @@ impl PatternMatcher {
                     return Some(SessionState::Waiting);
                 }
                 if self.codex_ready.is_match(line) {
+                    return Some(SessionState::Ready);
+                }
+                if !line.trim().is_empty() {
+                    return Some(SessionState::Running);
+                }
+            }
+            BaseKind::LocalAgent => {
+                if self.local_thinking.is_match(line) {
+                    return Some(SessionState::Thinking);
+                }
+                if self.local_ready.is_match(line) {
                     return Some(SessionState::Ready);
                 }
                 if !line.trim().is_empty() {

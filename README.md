@@ -28,6 +28,9 @@ tmux doesn't know your Claude session is blocked waiting on you. It doesn't know
 
 - **Up to 8 sessions** — Claude, Codex, shell, or any custom command
 - **Aliased identities** — env-prefixed commands (`CLAUDE_CONFIG_DIR=~/w claude`) and configured wrapper aliases get full Claude/Codex treatment, each with its own config home
+- **Local agents & LLMs** — opencode, oh-my-pi, pi, aider, and llama.cpp sessions get agent-style state inference; llama.cpp/Ollama/vLLM/LM Studio endpoints are chat-addressable via `[agents.*]`
+- **Agent chat pane** (`alt-t`) — talk to any session or local LLM by name, run commands with `/`, and orchestrate everything without leaving the pane
+- **Unified scrollback** — full-screen TUIs and shells scroll with the same keys; the view holds position while output streams and returns to live when you type
 - **Multi-agent councils** — declarative TOML topologies that relay output between agents on state transitions, with fan-in joins, round limits, and done signals
 - **Live session state** — READY, THINKING, RUNNING, WAITING, ERROR inferred from PTY output and JSONL logs
 - **Accurate token & cost tracking** — read directly from the Claude/Codex JSONL logs (config-home aware, `CLAUDE_CONFIG_DIR`/`CODEX_HOME` respected), not screen-scraped
@@ -126,12 +129,65 @@ Council members are spawned with the minimal `SignalState` capability — they
 can report their own state but cannot inject input, manage pipes, or create
 sessions. Live progress (`round R/M`, done) is shown in the Status panel title.
 
+## Agent Chat
+
+Press `alt-t` for a chat pane that talks to everything linkshell manages —
+council members, individual sessions, and configured local LLMs — without
+switching panes:
+
+```
+@critic what did you find?      address a session by name (or @2 by number)
+@qwen summarize this diff       address a local LLM from [agents.*]
+@all status update please       broadcast to every AI session
+looks good, continue            bare messages go to the last target
+/new claude worker              any command-bar command works with /
+/agents                         list everyone you can talk to
+```
+
+Messages to sessions are injected into their PTY; when the session returns to
+READY its answer is extracted (last code block, falling back to recent lines)
+back into the transcript. Local LLM agents keep a bounded per-agent
+conversation history.
+
+Local LLM agents are any OpenAI-compatible endpoint — llama.cpp server,
+Ollama, vLLM, LM Studio:
+
+```toml
+[agents.qwen]
+endpoint = "http://localhost:8080/v1"   # /v1 optional
+model = "qwen3.6-27b"
+system = "You are a concise coding assistant."
+# api_key = "..."                       # sent as Bearer if set
+```
+
+**Orchestration pattern**: spawn a Claude session as your foreman, promote it
+with `/grant 1 operator`, and delegate from chat — it can then use
+`linkshell-ctl` to create sessions, inject prompts, wait for READY, and wire
+pipes, while you stay in the chat pane.
+
+## Local agent sessions
+
+Sessions running `opencode`, `omp` (oh-my-pi), `pi`, `aider`, `llama-cli`, or
+`ollama` are recognized as local agents: they get agent-style state inference
+(THINKING on spinners/working verbs, READY on idle prompts) and terminal-based
+token scraping. Wrappers with other names can be mapped with
+`kind = "local"` in `[sessions.aliases]`.
+
+## Scrollback
+
+`alt-shift-PageUp/PageDown` (and `alt-shift-↑/↓`) scroll every session type
+the same way. Shells use the terminal's native scrollback; full-screen TUIs
+(claude, codex, opencode) scroll through linkshell's captured line history,
+shown dimmed. The view holds position while new output streams in — typing
+returns you to the live tail.
+
 ## Keybindings
 
 | Key | Action |
 |-----|--------|
 | `alt-n` | New session dialog |
 | `alt-c` | Open command bar |
+| `alt-t` | Toggle agent chat pane |
 | `alt-h` | Toggle help |
 | `alt-x` | Kill active session |
 | `alt-1` … `alt-8` | Switch to session by number |
@@ -158,6 +214,11 @@ kill <n>              Kill session by number
 council <file.toml>   Launch a multi-agent council
 council status        Show council round / completion state
 council stop          Detach the council router (sessions keep running)
+restart [n]           Respawn a session with the same command, name, and cwd
+grant <n> <tier>      Set a session's IPC capabilities (operator|worker|council)
+config path           Show the config file location
+config edit           Open the config in $EDITOR (as a session)
+config reload         Re-read linkshell.toml without restarting
 pipe <src> <dst> [--extract=last-block|last-n=N|diff] [--summarize=N] [--on=ready|waiting|manual] [--prefix="..."]
                       Forward output from src to dst on state change
 pipe fire [src] [dst] Manually fire a pipe with trigger=manual

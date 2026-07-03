@@ -2,6 +2,11 @@ use crossterm::event::KeyEvent;
 use tokio::sync::mpsc;
 
 pub enum AppEvent {
+    /// A local LLM agent's chat reply (from agent_llm background task)
+    ChatReply {
+        from: String,
+        text: String,
+    },
     Key(KeyEvent),
     Mouse(crossterm::event::MouseEvent),
     /// Raw PTY bytes — fed into the vt100 screen buffer for display
