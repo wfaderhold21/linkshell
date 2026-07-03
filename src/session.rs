@@ -32,6 +32,10 @@ impl SessionKind {
         matches!(self, SessionKind::Codex) || self.custom_base_name() == Some("codex")
     }
 
+    pub(crate) fn custom_base_name_pub(&self) -> Option<&str> {
+        self.custom_base_name()
+    }
+
     fn custom_base_name(&self) -> Option<&str> {
         if let SessionKind::Custom(cmd) = self {
             command_base_name(cmd)
@@ -84,7 +88,19 @@ pub fn command_env_assignment(cmd: &str, var: &str) -> Option<String> {
 pub enum BaseKind {
     Claude,
     Codex,
+    /// A recognized local/open coding agent or LLM CLI (opencode, oh-my-pi,
+    /// pi, aider, llama.cpp interactive). Gets agent-style state inference
+    /// but no JSONL watcher — these tools have no common log format.
+    LocalAgent,
     Other,
+}
+
+/// Command basenames recognized as local coding agents / LLM CLIs.
+pub const LOCAL_AGENT_BASENAMES: &[&str] =
+    &["opencode", "omp", "pi", "aider", "llama-cli", "llama", "ollama"];
+
+pub fn is_local_agent_basename(name: &str) -> bool {
+    LOCAL_AGENT_BASENAMES.contains(&name)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -153,6 +169,10 @@ pub struct Session {
     /// Raw bytes received since the last tick — used to detect active generation
     /// without relying on newlines (Claude Code streams via cursor movement, not \n).
     pub bytes_since_last_tick: usize,
+    /// Scroll offset (in lines) into `output_lines` history. Used when the
+    /// application occupies the alternate screen (full-screen TUIs), where
+    /// vt100 keeps no scrollback; unifies scrolling across session types.
+    pub history_scroll: usize,
     /// Resolved CLI identity: which JSONL watcher / stats pipeline applies.
     /// Defaults from the command's base name; spawn_session refines it with
     /// the config alias table.
@@ -175,6 +195,12 @@ impl Session {
             BaseKind::Claude
         } else if kind.is_codex_based() {
             BaseKind::Codex
+        } else if kind
+            .custom_base_name_pub()
+            .map(is_local_agent_basename)
+            .unwrap_or(false)
+        {
+            BaseKind::LocalAgent
         } else {
             BaseKind::Other
         };
@@ -198,6 +224,7 @@ impl Session {
             output_lines: VecDeque::new(),
             scroll_buffer_lines,
             bytes_since_last_tick: 0,
+            history_scroll: 0,
             base,
         }
     }

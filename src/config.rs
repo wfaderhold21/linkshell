@@ -3,6 +3,15 @@ use std::collections::HashMap;
 #[derive(serde::Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct Config {
+    /// Chat-addressable local LLM agents (OpenAI-compatible endpoints such as
+    /// llama.cpp server, Ollama, vLLM, LM Studio):
+    ///
+    ///   [agents.qwen]
+    ///   endpoint = "http://localhost:8080/v1"
+    ///   model = "qwen3.6-27b"
+    ///   system = "You are a concise coding assistant."
+    ///   # api_key = "..."          # optional; sent as Bearer if set
+    pub agents: HashMap<String, LocalAgent>,
     pub general: GeneralConfig,
     pub socket: SocketConfig,
     pub sessions: SessionsConfig,
@@ -69,6 +78,17 @@ pub struct SessionsConfig {
     ///   kind = "codex"
     ///   config_dir = "~/.codex-personal"  # exported as CODEX_HOME
     pub aliases: HashMap<String, SessionAlias>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+pub struct LocalAgent {
+    /// Base URL of an OpenAI-compatible server (with or without trailing /v1).
+    pub endpoint: String,
+    pub model: String,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -306,13 +326,20 @@ pub struct KeybindingsConfig {
 
 // ── Load ──────────────────────────────────────────────────────────────────
 
-pub fn load() -> Config {
-    let path = match std::env::var("HOME") {
-        Ok(h) => std::path::PathBuf::from(h)
+/// Location of the user config file: ~/.config/linkshell/config.toml
+pub fn config_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(|h| {
+        std::path::PathBuf::from(h)
             .join(".config")
             .join("linkshell")
-            .join("config.toml"),
-        Err(_) => return Config::default(),
+            .join("config.toml")
+    })
+}
+
+pub fn load() -> Config {
+    let path = match config_path() {
+        Some(p) => p,
+        None => return Config::default(),
     };
 
     let content = match std::fs::read_to_string(&path) {
@@ -447,5 +474,20 @@ kind = "codex"
         // absent table defaults to empty
         let empty: Config = toml::from_str("").unwrap();
         assert!(empty.sessions.aliases.is_empty());
+    }
+    #[test]
+    fn agents_table_parses_local_llm_endpoints() {
+        let toml = r#"
+[agents.qwen]
+endpoint = "http://localhost:8080/v1"
+model = "qwen3.6-27b"
+system = "Be concise."
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let a = &cfg.agents["qwen"];
+        assert_eq!(a.endpoint, "http://localhost:8080/v1");
+        assert_eq!(a.model, "qwen3.6-27b");
+        assert_eq!(a.system.as_deref(), Some("Be concise."));
+        assert!(a.api_key.is_none());
     }
 }
