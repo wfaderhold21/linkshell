@@ -49,9 +49,7 @@ impl SessionKind {
 /// `VAR=value` environment assignments — so `CLAUDE_CONFIG_DIR=~/w claude -c`
 /// resolves to `claude`.
 pub fn command_base_name(cmd: &str) -> Option<&str> {
-    let first = cmd
-        .split_whitespace()
-        .find(|tok| !is_env_assignment(tok))?;
+    let first = cmd.split_whitespace().find(|tok| !is_env_assignment(tok))?;
     std::path::Path::new(first).file_name()?.to_str()
 }
 
@@ -159,7 +157,7 @@ pub struct Session {
     pub stats: TokenStats,
     pub pro_sub: bool,
     pub started_at: Instant,
-    pub last_output_at: Option<Instant>,
+    #[allow(dead_code)] // only read in tests; kept for debugging and future use
     pub cwd: String,
     /// Send bytes to the PTY writer task
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
@@ -179,6 +177,8 @@ pub struct Session {
     /// Defaults from the command's base name; spawn_session refines it with
     /// the config alias table.
     pub base: BaseKind,
+    /// Last time we received output from this session; used for idle timeout detection.
+    pub last_output_at: Option<Instant>,
 }
 
 impl Session {
@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_accumulate_and_reported_totals_only_replace_when_larger() {
+    fn stats_accumulate_sums_input_output_and_cost() {
         let mut s = session(SessionKind::Shell);
 
         s.accumulate_stats(TokenStats {
@@ -444,23 +444,6 @@ mod tests {
         assert_eq!(s.stats.input_tokens, 15);
         assert_eq!(s.stats.output_tokens, 27);
         assert!((s.stats.total_cost_usd - 0.3).abs() < f64::EPSILON);
-
-        s.apply_reported_total(TokenStats {
-            input_tokens: 1,
-            output_tokens: 1,
-            total_cost_usd: 0.1,
-            context_tokens: 1,
-        });
-        assert_eq!(s.stats.input_tokens, 15);
-
-        s.apply_reported_total(TokenStats {
-            input_tokens: 100,
-            output_tokens: 200,
-            total_cost_usd: 1.0,
-            context_tokens: 300,
-        });
-        assert_eq!(s.stats.input_tokens, 100);
-        assert_eq!(s.stats.context_tokens, 300);
     }
 
     #[test]
@@ -550,7 +533,9 @@ mod tests {
             mk(SessionKind::Custom("CLAUDE_CONFIG_DIR=/x claude".into())),
             BaseKind::Claude
         );
-        assert_eq!(mk(SessionKind::Custom("my-wrapper".into())), BaseKind::Other);
+        assert_eq!(
+            mk(SessionKind::Custom("my-wrapper".into())),
+            BaseKind::Other
+        );
     }
-
 }

@@ -379,8 +379,6 @@ mod tests {
         assert_eq!(cwd.as_deref(), Some("/tmp/linkshell"));
     }
 
-    
-
     #[test]
     fn sessions_dir_prefers_per_session_codex_home() {
         let dir = sessions_dir(Some("/opt/codex-personal")).unwrap();

@@ -34,6 +34,7 @@ pub struct LayoutInfo {
 /// where the terminal interprets them (e.g. \x1b[2J clears the screen mid-draw).
 /// This strips CSI, OSC, and other escape sequences, expands tabs, and drops
 /// remaining non-printable control characters.
+// Only called from #[cfg(test)]; kept here (not inside the mod) so it can test internal logic.
 #[cfg_attr(not(test), allow(dead_code))]
 fn prepare_display(s: &str) -> String {
     // Phase 1: strip escape sequences
@@ -111,7 +112,7 @@ fn kind_color(kind: &SessionKind) -> Color {
 }
 
 fn state_border_style(state: &SessionState, active: bool) -> Style {
-    let base = match state {
+    match state {
         SessionState::Waiting => Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -123,8 +124,7 @@ fn state_border_style(state: &SessionState, active: bool) -> Style {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
         _ => Style::default().fg(Color::DarkGray),
-    };
-    base
+    }
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
@@ -227,7 +227,7 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         let session = &app.sessions[idx];
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
-        let display_rows = area.height.saturating_sub(2) as u16;
+        let display_rows = area.height.saturating_sub(2);
         let scroll_offset = app.scroll_offset() as u16;
         // vt100 handles the scrollback offset internally via set_scrollback;
         // just display the bottom display_rows rows of the virtual screen.
@@ -643,7 +643,9 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
         height: 3,
     };
     let browse_style = Style::default().fg(Color::Cyan);
-    let browse_block = Block::default().borders(Borders::ALL).border_style(browse_style);
+    let browse_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(browse_style);
     let browse_btn = Paragraph::new("Browse")
         .block(browse_block)
         .alignment(Alignment::Center);
@@ -701,11 +703,15 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
 
     // Current path line
     let path_str = state.current_dir.to_string_lossy();
-    let path_line = Paragraph::new(path_str.as_ref())
-        .style(Style::default().fg(Color::Yellow));
+    let path_line = Paragraph::new(path_str.as_ref()).style(Style::default().fg(Color::Yellow));
     f.render_widget(
         path_line,
-        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
     );
 
     // Separator
@@ -713,7 +719,12 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(
         sep,
-        Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: 1 },
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        },
     );
 
     // Directory list
@@ -730,7 +741,10 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
         .map(|i| {
             let label = state.entry_label(i);
             let style = if i == state.selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -742,9 +756,10 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
     f.render_widget(list, list_area);
 
     // Footer
-    let footer = Paragraph::new(" ↑↓: navigate  Enter: open dir  Space: select current  Esc: cancel ")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
+    let footer =
+        Paragraph::new(" ↑↓: navigate  Enter: open dir  Space: select current  Esc: cancel ")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
     f.render_widget(
         footer,
         Rect {
@@ -1219,7 +1234,14 @@ fn build_row(
     sel: Option<&Selection>,
     cursor_col: Option<u16>,
 ) -> ListItem<'static> {
-    ListItem::new(build_row_line(screen, vt_row, screen_cols, disp_row, sel, cursor_col))
+    ListItem::new(build_row_line(
+        screen,
+        vt_row,
+        screen_cols,
+        disp_row,
+        sel,
+        cursor_col,
+    ))
 }
 
 /// Assemble the styled spans for one row. Split out from `build_row` so tests
@@ -1240,7 +1262,7 @@ fn build_row_line(
     let mut cur_style: Option<Style> = None;
 
     for col in 0..screen_cols {
-        let is_sel = sel.map_or(false, |s| s.contains(disp_row, col));
+        let is_sel = sel.is_some_and(|s| s.contains(disp_row, col));
         let is_cursor = cursor_col == Some(col);
         let (content, style) = match screen.cell(vt_row, col) {
             Some(cell) => {

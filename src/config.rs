@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct Config {
     /// Chat-addressable local LLM agents (OpenAI-compatible endpoints such as
@@ -18,20 +18,6 @@ pub struct Config {
     pub pipe: PipeConfig,
     pub pricing: PricingConfig,
     pub keybindings: KeybindingsConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            agents: HashMap::new(),
-            general: GeneralConfig::default(),
-            socket: SocketConfig::default(),
-            sessions: SessionsConfig::default(),
-            pipe: PipeConfig::default(),
-            pricing: PricingConfig::default(),
-            keybindings: KeybindingsConfig::default(),
-        }
-    }
 }
 
 // ── [general] ─────────────────────────────────────────────────────────────
@@ -504,6 +490,4 @@ system = "Be concise."
         assert_eq!(a.system.as_deref(), Some("Be concise."));
         assert!(a.api_key.is_none());
     }
-
-
 }
