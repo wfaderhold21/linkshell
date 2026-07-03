@@ -33,6 +33,7 @@ pub struct LayoutInfo {
 /// where the terminal interprets them (e.g. \x1b[2J clears the screen mid-draw).
 /// This strips CSI, OSC, and other escape sequences, expands tabs, and drops
 /// remaining non-printable control characters.
+// Only called from #[cfg(test)]; kept here (not inside the mod) so it can test internal logic.
 #[cfg_attr(not(test), allow(dead_code))]
 fn prepare_display(s: &str) -> String {
     // Phase 1: strip escape sequences

@@ -1,3 +1,9 @@
+// Council integration: `App::launch_council` is the activation point for this entire
+// module but has no callers in the binary yet. A config-file loader or CLI flag will
+// wire it up once that feature lands; until then everything here is dead from the
+// binary's perspective.
+#![allow(dead_code)]
+
 use serde::de::{self, Deserializer, Visitor};
 use std::collections::HashMap;
 use std::fmt;
@@ -14,7 +20,6 @@ pub struct CouncilConfig {
     pub route: Vec<RouteSpec>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct CouncilMeta {
     pub name: String,
@@ -25,17 +30,14 @@ pub struct CouncilMeta {
     pub done_signal: Option<String>,
 }
 
-#[allow(dead_code)]
 fn default_one() -> u32 {
     1
 }
 
-#[allow(dead_code)]
 fn default_on_ready() -> String {
     "ready".to_string()
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct AgentSpec {
     pub name: String,
@@ -46,7 +48,6 @@ pub struct AgentSpec {
     pub cwd: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct RouteSpec {
     #[serde(deserialize_with = "one_or_many")]
@@ -75,7 +76,6 @@ pub enum JoinMode {
 
 // ── one_or_many deserializer ──────────────────────────────────────────────────
 
-#[allow(dead_code)]
 struct OneOrManyVisitor;
 
 impl<'de> Visitor<'de> for OneOrManyVisitor {
@@ -102,7 +102,6 @@ impl<'de> Visitor<'de> for OneOrManyVisitor {
     }
 }
 
-#[allow(dead_code)]
 fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     d.deserialize_any(OneOrManyVisitor)
 }
@@ -149,7 +148,6 @@ struct JoinRoute {
     unless_signal: Option<String>,
 }
 
-#[allow(dead_code)]
 pub struct CouncilRouter {
     pub group: String,
     pub max_rounds: u32,
@@ -283,7 +281,6 @@ impl CouncilRouter {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 fn parse_extract(s: &str) -> ExtractMode {
     if s == "diff" {
         ExtractMode::Diff

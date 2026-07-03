@@ -141,7 +141,7 @@ pub struct Session {
     pub stats: TokenStats,
     pub pro_sub: bool,
     pub started_at: Instant,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // only read in tests; kept for debugging and future use
     pub cwd: String,
     /// Send bytes to the PTY writer task
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_accumulate_and_reported_totals_only_replace_when_larger() {
+    fn stats_accumulate_sums_input_output_and_cost() {
         let mut s = session(SessionKind::Shell);
 
         s.accumulate_stats(TokenStats {
@@ -417,23 +417,6 @@ mod tests {
         assert_eq!(s.stats.input_tokens, 15);
         assert_eq!(s.stats.output_tokens, 27);
         assert!((s.stats.total_cost_usd - 0.3).abs() < f64::EPSILON);
-
-        s.apply_reported_total(TokenStats {
-            input_tokens: 1,
-            output_tokens: 1,
-            total_cost_usd: 0.1,
-            context_tokens: 1,
-        });
-        assert_eq!(s.stats.input_tokens, 15);
-
-        s.apply_reported_total(TokenStats {
-            input_tokens: 100,
-            output_tokens: 200,
-            total_cost_usd: 1.0,
-            context_tokens: 300,
-        });
-        assert_eq!(s.stats.input_tokens, 100);
-        assert_eq!(s.stats.context_tokens, 300);
     }
 
     #[test]

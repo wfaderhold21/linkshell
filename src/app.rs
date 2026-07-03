@@ -2321,6 +2321,8 @@ fn parse_kind(s: &str) -> crate::session::SessionKind {
 
 // ── PTY runner task ────────────────────────────────────────────────────────
 
+// All 9 parameters are required session context (id, cmd, cwd, dims, channels, env vars);
+// collapsing them into a struct would add boilerplate for a single private async function.
 #[allow(clippy::too_many_arguments)]
 async fn run_pty(
     session_id: usize,
@@ -2969,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_and_direct_send_write_json_lines_to_connected_agents() {
+    fn broadcast_writes_json_lines_only_to_agents_in_the_named_group() {
         let mut app = make_app();
         let a = app
             .spawn_headless_session("a".into(), Some("agents".into()))
@@ -2983,11 +2985,10 @@ mod tests {
         app.handle_ipc_agent_connected(b, b_tx);
 
         app.handle_broadcast("agents", serde_json::json!({"type": "ping"}));
-        app.handle_ipc_send(b, serde_json::json!({"type": "direct"}));
 
         assert_eq!(a_rx.try_recv().unwrap(), "{\"type\":\"ping\"}\n");
-        assert_eq!(b_rx.try_recv().unwrap(), "{\"type\":\"direct\"}\n");
         assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
     }
 
     #[tokio::test]

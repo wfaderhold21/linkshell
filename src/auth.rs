@@ -41,7 +41,7 @@ pub fn worker_caps() -> CapSet {
 }
 
 /// Council members are driven externally by linkshell; they only report state.
-#[allow(dead_code)]
+#[allow(dead_code)] // only called from launch_council, which has no callers in the binary yet
 pub fn council_caps() -> CapSet {
     [Capability::SignalState].into_iter().collect()
 }
