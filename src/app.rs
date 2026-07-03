@@ -120,6 +120,7 @@ impl Default for NewSessionState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
     Normal,
+    Chat,
     NewSession,
     FileBrowser,
     CommandBar,
@@ -129,6 +130,34 @@ pub enum AppMode {
         selected_top: usize,
         selected_sub: Option<usize>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMsg {
+    pub from: String,
+    pub text: String,
+}
+
+/// A chat message injected into a session's PTY, awaiting the session's
+/// return to READY so its answer can be pulled back into the chat.
+#[derive(Debug, Clone)]
+pub struct PendingChat {
+    pub session_id: usize,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatState {
+    pub input: String,
+    pub cursor: usize,
+    pub messages: Vec<ChatMsg>,
+    /// Lines scrolled up from the tail of the transcript.
+    pub scroll: usize,
+    /// Last explicitly addressed target; bare messages go here.
+    pub target: Option<String>,
+    /// Per-local-agent conversation history (role, content), oldest first.
+    pub histories: std::collections::HashMap<String, Vec<(String, String)>>,
+    pub pending: Vec<PendingChat>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +237,7 @@ pub struct App {
     pub file_browser_state: FileBrowserState,
     pub command_bar_area: Rect,
     pub help_area: Rect,
+    pub chat_area: Rect,
     pub menu_bar_area: Rect,
     pub menu_item_areas: Vec<Rect>,
     pub menu_submenu_area: Rect,
@@ -231,6 +261,7 @@ pub struct App {
     pub caps: HashMap<usize, CapSet>,
     /// Optional council router for multi-agent orchestration
     pub council: Option<CouncilRouter>,
+    pub chat: ChatState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -280,6 +311,7 @@ impl App {
             file_browser_state: FileBrowserState::new("."),
             command_bar_area: Rect::default(),
             help_area: Rect::default(),
+            chat_area: Rect::default(),
             menu_bar_area: Rect::default(),
             menu_item_areas: Vec::new(),
             menu_submenu_area: Rect::default(),
@@ -295,6 +327,7 @@ impl App {
             tokens: HashMap::new(),
             caps: HashMap::new(),
             council: None,
+            chat: ChatState::default(),
         }
     }
 
@@ -408,6 +441,12 @@ impl App {
             || alias.as_ref().map(|a| a.kind == "codex").unwrap_or(false)
         {
             crate::session::BaseKind::Codex
+        } else if crate::session::command_base_name(&cmd_str)
+            .map(crate::session::is_local_agent_basename)
+            .unwrap_or(false)
+            || alias.as_ref().map(|a| a.kind == "local").unwrap_or(false)
+        {
+            crate::session::BaseKind::LocalAgent
         } else {
             crate::session::BaseKind::Other
         };
@@ -421,7 +460,7 @@ impl App {
         let home_var = match base {
             crate::session::BaseKind::Claude => Some("CLAUDE_CONFIG_DIR"),
             crate::session::BaseKind::Codex => Some("CODEX_HOME"),
-            crate::session::BaseKind::Other => None,
+            crate::session::BaseKind::LocalAgent | crate::session::BaseKind::Other => None,
         };
         let mut inject_env: Vec<(String, String)> = Vec::new();
         let config_home = home_var.and_then(|var| {
@@ -455,7 +494,7 @@ impl App {
                     config_home,
                 );
             }
-            crate::session::BaseKind::Other => {}
+            crate::session::BaseKind::LocalAgent | crate::session::BaseKind::Other => {}
         }
 
         let wrap_in_shell = !matches!(kind, SessionKind::Shell);
@@ -558,11 +597,20 @@ impl App {
         );
     }
 
+    /// Unified scrollback. Normal-screen apps (shells) use vt100's native
+    /// scrollback; full-screen TUIs (claude, codex, opencode, ...) occupy the
+    /// alternate screen where vt100 keeps none, so we scroll through our own
+    /// captured `output_lines` history instead. Same keys, every session type.
     pub fn scroll_up(&mut self, lines: usize) {
         if let Some(idx) = self.active_idx {
             if let Some(session) = self.sessions.get_mut(idx) {
-                let current = session.screen.screen().scrollback();
-                session.screen.set_scrollback(current + lines);
+                if session.screen.screen().alternate_screen() {
+                    let max = session.output_lines.len();
+                    session.history_scroll = (session.history_scroll + lines).min(max);
+                } else {
+                    let current = session.screen.screen().scrollback();
+                    session.screen.set_scrollback(current + lines);
+                }
             }
         }
     }
@@ -570,8 +618,12 @@ impl App {
     pub fn scroll_down(&mut self, lines: usize) {
         if let Some(idx) = self.active_idx {
             if let Some(session) = self.sessions.get_mut(idx) {
-                let current = session.screen.screen().scrollback();
-                session.screen.set_scrollback(current.saturating_sub(lines));
+                if session.history_scroll > 0 {
+                    session.history_scroll = session.history_scroll.saturating_sub(lines);
+                } else {
+                    let current = session.screen.screen().scrollback();
+                    session.screen.set_scrollback(current.saturating_sub(lines));
+                }
             }
         }
     }
@@ -579,13 +631,14 @@ impl App {
     pub fn clear_scroll(&mut self) {
         if let Some(session) = self.active_session_mut() {
             session.screen.set_scrollback(0);
+            session.history_scroll = 0;
         }
     }
 
     pub fn scroll_offset(&self) -> usize {
         self.active_idx
             .and_then(|i| self.sessions.get(i))
-            .map(|s| s.screen.screen().scrollback())
+            .map(|s| s.screen.screen().scrollback().max(s.history_scroll))
             .unwrap_or(0)
     }
 
@@ -626,19 +679,10 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.process_bytes(&data);
         }
-        // Auto-scroll to bottom when the active session receives new output
-        let active_is_updated = self
-            .active_idx
-            .and_then(|i| self.sessions.get(i))
-            .map(|s| s.id == session_id)
-            .unwrap_or(false);
-        if active_is_updated {
-            if let Some(idx) = self.active_idx {
-                if let Some(session) = self.sessions.get_mut(idx) {
-                    session.screen.set_scrollback(0);
-                }
-            }
-        }
+        // While the user is scrolled up, hold their position (tmux-style)
+        // instead of yanking to the tail on every output burst — full-screen
+        // TUIs redraw constantly, which previously made scrollback unusable
+        // for them. Typing returns to the live view (see clear_scroll).
     }
 
     pub fn handle_session_output(&mut self, session_id: usize, line: String) {
@@ -662,7 +706,10 @@ impl App {
             // Claude and Codex stats come from their JSONL watchers; skip terminal scraping.
             // Uses the resolved base identity so aliased/env-prefixed CLIs are
             // treated the same as plain `claude` / `codex`.
-            if session.base == crate::session::BaseKind::Other {
+            if matches!(
+                session.base,
+                crate::session::BaseKind::Other | crate::session::BaseKind::LocalAgent
+            ) {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
                 }
@@ -673,6 +720,7 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.check_pipes(session_id, &after);
+                self.check_chat_pending(session_id, &after);
                 let council_relays = if let Some(router) = &mut self.council {
                     router.on_state(&self.sessions, session_id, &after)
                 } else {
@@ -815,6 +863,7 @@ impl App {
         }
         if old.as_ref() != Some(&state) {
             self.check_pipes(session_id, &state);
+            self.check_chat_pending(session_id, &state);
             let council_relays = if let Some(router) = &mut self.council {
                 router.on_state(&self.sessions, session_id, &state)
             } else {
@@ -1337,6 +1386,7 @@ impl App {
 
         for id in tick_ready {
             self.check_pipes(id, &SessionState::Ready);
+            self.check_chat_pending(id, &SessionState::Ready);
             let council_relays = if let Some(router) = &mut self.council {
                 router.on_state(&self.sessions, id, &SessionState::Ready)
             } else {
@@ -1366,6 +1416,12 @@ impl App {
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 match self.mode {
+                    AppMode::Chat => {
+                        if !rect_hit(self.chat_area, col, row) {
+                            self.mode = AppMode::Normal;
+                        }
+                        return;
+                    }
                     AppMode::Help => {
                         if !rect_hit(self.help_area, col, row) {
                             self.mode = AppMode::Normal;
@@ -1876,6 +1932,18 @@ impl App {
                 self.execute_council_command(&all_parts[1..]);
                 return;
             }
+            Some("config") => {
+                self.execute_config_command(&all_parts[1..]);
+                return;
+            }
+            Some("grant") => {
+                self.execute_grant_command(&all_parts[1..]);
+                return;
+            }
+            Some("restart") => {
+                self.execute_restart_command(&all_parts[1..]);
+                return;
+            }
             _ => {}
         }
 
@@ -2034,7 +2102,9 @@ impl App {
 
     // ── Write to active PTY ────────────────────────────────────────────────
 
-    pub fn write_to_active(&self, data: &[u8]) {
+    pub fn write_to_active(&mut self, data: &[u8]) {
+        // Typing returns the view to the live tail.
+        self.clear_scroll();
         if let Some(session) = self.active_session() {
             session.write_bytes(data.to_vec());
         }
@@ -2161,6 +2231,272 @@ pub const MENU: &[(&str, &[&str])] = &[
     ("Help", &["Keybindings", "About"]),
 ];
 
+// ── Chat ──────────────────────────────────────────────────────────────────────
+
+impl App {
+    pub fn toggle_chat(&mut self) {
+        self.mode = if matches!(self.mode, AppMode::Chat) {
+            AppMode::Normal
+        } else {
+            AppMode::Chat
+        };
+    }
+
+    pub fn chat_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Esc => self.mode = AppMode::Normal,
+            KeyCode::Enter => self.chat_send(),
+            KeyCode::Backspace => {
+                if self.chat.cursor > 0 {
+                    let mut i = self.chat.cursor - 1;
+                    while i > 0 && !self.chat.input.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    self.chat.input.replace_range(i..self.chat.cursor, "");
+                    self.chat.cursor = i;
+                }
+            }
+            KeyCode::Left => {
+                if self.chat.cursor > 0 {
+                    let mut i = self.chat.cursor - 1;
+                    while i > 0 && !self.chat.input.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    self.chat.cursor = i;
+                }
+            }
+            KeyCode::Right => {
+                if self.chat.cursor < self.chat.input.len() {
+                    let mut i = self.chat.cursor + 1;
+                    while i < self.chat.input.len() && !self.chat.input.is_char_boundary(i) {
+                        i += 1;
+                    }
+                    self.chat.cursor = i;
+                }
+            }
+            KeyCode::PageUp => self.chat.scroll += 10,
+            KeyCode::PageDown => self.chat.scroll = self.chat.scroll.saturating_sub(10),
+            KeyCode::Char(c) => {
+                self.chat.input.insert(self.chat.cursor, c);
+                self.chat.cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fn chat_system(&mut self, text: impl Into<String>) {
+        self.chat.messages.push(ChatMsg {
+            from: "linkshell".to_string(),
+            text: text.into(),
+        });
+    }
+
+    /// Parse and dispatch one chat input line:
+    ///   /agents           list addressable targets
+    ///   /<command>        run any command-bar command without leaving chat
+    ///   @<target> <msg>   address a session (by name or number), a configured
+    ///                     local LLM agent, or `all`
+    ///   <msg>             goes to the last addressed target
+    pub fn chat_send(&mut self) {
+        let raw = std::mem::take(&mut self.chat.input);
+        self.chat.cursor = 0;
+        self.chat.scroll = 0;
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+
+        if raw == "/agents" {
+            let mut targets: Vec<String> = self
+                .config
+                .agents
+                .keys()
+                .map(|k| format!("@{} (local llm)", k))
+                .collect();
+            targets.extend(
+                self.sessions
+                    .iter()
+                    .map(|s| format!("@{} / @{} ({})", s.name, s.id + 1, s.kind.label())),
+            );
+            targets.push("@all (every AI session)".to_string());
+            let list = if targets.is_empty() {
+                "no targets — spawn sessions or configure [agents.*]".to_string()
+            } else {
+                targets.join("   ")
+            };
+            self.chat_system(list);
+            return;
+        }
+
+        if let Some(cmd) = raw.strip_prefix('/') {
+            self.command_input = cmd.to_string();
+            self.execute_command();
+            if !self.command_result.is_empty() {
+                let result = self.command_result.clone();
+                self.chat_system(result);
+                self.command_result.clear();
+            }
+            self.mode = AppMode::Chat; // stay in the pane
+            return;
+        }
+
+        // Resolve the target
+        let (target, msg) = if let Some(rest) = raw.strip_prefix('@') {
+            match rest.split_once(char::is_whitespace) {
+                Some((t, m)) => (t.to_string(), m.trim().to_string()),
+                None => {
+                    self.chat.target = Some(rest.to_string());
+                    self.chat_system(format!("now talking to @{}", rest));
+                    return;
+                }
+            }
+        } else {
+            match &self.chat.target {
+                Some(t) => (t.clone(), raw),
+                None => {
+                    self.chat_system(
+                        "address someone first: @name message (see /agents)",
+                    );
+                    return;
+                }
+            }
+        };
+        self.chat.target = Some(target.clone());
+
+        if target == "all" {
+            let ids: Vec<(usize, String)> = self
+                .sessions
+                .iter()
+                .filter(|s| s.base != crate::session::BaseKind::Other)
+                .map(|s| (s.id, s.name.clone()))
+                .collect();
+            if ids.is_empty() {
+                self.chat_system("no AI sessions to broadcast to");
+                return;
+            }
+            for (id, name) in &ids {
+                self.send_chat_to_session(*id, name.clone(), &msg);
+            }
+            self.chat.messages.push(ChatMsg {
+                from: "you → all".to_string(),
+                text: msg,
+            });
+            return;
+        }
+
+        // Local LLM agent from [agents.*]
+        if let Some(agent) = self.config.agents.get(&target).cloned() {
+            let history = self.chat.histories.entry(target.clone()).or_default();
+            history.push(("user".to_string(), msg.clone()));
+            // Bound context growth
+            let excess = history.len().saturating_sub(40);
+            if excess > 0 {
+                history.drain(..excess);
+            }
+            crate::agent_llm::spawn_chat_request(
+                target.clone(),
+                agent,
+                history.clone(),
+                self.event_tx.clone(),
+            );
+            self.chat.messages.push(ChatMsg {
+                from: format!("you → {}", target),
+                text: msg,
+            });
+            return;
+        }
+
+        // Session by name or number
+        let found = self
+            .sessions
+            .iter()
+            .find(|s| {
+                s.name == target
+                    || target
+                        .parse::<usize>()
+                        .map(|n| s.id + 1 == n)
+                        .unwrap_or(false)
+            })
+            .map(|s| (s.id, s.name.clone()));
+        match found {
+            Some((id, name)) => {
+                self.send_chat_to_session(id, name.clone(), &msg);
+                self.chat.messages.push(ChatMsg {
+                    from: format!("you → {}", name),
+                    text: msg,
+                });
+            }
+            None => {
+                self.chat_system(format!(
+                    "no target '{}' — /agents lists who you can talk to",
+                    target
+                ));
+            }
+        }
+    }
+
+    /// Inject a chat message into a session's PTY and await its READY reply.
+    fn send_chat_to_session(&mut self, id: usize, name: String, msg: &str) {
+        if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+            let mut bytes = msg.as_bytes().to_vec();
+            bytes.push(b'\r');
+            s.write_bytes(bytes);
+        }
+        // One outstanding reply per session; a new message supersedes it.
+        self.chat.pending.retain(|p| p.session_id != id);
+        self.chat.pending.push(PendingChat {
+            session_id: id,
+            name,
+        });
+    }
+
+    /// Called on session state transitions: when a session we're awaiting hits
+    /// READY, pull its answer into the chat transcript.
+    pub fn check_chat_pending(&mut self, session_id: usize, state: &SessionState) {
+        if !matches!(state, SessionState::Ready) {
+            return;
+        }
+        let Some(pos) = self
+            .chat
+            .pending
+            .iter()
+            .position(|p| p.session_id == session_id)
+        else {
+            return;
+        };
+        let pending = self.chat.pending.remove(pos);
+        let reply = crate::pipe::extract_from_session(
+            &self.sessions,
+            session_id,
+            &crate::pipe::ExtractMode::LastBlock,
+        )
+        .or_else(|| {
+            crate::pipe::extract_from_session(
+                &self.sessions,
+                session_id,
+                &crate::pipe::ExtractMode::LastN(40),
+            )
+        });
+        if let Some(text) = reply {
+            self.chat.messages.push(ChatMsg {
+                from: pending.name,
+                text,
+            });
+        }
+    }
+
+    pub fn handle_chat_reply(&mut self, from: String, text: String) {
+        self.chat
+            .histories
+            .entry(from.clone())
+            .or_default()
+            .push(("assistant".to_string(), text.clone()));
+        self.chat.messages.push(ChatMsg { from, text });
+        self.chat.scroll = 0;
+    }
+}
+
 // ── Council ───────────────────────────────────────────────────────────────────
 
 impl App {
@@ -2198,6 +2534,105 @@ impl App {
             self.command_result = format!("council: {}", e);
             self.mode = AppMode::CommandResult;
         }
+    }
+
+    /// `config path` / `config edit` / `config reload`
+    fn execute_config_command(&mut self, args: &[&str]) {
+        self.command_result = match args {
+            ["path"] | [] => match crate::config::config_path() {
+                Some(p) => p.to_string_lossy().to_string(),
+                None => "cannot resolve $HOME".to_string(),
+            },
+            ["edit"] => match crate::config::config_path() {
+                Some(p) => {
+                    // Make sure the file and its directory exist so the editor
+                    // has something to open on first run.
+                    if let Some(dir) = p.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if !p.exists() {
+                        let _ = std::fs::write(&p, "# linkshell configuration\n");
+                    }
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                    let cmd = format!("{} {}", editor, p.to_string_lossy());
+                    let cwd = p
+                        .parent()
+                        .map(|d| d.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "~".to_string());
+                    match self.spawn_session(SessionKind::Custom(cmd), "config".to_string(), cwd)
+                    {
+                        Ok(_) => "editing config — run `config reload` when done".to_string(),
+                        Err(e) => format!("config edit: {}", e),
+                    }
+                }
+                None => "cannot resolve $HOME".to_string(),
+            },
+            ["reload"] => {
+                self.config = std::sync::Arc::new(crate::config::load());
+                    self.keymap = keybindings::build_keymap(&self.config.keybindings);
+                "config reloaded — commands, aliases, agents, pricing, and keybindings apply now; \
+                 socket settings and running watchers keep their old values"
+                    .to_string()
+            }
+            _ => "usage: config path | config edit | config reload".to_string(),
+        };
+        self.mode = AppMode::CommandResult;
+    }
+
+    /// `grant <n> <operator|worker|council>` — change a session's IPC capabilities.
+    fn execute_grant_command(&mut self, args: &[&str]) {
+        self.command_result = match args {
+            [n, tier] => match n.parse::<usize>().ok().and_then(|n| {
+                self.sessions.iter().find(|s| s.id + 1 == n || s.id == n).map(|s| s.id)
+            }) {
+                Some(id) => {
+                    let caps = match *tier {
+                        "operator" => Some(crate::auth::operator_caps()),
+                        "worker" => Some(crate::auth::worker_caps()),
+                        "council" => Some(crate::auth::council_caps()),
+                        _ => None,
+                    };
+                    match caps {
+                        Some(caps) => {
+                            self.caps.insert(id, caps);
+                            format!("session {} granted {} capabilities", n, tier)
+                        }
+                        None => "usage: grant <n> <operator|worker|council>".to_string(),
+                    }
+                }
+                None => format!("no session {}", n),
+            },
+            _ => "usage: grant <n> <operator|worker|council>".to_string(),
+        };
+        self.mode = AppMode::CommandResult;
+    }
+
+    /// `restart [n]` — respawn a session with the same command, name, and cwd.
+    fn execute_restart_command(&mut self, args: &[&str]) {
+        let idx = match args {
+            [] => self.active_idx,
+            [n] => n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| self.sessions.iter().position(|s| s.id + 1 == n || s.id == n)),
+            _ => None,
+        };
+        let Some(idx) = idx else {
+            self.command_result = "usage: restart [n]".to_string();
+            self.mode = AppMode::CommandResult;
+            return;
+        };
+        let (kind, name, cwd, id) = {
+            let s = &self.sessions[idx];
+            (s.kind.clone(), s.name.clone(), s.cwd.clone(), s.id)
+        };
+        let _ = id;
+        self.remove_session(idx);
+        self.command_result = match self.spawn_session(kind, name.clone(), cwd) {
+            Ok(_) => format!("restarted '{}'", name),
+            Err(e) => format!("restart: {}", e),
+        };
+        self.mode = AppMode::CommandResult;
     }
 
     /// Read and parse a council.toml, then launch it.
@@ -3168,5 +3603,113 @@ mod tests {
         assert_eq!(app.sessions[0].kind, SessionKind::Custom("mytool".into()));
         assert_eq!(app.sessions[0].name, "build");
     }
+    #[tokio::test]
+    async fn chat_addresses_sessions_and_captures_ready_reply() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("critic".to_string(), None).unwrap();
+
+        // Bare message with no target yet → guidance, no pending
+        app.chat.input = "hello?".into();
+        app.chat_send();
+        assert!(app.chat.pending.is_empty());
+        assert!(app.chat.messages.last().unwrap().text.contains("@name"));
+
+        // Address the session by name
+        app.chat.input = "@critic review this".into();
+        app.chat_send();
+        assert_eq!(app.chat.pending.len(), 1);
+        assert_eq!(app.chat.target.as_deref(), Some("critic"));
+        assert_eq!(app.chat.messages.last().unwrap().from, "you → critic");
+
+        // Session produces output, then hits READY → reply lands in chat
+        if let Some(s) = app.sessions.iter_mut().find(|s| s.id == id) {
+            s.push_output_line("the fix looks correct".to_string());
+        }
+        app.check_chat_pending(id, &SessionState::Ready);
+        assert!(app.chat.pending.is_empty());
+        let last = app.chat.messages.last().unwrap();
+        assert_eq!(last.from, "critic");
+        assert!(last.text.contains("looks correct"));
+
+        // Bare follow-up reuses the sticky target
+        app.chat.input = "thanks".into();
+        app.chat_send();
+        assert_eq!(app.chat.pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_slash_runs_command_bar_commands_without_leaving_chat() {
+        let mut app = make_app();
+        app.mode = AppMode::Chat;
+        app.chat.input = "/council status".into();
+        app.chat_send();
+        assert!(matches!(app.mode, AppMode::Chat));
+        assert!(app
+            .chat
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .contains("no council running"));
+    }
+
+    #[test]
+    fn chat_local_agent_history_is_bounded_and_roled() {
+        let mut app = make_app();
+        for i in 0..50 {
+            app.chat
+                .histories
+                .entry("qwen".to_string())
+                .or_default()
+                .push(("user".to_string(), format!("m{}", i)));
+        }
+        app.handle_chat_reply("qwen".to_string(), "answer".to_string());
+        let h = &app.chat.histories["qwen"];
+        assert_eq!(h.last().unwrap(), &("assistant".to_string(), "answer".to_string()));
+        assert_eq!(app.chat.messages.last().unwrap().from, "qwen");
+    }
+
+    #[test]
+    fn grant_command_swaps_capability_tiers() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("w".to_string(), None).unwrap();
+        app.command_input = format!("grant {} council", id + 1);
+        app.execute_command();
+        assert_eq!(app.caps[&id], crate::auth::council_caps());
+        app.command_input = format!("grant {} operator", id + 1);
+        app.execute_command();
+        assert_eq!(app.caps[&id], crate::auth::operator_caps());
+    }
+    #[tokio::test]
+    async fn scrollback_is_unified_across_screen_modes() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("tui".to_string(), None).unwrap();
+        app.active_idx = app.sessions.iter().position(|s| s.id == id);
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            for i in 0..100 {
+                s.push_output_line(format!("history-{}", i));
+            }
+            // Enter the alternate screen, like claude/codex/opencode do.
+            s.process_bytes(b"\x1b[?1049h");
+            assert!(s.screen.screen().alternate_screen());
+        }
+        // Scrolling a full-screen app walks our captured history…
+        app.scroll_up(20);
+        assert_eq!(app.sessions[0].history_scroll, 20);
+        assert_eq!(app.scroll_offset(), 20);
+        // …is clamped to what exists…
+        app.scroll_up(500);
+        assert_eq!(app.sessions[0].history_scroll, 100);
+        // …new output does NOT yank the view back…
+        app.handle_session_bytes(id, b"more output\r\n".to_vec());
+        assert_eq!(app.sessions[0].history_scroll, 100);
+        // …and typing returns to the live tail.
+        app.write_to_active(b"x");
+        assert_eq!(app.sessions[0].history_scroll, 0);
+        assert_eq!(app.scroll_offset(), 0);
+    }
+
+
 
 }

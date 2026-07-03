@@ -21,6 +21,7 @@ pub struct LayoutInfo {
     pub file_browser_area: Rect,
     pub command_bar_area: Rect,
     pub help_area: Rect,
+    pub chat_area: Rect,
     pub menu_bar_area: Rect,
     pub menu_item_areas: Vec<Rect>,
     pub menu_submenu_area: Rect,
@@ -166,6 +167,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let mut file_browser_area = Rect::default();
     let mut command_bar_area = Rect::default();
     let mut help_area = Rect::default();
+    let mut chat_area = Rect::default();
 
     match &app.mode {
         AppMode::NewSession => {
@@ -188,6 +190,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         AppMode::Help => {
             help_area = draw_help(f, size);
         }
+        AppMode::Chat => {
+            chat_area = draw_chat(f, app, size);
+        }
         AppMode::Menu { .. } => {
             let menu = draw_menu_bar(f, app, menu_bar_area);
             menu_item_areas = menu.0;
@@ -207,6 +212,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         file_browser_area,
         command_bar_area,
         help_area,
+        chat_area,
         menu_bar_area,
         menu_item_areas,
         menu_submenu_area,
@@ -241,19 +247,40 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         );
         let sel = app.selection.as_ref();
         let cursor = screen.cursor_position();
-        let items: Vec<ListItem> = (start_row..end_row)
-            .enumerate()
-            .map(|(disp_row, vt_row)| {
-                let disp_row = disp_row as u16;
-                // Only show cursor when at the live tail
-                let cursor_col = if scroll_offset == 0 && vt_row == cursor.0 {
-                    Some(cursor.1)
-                } else {
-                    None
-                };
-                build_row(screen, vt_row, screen_cols, disp_row, sel, cursor_col)
-            })
-            .collect();
+        let items: Vec<ListItem> = if session.history_scroll > 0 {
+            // Alternate-screen apps have no vt100 scrollback; show a window of
+            // our captured line history instead. history_scroll counts lines
+            // up from the tail of output_lines.
+            let total = session.output_lines.len();
+            let end = total.saturating_sub(session.history_scroll);
+            let start = end.saturating_sub(display_rows as usize);
+            session
+                .output_lines
+                .iter()
+                .skip(start)
+                .take(end - start)
+                .map(|l| {
+                    ListItem::new(Line::from(Span::styled(
+                        l.clone(),
+                        Style::default().fg(Color::Gray),
+                    )))
+                })
+                .collect()
+        } else {
+            (start_row..end_row)
+                .enumerate()
+                .map(|(disp_row, vt_row)| {
+                    let disp_row = disp_row as u16;
+                    // Only show cursor when at the live tail
+                    let cursor_col = if scroll_offset == 0 && vt_row == cursor.0 {
+                        Some(cursor.1)
+                    } else {
+                        None
+                    };
+                    build_row(screen, vt_row, screen_cols, disp_row, sel, cursor_col)
+                })
+                .collect()
+        };
         let style = state_border_style(&session.state, true);
         (title, items, style)
     } else {
@@ -785,6 +812,8 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
         ("alt-← / alt-→", "Cycle sessions"),
         ("alt-x", "Kill active session"),
         ("alt-c", "Open command bar"),
+        ("alt-t", "Toggle agent chat pane"),
+        ("alt-shift-pgup/pgdn", "Scroll output (any session)"),
         ("alt-h", "Show this help"),
         ("ctrl-space", "Toggle menu bar"),
         ("ctrl-q", "Quit"),
@@ -833,6 +862,172 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
             height: 1,
         },
     );
+
+    popup
+}
+
+// ── Chat pane ───────────────────────────────────────────────────────────────
+
+/// Greedy word wrap; falls back to hard breaks for unbroken runs.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let mut line = String::new();
+        for word in raw_line.split(' ') {
+            let candidate_len = if line.is_empty() {
+                word.chars().count()
+            } else {
+                line.chars().count() + 1 + word.chars().count()
+            };
+            if candidate_len <= width {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            } else {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                // Hard-break words longer than the width
+                let mut w: Vec<char> = word.chars().collect();
+                while w.len() > width {
+                    out.push(w.drain(..width).collect());
+                }
+                line = w.into_iter().collect();
+            }
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn chat_from_style(from: &str) -> Style {
+    if from.starts_with("you") {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else if from == "linkshell" {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let popup = centered_rect(86, 86, area);
+    f.render_widget(Clear, popup);
+
+    let target = app
+        .chat
+        .target
+        .as_deref()
+        .map(|t| format!("@{}", t))
+        .unwrap_or_else(|| "no target".to_string());
+    let block = Block::default()
+        .title(format!(
+            " Chat ─ {}  (@name msg · /cmd · /agents · esc) ",
+            target
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Bottom row: input; the rest: transcript
+    let transcript_h = inner.height.saturating_sub(2) as usize;
+    let width = inner.width as usize;
+
+    // Flatten messages into wrapped, styled lines
+    let mut lines: Vec<Line> = Vec::new();
+    for m in &app.chat.messages {
+        let prefix = format!("{}: ", m.from);
+        let indent = " ".repeat(prefix.chars().count().min(width / 2));
+        let body_width = width.saturating_sub(indent.chars().count()).max(8);
+        for (i, l) in wrap_text(&m.text, body_width).into_iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), chat_from_style(&m.from)),
+                    Span::raw(l),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::raw(l),
+                ]));
+            }
+        }
+    }
+    if !app.chat.pending.is_empty() {
+        let waiting: Vec<&str> = app.chat.pending.iter().map(|p| p.name.as_str()).collect();
+        lines.push(Line::from(Span::styled(
+            format!("… awaiting {}", waiting.join(", ")),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Window: scroll counts lines up from the tail
+    let total = lines.len();
+    let end = total.saturating_sub(app.chat.scroll.min(total));
+    let start = end.saturating_sub(transcript_h);
+    let items: Vec<ListItem> = lines[start..end]
+        .iter()
+        .cloned()
+        .map(ListItem::new)
+        .collect();
+    let transcript = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
+    };
+    f.render_widget(List::new(items), transcript);
+
+    // Separator + input line with cursor overlay
+    let sep = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(2),
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        sep,
+    );
+
+    let input_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(1),
+        width: inner.width,
+        height: 1,
+    };
+    let mut pos = app.chat.cursor.min(app.chat.input.len());
+    while pos > 0 && !app.chat.input.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let (before, after) = app.chat.input.split_at(pos);
+    let (cursor_ch, after) = match after.chars().next() {
+        Some(ch) => (&after[..ch.len_utf8()], &after[ch.len_utf8()..]),
+        None => (" ", ""),
+    };
+    let input_line = Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(Color::Cyan)),
+        Span::raw(before.to_string()),
+        Span::styled(
+            cursor_ch.to_string(),
+            Style::default().fg(Color::Black).bg(Color::White),
+        ),
+        Span::raw(after.to_string()),
+    ]);
+    f.render_widget(Paragraph::new(input_line), input_area);
 
     popup
 }
@@ -1220,4 +1415,12 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn wrap_text_wraps_words_and_hard_breaks_long_runs() {
+        assert_eq!(wrap_text("a bb ccc", 5), vec!["a bb", "ccc"]);
+        assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(wrap_text("", 10), vec![""]);
+        assert_eq!(wrap_text("one\ntwo", 10), vec!["one", "two"]);
+    }
+
 }

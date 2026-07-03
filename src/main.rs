@@ -1,3 +1,4 @@
+mod agent_llm;
 mod app;
 mod auth;
 mod claude_log;
@@ -153,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
             app.file_browser_area = layout.file_browser_area;
             app.command_bar_area = layout.command_bar_area;
             app.help_area = layout.help_area;
+            app.chat_area = layout.chat_area;
             app.menu_bar_area = layout.menu_bar_area;
             app.menu_item_areas = layout.menu_item_areas;
             app.menu_submenu_area = layout.menu_submenu_area;
@@ -210,6 +212,9 @@ async fn main() -> anyhow::Result<()> {
 
 fn handle_event(app: &mut App, event: AppEvent) {
     match event {
+        AppEvent::ChatReply { from, text } => {
+            app.handle_chat_reply(from, text);
+        }
         AppEvent::Tick => app.handle_tick(),
         AppEvent::SessionBytes { session_id, data } => {
             app.handle_session_bytes(session_id, data);
@@ -356,6 +361,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollUpLine => app.scroll_up(3),
                     Action::ScrollDownLine => app.scroll_down(3),
                     Action::OpenMenu => app.open_menu(),
+                    Action::ToggleChat => app.toggle_chat(),
                 }
                 return;
             }
@@ -472,6 +478,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
             _ => {}
         },
+
+        AppMode::Chat => {
+            app.chat_key(key);
+        }
 
         AppMode::Help | AppMode::CommandResult => {
             app.mode = AppMode::Normal; // any key dismisses
