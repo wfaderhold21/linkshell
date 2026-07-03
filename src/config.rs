@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -9,19 +9,6 @@ pub struct Config {
     pub pipe: PipeConfig,
     pub pricing: PricingConfig,
     pub keybindings: KeybindingsConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            socket: SocketConfig::default(),
-            sessions: SessionsConfig::default(),
-            pipe: PipeConfig::default(),
-            pricing: PricingConfig::default(),
-            keybindings: KeybindingsConfig::default(),
-        }
-    }
 }
 
 // ── [general] ─────────────────────────────────────────────────────────────
@@ -461,5 +448,4 @@ kind = "codex"
         let empty: Config = toml::from_str("").unwrap();
         assert!(empty.sessions.aliases.is_empty());
     }
-
 }

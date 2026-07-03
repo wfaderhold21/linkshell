@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::de::{self, Deserializer, Visitor};
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::pipe::{ExtractMode, PipeTrigger};
@@ -14,6 +14,7 @@ pub struct CouncilConfig {
     pub route: Vec<RouteSpec>,
 }
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct CouncilMeta {
     pub name: String,
@@ -24,14 +25,17 @@ pub struct CouncilMeta {
     pub done_signal: Option<String>,
 }
 
+#[allow(dead_code)]
 fn default_one() -> u32 {
     1
 }
 
+#[allow(dead_code)]
 fn default_on_ready() -> String {
     "ready".to_string()
 }
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct AgentSpec {
     pub name: String,
@@ -42,6 +46,7 @@ pub struct AgentSpec {
     pub cwd: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct RouteSpec {
     #[serde(deserialize_with = "one_or_many")]
@@ -70,6 +75,7 @@ pub enum JoinMode {
 
 // ── one_or_many deserializer ──────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct OneOrManyVisitor;
 
 impl<'de> Visitor<'de> for OneOrManyVisitor {
@@ -96,6 +102,7 @@ impl<'de> Visitor<'de> for OneOrManyVisitor {
     }
 }
 
+#[allow(dead_code)]
 fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     d.deserialize_any(OneOrManyVisitor)
 }
@@ -112,10 +119,14 @@ pub fn parse_config(text: &str) -> anyhow::Result<CouncilConfig> {
     let cfg: CouncilConfig =
         toml::from_str(text).map_err(|e| anyhow::anyhow!("invalid council config: {}", e))?;
     if cfg.agent.is_empty() {
-        return Err(anyhow::anyhow!("council config defines no [[agent]] entries"));
+        return Err(anyhow::anyhow!(
+            "council config defines no [[agent]] entries"
+        ));
     }
     if cfg.route.is_empty() {
-        return Err(anyhow::anyhow!("council config defines no [[route]] entries"));
+        return Err(anyhow::anyhow!(
+            "council config defines no [[route]] entries"
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     for a in &cfg.agent {
@@ -138,6 +149,7 @@ struct JoinRoute {
     unless_signal: Option<String>,
 }
 
+#[allow(dead_code)]
 pub struct CouncilRouter {
     pub group: String,
     pub max_rounds: u32,
@@ -218,8 +230,8 @@ impl CouncilRouter {
                 }
             }
 
-            let payload = crate::pipe::extract_from_session(sessions, sid, &route.extract)
-                .or_else(|| {
+            let payload =
+                crate::pipe::extract_from_session(sessions, sid, &route.extract).or_else(|| {
                     // LastBlock only matches ``` fenced output. Agents frequently
                     // answer in plain prose; rather than silently dropping the
                     // turn (which stalls the council), fall back to the tail of
@@ -271,6 +283,7 @@ impl CouncilRouter {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn parse_extract(s: &str) -> ExtractMode {
     if s == "diff" {
         ExtractMode::Diff
@@ -395,7 +408,7 @@ unless_signal = "LGTM"
         assert_eq!(cfg.route[0].from, vec!["author"]);
         assert_eq!(cfg.route[0].on, "ready"); // default
         assert_eq!(cfg.route[0].join, JoinMode::Any); // default
-        // list form preserved
+                                                      // list form preserved
         assert_eq!(cfg.route[1].from, vec!["author", "critic"]);
         assert_eq!(cfg.route[1].join, JoinMode::All);
     }
@@ -411,9 +424,18 @@ unless_signal = "LGTM"
     fn parse_extract_handles_all_modes_with_fallback() {
         assert!(matches!(parse_extract("diff"), ExtractMode::Diff));
         assert!(matches!(parse_extract("last-n=7"), ExtractMode::LastN(7)));
-        assert!(matches!(parse_extract("last-n=bad"), ExtractMode::LastN(20)));
-        assert!(matches!(parse_extract("summarize=99"), ExtractMode::Summarize(99)));
-        assert!(matches!(parse_extract("last-block"), ExtractMode::LastBlock));
+        assert!(matches!(
+            parse_extract("last-n=bad"),
+            ExtractMode::LastN(20)
+        ));
+        assert!(matches!(
+            parse_extract("summarize=99"),
+            ExtractMode::Summarize(99)
+        ));
+        assert!(matches!(
+            parse_extract("last-block"),
+            ExtractMode::LastBlock
+        ));
         assert!(matches!(parse_extract("nonsense"), ExtractMode::LastBlock));
     }
 
@@ -440,9 +462,13 @@ unless_signal = "LGTM"
         assert_eq!(out[0].0, 2);
         assert_eq!(out[1].0, 3);
         // Waiting state must not fire an on-ready route.
-        assert!(router.on_state(&sessions, 1, &SessionState::Waiting).is_empty());
+        assert!(router
+            .on_state(&sessions, 1, &SessionState::Waiting)
+            .is_empty());
         // Non-member session must not fire.
-        assert!(router.on_state(&sessions, 2, &SessionState::Ready).is_empty());
+        assert!(router
+            .on_state(&sessions, 2, &SessionState::Ready)
+            .is_empty());
     }
 
     #[test]
@@ -471,7 +497,9 @@ unless_signal = "LGTM"
             session_with_lines(3, &[]),
         ];
         // First source ready → held, nothing relayed yet.
-        assert!(router.on_state(&sessions, 1, &SessionState::Ready).is_empty());
+        assert!(router
+            .on_state(&sessions, 1, &SessionState::Ready)
+            .is_empty());
         // Second source ready → combined relay fires.
         let out = router.on_state(&sessions, 2, &SessionState::Ready);
         assert_eq!(out.len(), 1);
@@ -481,7 +509,9 @@ unless_signal = "LGTM"
         assert!(out[0].1.contains("[s2]"));
         // max_rounds = 1 → council is now complete and inert.
         assert!(router.complete);
-        assert!(router.on_state(&sessions, 1, &SessionState::Ready).is_empty());
+        assert!(router
+            .on_state(&sessions, 1, &SessionState::Ready)
+            .is_empty());
     }
 
     #[test]

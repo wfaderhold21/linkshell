@@ -380,8 +380,6 @@ mod tests {
         );
     }
 
-    
-
     #[test]
     fn encode_cwd_matches_claude_cli_scheme() {
         assert_eq!(encode_cwd("/home/u/proj"), "-home-u-proj");
@@ -390,9 +388,6 @@ mod tests {
     #[test]
     fn project_dir_prefers_per_session_config_home() {
         let dir = project_dir("/home/u/proj", Some("/opt/claude-work")).unwrap();
-        assert_eq!(
-            dir,
-            PathBuf::from("/opt/claude-work/projects/-home-u-proj")
-        );
+        assert_eq!(dir, PathBuf::from("/opt/claude-work/projects/-home-u-proj"));
     }
 }

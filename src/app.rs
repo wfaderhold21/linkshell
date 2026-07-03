@@ -74,6 +74,7 @@ pub struct NewSessionState {
     pub custom_cmd_cursor: usize,
 }
 
+#[allow(dead_code)]
 impl NewSessionState {
     /// Returns the cursor position for the currently active text field.
     /// Returns 0 for the Kind field (which has no text cursor).
@@ -460,9 +461,19 @@ impl App {
 
         let wrap_in_shell = !matches!(kind, SessionKind::Shell);
         tokio::spawn(async move {
-            if let Err(e) =
-                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, token, wrap_in_shell, inject_env)
-                    .await
+            if let Err(e) = run_pty(
+                id,
+                cmd_str,
+                cwd,
+                pty_rows,
+                pty_cols,
+                tx.clone(),
+                socket,
+                token,
+                wrap_in_shell,
+                inject_env,
+            )
+            .await
             {
                 let _ = tx
                     .send(AppEvent::SessionOutput {
@@ -1262,7 +1273,11 @@ impl App {
 
         let result: Option<(Option<usize>, CapSet)> = if let Some(tok) = token {
             if let Some(&sid) = self.tokens.get(&tok) {
-                let caps = self.caps.get(&sid).cloned().unwrap_or_else(crate::auth::worker_caps);
+                let caps = self
+                    .caps
+                    .get(&sid)
+                    .cloned()
+                    .unwrap_or_else(crate::auth::worker_caps);
                 Some((Some(sid), caps))
             } else {
                 None
@@ -1317,16 +1332,13 @@ impl App {
             if !session.ipc_state {
                 if let Some(last) = session.last_output_at {
                     let elapsed = last.elapsed();
-                    if elapsed > Duration::from_secs(2)
+                    if (elapsed > Duration::from_secs(2)
                         && matches!(
                             session.state,
                             SessionState::Running | SessionState::Thinking
-                        )
-                    {
-                        session.state = SessionState::Ready;
-                        tick_ready.push(session.id);
-                    } else if elapsed > Duration::from_secs(30)
-                        && session.state == SessionState::Waiting
+                        ))
+                        || (elapsed > Duration::from_secs(30)
+                            && session.state == SessionState::Waiting)
                     {
                         session.state = SessionState::Ready;
                         tick_ready.push(session.id);
@@ -1377,7 +1389,11 @@ impl App {
                         return;
                     }
                     AppMode::FileBrowser => {
-                        self.handle_file_browser_mouse(col, row, crate::ui::FILE_BROWSER_VISIBLE_ROWS);
+                        self.handle_file_browser_mouse(
+                            col,
+                            row,
+                            crate::ui::FILE_BROWSER_VISIBLE_ROWS,
+                        );
                         return;
                     }
                     AppMode::CommandBar => {
@@ -1421,13 +1437,13 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if rect_inner_hit(self.output_area, col, row) {
-                    let (c, r) = to_content_coords(self.output_area, col, row);
-                    if let Some(sel) = &mut self.selection {
-                        sel.end_col = c;
-                        sel.end_row = r;
-                    }
+            MouseEventKind::Drag(MouseButton::Left)
+                if rect_inner_hit(self.output_area, col, row) =>
+            {
+                let (c, r) = to_content_coords(self.output_area, col, row);
+                if let Some(sel) = &mut self.selection {
+                    sel.end_col = c;
+                    sel.end_row = r;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -1442,11 +1458,8 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Down(MouseButton::Right) => {
-                // Right-click copies current selection (or clears it)
-                if self.selection.is_some() {
-                    self.copy_selection();
-                }
+            MouseEventKind::Down(MouseButton::Right) if self.selection.is_some() => {
+                self.copy_selection();
             }
             MouseEventKind::ScrollUp => {
                 if matches!(self.mode, AppMode::NewSession) {
@@ -1566,7 +1579,7 @@ impl App {
         let session = self.active_session()?;
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
-        let display_rows = self.output_area.height.saturating_sub(2) as u16;
+        let display_rows = self.output_area.height.saturating_sub(2);
         let start_vt_row = screen_rows.saturating_sub(display_rows);
 
         let ((min_row, min_col), (max_row, max_col)) = sel.normalized();
@@ -1769,7 +1782,11 @@ impl App {
     }
 
     pub fn file_browser_select(&mut self) {
-        let s = self.file_browser_state.current_dir.to_string_lossy().to_string();
+        let s = self
+            .file_browser_state
+            .current_dir
+            .to_string_lossy()
+            .to_string();
         self.new_session_state.cwd = s.clone();
         self.new_session_state.cwd_cursor = s.len();
         self.new_session_state.active_field = NewSessionField::Cwd;
@@ -2206,10 +2223,7 @@ impl App {
         self.launch_council(cfg)
     }
 
-    pub fn launch_council(
-        &mut self,
-        cfg: crate::council::CouncilConfig,
-    ) -> anyhow::Result<()> {
+    pub fn launch_council(&mut self, cfg: crate::council::CouncilConfig) -> anyhow::Result<()> {
         if self.council.is_some() {
             return Err(anyhow::anyhow!(
                 "a council is already running — `council stop` first"
@@ -2261,11 +2275,10 @@ impl App {
                 .iter()
                 .filter_map(|n| name_to_id.get(n).copied())
                 .collect();
-            let to: Vec<usize> = r
-                .to
-                .iter()
-                .filter_map(|n| name_to_id.get(n).copied())
-                .collect();
+            let to: Vec<usize> =
+                r.to.iter()
+                    .filter_map(|n| name_to_id.get(n).copied())
+                    .collect();
             router.add_route(from, to, r);
         }
 
@@ -2340,8 +2353,7 @@ async fn run_pty(
             // only the first word of a plain simple command gets alias-expanded.
             // We also re-cd to the configured cwd so that any `cd` in .bashrc does
             // not shift claude to a different directory and break the JSONL watcher.
-            let shell =
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
             let escaped_cwd = cwd.replace('\'', "'\\''");
             let shell_cmd = format!("cd '{}' && {}", escaped_cwd, cmd);
             let mut c = pty_process::Command::new(&shell);
@@ -3168,5 +3180,4 @@ mod tests {
         assert_eq!(app.sessions[0].kind, SessionKind::Custom("mytool".into()));
         assert_eq!(app.sessions[0].name, "build");
     }
-
 }

@@ -30,9 +30,9 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use app::{App, AppMode, NewSessionField};
-use ui::FILE_BROWSER_VISIBLE_ROWS;
 use events::AppEvent;
 use keybindings::Action;
+use ui::FILE_BROWSER_VISIBLE_ROWS;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,7 +61,12 @@ async fn main() -> anyhow::Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )
     .is_ok();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -91,20 +96,18 @@ async fn main() -> anyhow::Result<()> {
         loop {
             if event::poll(Duration::from_millis(50)).unwrap_or(false) {
                 match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if key_tx.send(AppEvent::Key(key)).await.is_err() {
-                            break;
-                        }
+                    Ok(Event::Key(key)) if key_tx.send(AppEvent::Key(key)).await.is_err() => {
+                        break;
                     }
-                    Ok(Event::Mouse(mouse)) => {
-                        if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() {
-                            break;
-                        }
+                    Ok(Event::Mouse(mouse))
+                        if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() =>
+                    {
+                        break;
                     }
-                    Ok(Event::Paste(text)) => {
-                        if key_tx.send(AppEvent::Paste(text)).await.is_err() {
-                            break;
-                        }
+                    Ok(Event::Paste(text))
+                        if key_tx.send(AppEvent::Paste(text.clone())).await.is_err() =>
+                    {
+                        break;
                     }
                     _ => {}
                 }
@@ -302,7 +305,13 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
         AppEvent::Paste(text) => handle_paste(app, text),
-        AppEvent::Authenticate { token, transport, name, group, response_tx } => {
+        AppEvent::Authenticate {
+            token,
+            transport,
+            name,
+            group,
+            response_tx,
+        } => {
             app.handle_authenticate(token, transport, name, group, response_tx);
         }
     }
@@ -526,11 +535,9 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         KeyCode::Char(c) => {
-            if key.modifiers == KeyModifiers::CONTROL {
-                if c.is_ascii_alphabetic() {
-                    let b = (c.to_ascii_lowercase() as u8) - b'a' + 1;
-                    return vec![b];
-                }
+            if key.modifiers == KeyModifiers::CONTROL && c.is_ascii_alphabetic() {
+                let b = (c.to_ascii_lowercase() as u8) - b'a' + 1;
+                return vec![b];
             }
             let mut buf = [0u8; 4];
             c.encode_utf8(&mut buf).as_bytes().to_vec()

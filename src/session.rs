@@ -45,9 +45,7 @@ impl SessionKind {
 /// `VAR=value` environment assignments — so `CLAUDE_CONFIG_DIR=~/w claude -c`
 /// resolves to `claude`.
 pub fn command_base_name(cmd: &str) -> Option<&str> {
-    let first = cmd
-        .split_whitespace()
-        .find(|tok| !is_env_assignment(tok))?;
+    let first = cmd.split_whitespace().find(|tok| !is_env_assignment(tok))?;
     std::path::Path::new(first).file_name()?.to_str()
 }
 
@@ -143,7 +141,7 @@ pub struct Session {
     pub stats: TokenStats,
     pub pro_sub: bool,
     pub started_at: Instant,
-    pub last_output_at: Option<Instant>,
+    #[allow(dead_code)]
     pub cwd: String,
     /// Send bytes to the PTY writer task
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
@@ -159,6 +157,8 @@ pub struct Session {
     /// Defaults from the command's base name; spawn_session refines it with
     /// the config alias table.
     pub base: BaseKind,
+    /// Last time we received output from this session; used for idle timeout detection.
+    pub last_output_at: Option<Instant>,
 }
 
 impl Session {
@@ -523,7 +523,9 @@ mod tests {
             mk(SessionKind::Custom("CLAUDE_CONFIG_DIR=/x claude".into())),
             BaseKind::Claude
         );
-        assert_eq!(mk(SessionKind::Custom("my-wrapper".into())), BaseKind::Other);
+        assert_eq!(
+            mk(SessionKind::Custom("my-wrapper".into())),
+            BaseKind::Other
+        );
     }
-
 }

@@ -164,12 +164,17 @@ mod tests {
         assert_eq!(env.id, Some(7));
         assert!(matches!(
             env.msg,
-            Message::State { state: SessionState::Ready, .. }
+            Message::State {
+                state: SessionState::Ready,
+                ..
+            }
         ));
         // id is omitted from fire-and-forget messages when serialized
         let out = serde_json::to_string(&Envelope {
             id: None,
-            msg: Message::Query { what: "sessions".into() },
+            msg: Message::Query {
+                what: "sessions".into(),
+            },
         })
         .unwrap();
         assert!(!out.contains("\"id\""));
@@ -182,13 +187,17 @@ mod tests {
             serde_json::from_str(r#"{"msg":{"type":"hello","protocol":1}}"#).unwrap();
         assert!(matches!(
             hello.msg,
-            Message::Hello { protocol: 1, token: None, name: None, group: None }
+            Message::Hello {
+                protocol: 1,
+                token: None,
+                name: None,
+                group: None
+            }
         ));
 
-        let wait: Envelope = serde_json::from_str(
-            r#"{"id":1,"msg":{"type":"session_input_wait","session_id":3}}"#,
-        )
-        .unwrap();
+        let wait: Envelope =
+            serde_json::from_str(r#"{"id":1,"msg":{"type":"session_input_wait","session_id":3}}"#)
+                .unwrap();
         match wait.msg {
             Message::SessionInputWait { session_id, text } => {
                 assert_eq!(session_id, 3);
@@ -202,20 +211,42 @@ mod tests {
     fn required_cap_gates_every_privileged_message() {
         use crate::auth::Capability::*;
         let cases: Vec<(Message, Option<crate::auth::Capability>)> = vec![
-            (Message::Query { what: "sessions".into() }, Some(Query)),
             (
-                Message::SessionInputWait { session_id: 0, text: String::new() },
+                Message::Query {
+                    what: "sessions".into(),
+                },
+                Some(Query),
+            ),
+            (
+                Message::SessionInputWait {
+                    session_id: 0,
+                    text: String::new(),
+                },
                 Some(InjectInput),
             ),
             (
-                Message::SessionCreate { kind: "shell".into(), name: None, cwd: None },
+                Message::SessionCreate {
+                    kind: "shell".into(),
+                    name: None,
+                    cwd: None,
+                },
                 Some(CreateSession),
             ),
             (
-                Message::Hello { protocol: 1, token: None, name: None, group: None },
+                Message::Hello {
+                    protocol: 1,
+                    token: None,
+                    name: None,
+                    group: None,
+                },
                 None,
             ),
-            (Message::Relay { content: String::new() }, None),
+            (
+                Message::Relay {
+                    content: String::new(),
+                },
+                None,
+            ),
         ];
         for (msg, expected) in cases {
             assert_eq!(required_cap(&msg), expected);
