@@ -75,7 +75,7 @@ pub struct NewSessionState {
 }
 
 impl NewSessionState {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used only in #[cfg(test)] module
     /// Returns the cursor position for the currently active text field.
     /// Returns 0 for the Kind field (which has no text cursor).
     /// Kept as public API surface; exercised by the dialog cursor tests.
