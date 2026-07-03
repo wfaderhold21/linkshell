@@ -77,6 +77,8 @@ pub struct NewSessionState {
 impl NewSessionState {
     /// Returns the cursor position for the currently active text field.
     /// Returns 0 for the Kind field (which has no text cursor).
+    /// Kept as public API surface; exercised by the dialog cursor tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cursor_pos(&self) -> usize {
         match self.active_field {
             NewSessionField::Kind => 0,
@@ -371,26 +373,95 @@ impl App {
             self.active_idx = Some(idx);
         }
 
-        // Mint a capability token for this session.
+        // Mint a capability token for this session. Interactive shells belong
+        // to the human and keep full operator rights (so orchestrator scripts
+        // run inside a linkshell shell can manage pipes / create sessions);
+        // AI agent sessions are confined to worker capabilities.
         let token = crate::auth::mint_token();
         self.tokens.insert(token.clone(), id);
-        self.caps.insert(id, crate::auth::worker_caps());
+        let caps = if matches!(kind, SessionKind::Shell) {
+            crate::auth::operator_caps()
+        } else {
+            crate::auth::worker_caps()
+        };
+        self.caps.insert(id, caps);
 
         let tx = self.event_tx.clone();
         let cfg = Arc::clone(&self.config);
         let socket = crate::ipc::socket_path(&self.config);
 
-        if kind.is_claude_based() {
-            crate::claude_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
+        // ── Resolve the session's real CLI identity ─────────────────────────
+        // A "claude" session may be spelled many ways: the plain binary, an
+        // env-prefixed command (CLAUDE_CONFIG_DIR=~/w claude), or an aliased
+        // wrapper mapped in [sessions.aliases]. Resolve base kind + config
+        // home here so the JSONL watcher tracks the right log directory.
+        let alias = crate::session::command_base_name(&cmd_str)
+            .and_then(|b| self.config.sessions.aliases.get(b))
+            .cloned();
+        let base = if kind.is_claude_based()
+            || crate::session::command_base_name(&cmd_str) == Some("claude")
+            || alias.as_ref().map(|a| a.kind == "claude").unwrap_or(false)
+        {
+            crate::session::BaseKind::Claude
+        } else if kind.is_codex_based()
+            || crate::session::command_base_name(&cmd_str) == Some("codex")
+            || alias.as_ref().map(|a| a.kind == "codex").unwrap_or(false)
+        {
+            crate::session::BaseKind::Codex
+        } else {
+            crate::session::BaseKind::Other
+        };
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+            s.base = base;
         }
-        if kind.is_codex_based() {
-            crate::codex_log::spawn_watcher(id, cwd.clone(), tx.clone(), Arc::clone(&cfg));
+
+        // Config home precedence: inline env prefix on the command wins, then
+        // the alias table. When it comes from the alias table the CLI itself
+        // hasn't been told, so also inject it into the PTY environment.
+        let home_var = match base {
+            crate::session::BaseKind::Claude => Some("CLAUDE_CONFIG_DIR"),
+            crate::session::BaseKind::Codex => Some("CODEX_HOME"),
+            crate::session::BaseKind::Other => None,
+        };
+        let mut inject_env: Vec<(String, String)> = Vec::new();
+        let config_home = home_var.and_then(|var| {
+            if let Some(inline) = crate::session::command_env_assignment(&cmd_str, var) {
+                Some(expand_tilde(&inline))
+            } else if let Some(dir) = alias.as_ref().and_then(|a| a.config_dir.clone()) {
+                let dir = expand_tilde(&dir);
+                inject_env.push((var.to_string(), dir.clone()));
+                Some(dir)
+            } else {
+                None
+            }
+        });
+
+        match base {
+            crate::session::BaseKind::Claude => {
+                crate::claude_log::spawn_watcher(
+                    id,
+                    cwd.clone(),
+                    tx.clone(),
+                    Arc::clone(&cfg),
+                    config_home,
+                );
+            }
+            crate::session::BaseKind::Codex => {
+                crate::codex_log::spawn_watcher(
+                    id,
+                    cwd.clone(),
+                    tx.clone(),
+                    Arc::clone(&cfg),
+                    config_home,
+                );
+            }
+            crate::session::BaseKind::Other => {}
         }
 
         let wrap_in_shell = !matches!(kind, SessionKind::Shell);
         tokio::spawn(async move {
             if let Err(e) =
-                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, token, wrap_in_shell)
+                run_pty(id, cmd_str, cwd, pty_rows, pty_cols, tx.clone(), socket, token, wrap_in_shell, inject_env)
                     .await
             {
                 let _ = tx
@@ -578,7 +649,7 @@ impl App {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&line);
             session.push_output_line(stripped.clone());
-            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+            if let Some(new_state) = self.matcher.infer_state(&stripped, session.base) {
                 // When JSONL is active it owns Thinking/Running/Ready transitions, but it
                 // cannot see permission prompts or question text, so Waiting and Error must
                 // still come from terminal pattern matching.
@@ -589,7 +660,9 @@ impl App {
                 }
             }
             // Claude and Codex stats come from their JSONL watchers; skip terminal scraping.
-            if !session.kind.is_claude_based() && !session.kind.is_codex_based() {
+            // Uses the resolved base identity so aliased/env-prefixed CLIs are
+            // treated the same as plain `claude` / `codex`.
+            if session.base == crate::session::BaseKind::Other {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
                 }
@@ -698,7 +771,7 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&text);
-            if let Some(new_state) = self.matcher.infer_state(&stripped, &session.kind) {
+            if let Some(new_state) = self.matcher.infer_state(&stripped, session.base) {
                 // Partial lines can detect Thinking/Waiting/Ready but must not
                 // flip to Running — that requires a complete line.
                 // Even with JSONL active, Waiting and Error must pass through because
@@ -722,7 +795,10 @@ impl App {
 
     pub fn handle_session_stats(&mut self, session_id: usize, stats: crate::session::TokenStats) {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            s.stats = stats;
+            // JSONL watchers report cumulative totals. Only accept monotonically
+            // increasing cost so a watcher re-reading a fresh log file can't
+            // wipe accumulated spend back to zero.
+            s.apply_reported_total(stats);
         }
     }
 
@@ -864,14 +940,23 @@ impl App {
         self.pipe_tasks = keep;
     }
 
+    /// Push a raw JSON line to a connected headless agent.
+    pub fn handle_ipc_send(&self, session_id: usize, message: serde_json::Value) {
+        if let Some(tx) = self.agent_writers.get(&session_id) {
+            let line = serde_json::to_string(&message).unwrap_or_default() + "\n";
+            let _ = tx.try_send(line);
+        }
+    }
+
     pub fn handle_broadcast(&self, group: &str, msg: serde_json::Value) {
-        let line = serde_json::to_string(&msg).unwrap_or_default() + "\n";
-        for session in &self.sessions {
-            if session.group.as_deref() == Some(group) {
-                if let Some(tx) = self.agent_writers.get(&session.id) {
-                    let _ = tx.try_send(line.clone());
-                }
-            }
+        let members: Vec<usize> = self
+            .sessions
+            .iter()
+            .filter(|s| s.group.as_deref() == Some(group))
+            .map(|s| s.id)
+            .collect();
+        for id in members {
+            self.handle_ipc_send(id, msg.clone());
         }
     }
 
@@ -909,13 +994,6 @@ impl App {
             .position(|s| s.id == session_id && s.headless)
         {
             self.remove_session(idx);
-        }
-    }
-
-    pub fn handle_ipc_send(&self, session_id: usize, message: serde_json::Value) {
-        if let Some(tx) = self.agent_writers.get(&session_id) {
-            let line = serde_json::to_string(&message).unwrap_or_default() + "\n";
-            let _ = tx.try_send(line);
         }
     }
 
@@ -1102,17 +1180,6 @@ impl App {
                     }
                 }
             }
-            IpcQueryPayload::Register { name, group } => {
-                match self.spawn_headless_session(name, group) {
-                    Ok(new_id) => {
-                        let _ = response_tx
-                            .send(serde_json::json!({"type": "registered", "session_id": new_id}));
-                    }
-                    Err(e) => {
-                        let _ = response_tx.send(serde_json::json!({"error": e.to_string()}));
-                    }
-                }
-            }
             IpcQueryPayload::Query { what } => {
                 let resp = match what.as_str() {
                     "sessions" => {
@@ -1126,6 +1193,7 @@ impl App {
                                     "kind":          s.kind.label(),
                                     "state":         s.state.label(),
                                     "group":         s.group,
+                                    "cwd":           s.cwd,
                                     "input_tokens":  s.stats.input_tokens,
                                     "output_tokens": s.stats.output_tokens,
                                     "cost_usd":      s.stats.total_cost_usd,
@@ -1804,11 +1872,24 @@ impl App {
                 self.execute_unpipe_command(&all_parts[1..]);
                 return;
             }
+            Some("council") => {
+                self.execute_council_command(&all_parts[1..]);
+                return;
+            }
             _ => {}
         }
 
         let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
         match parts.as_slice() {
+            // `new custom <full command line>` — the remainder is the command,
+            // spaces and env prefixes included (name is auto-assigned).
+            ["new", "custom", rest @ ..] if !rest.is_empty() => {
+                let command = rest.first().unwrap_or(&"").to_string();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "~".to_string());
+                let _ = self.spawn_session(SessionKind::Custom(command), String::new(), cwd);
+            }
             ["new", kind_str, rest @ ..] => {
                 let name = rest.first().unwrap_or(&"").to_string();
                 let kind = match *kind_str {
@@ -2083,10 +2164,73 @@ pub const MENU: &[(&str, &[&str])] = &[
 // ── Council ───────────────────────────────────────────────────────────────────
 
 impl App {
+    /// `council <file>` / `council load <file>` / `council status` / `council stop`
+    fn execute_council_command(&mut self, args: &[&str]) {
+        let result = match args {
+            [] | ["status"] => {
+                self.command_result = match &self.council {
+                    Some(r) => format!(
+                        "council '{}': round {}/{}{}",
+                        r.group,
+                        r.round,
+                        r.max_rounds,
+                        if r.complete { "  [complete]" } else { "" },
+                    ),
+                    None => "no council running — usage: council <file.toml>".to_string(),
+                };
+                self.mode = AppMode::CommandResult;
+                return;
+            }
+            ["stop"] => {
+                self.command_result = match self.council.take() {
+                    Some(r) => format!("council '{}' stopped (sessions left running)", r.group),
+                    None => "no council running".to_string(),
+                };
+                self.mode = AppMode::CommandResult;
+                return;
+            }
+            ["load", path] | [path] => self.load_council_file(path),
+            _ => Err(anyhow::anyhow!(
+                "usage: council <file.toml> | council status | council stop"
+            )),
+        };
+        if let Err(e) = result {
+            self.command_result = format!("council: {}", e);
+            self.mode = AppMode::CommandResult;
+        }
+    }
+
+    /// Read and parse a council.toml, then launch it.
+    pub fn load_council_file(&mut self, path: &str) -> anyhow::Result<()> {
+        let cfg = crate::council::load_config_file(path)?;
+        self.launch_council(cfg)
+    }
+
     pub fn launch_council(
         &mut self,
         cfg: crate::council::CouncilConfig,
     ) -> anyhow::Result<()> {
+        if self.council.is_some() {
+            return Err(anyhow::anyhow!(
+                "a council is already running — `council stop` first"
+            ));
+        }
+        if self.sessions.len() + cfg.agent.len() > MAX_SESSIONS {
+            return Err(anyhow::anyhow!(
+                "council needs {} sessions but only {} slots are free",
+                cfg.agent.len(),
+                MAX_SESSIONS - self.sessions.len()
+            ));
+        }
+        // Validate route names before spawning anything.
+        for r in &cfg.route {
+            for n in r.from.iter().chain(r.to.iter()) {
+                if !cfg.agent.iter().any(|a| &a.name == n) {
+                    return Err(anyhow::anyhow!("route references unknown agent '{}'", n));
+                }
+            }
+        }
+
         let group = cfg.council.name.clone();
         let mut name_to_id: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -2143,6 +2287,16 @@ impl App {
     }
 }
 
+/// Expand a leading `~` or `~/` to $HOME. Anything else passes through.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
 fn parse_kind(s: &str) -> crate::session::SessionKind {
     match s {
         "claude" => crate::session::SessionKind::Claude,
@@ -2154,6 +2308,7 @@ fn parse_kind(s: &str) -> crate::session::SessionKind {
 
 // ── PTY runner task ────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_pty(
     session_id: usize,
     cmd: String,
@@ -2164,6 +2319,7 @@ async fn run_pty(
     linkshell_sock: String,
     linkshell_token: String,
     wrap_in_shell: bool,
+    extra_env: Vec<(String, String)>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -2205,6 +2361,12 @@ async fn run_pty(
         command.env("LINKSHELL_SESSION_ID", session_id.to_string());
         command.env("LINKSHELL_SOCK", &linkshell_sock);
         command.env("LINKSHELL_TOKEN", &linkshell_token);
+        // Identity env for aliased claude/codex sessions (CLAUDE_CONFIG_DIR /
+        // CODEX_HOME from [sessions.aliases]); set on the shell so the CLI and
+        // any children inherit it.
+        for (k, v) in &extra_env {
+            command.env(k, v);
+        }
         command.spawn(&pts)?
     };
 
@@ -2985,4 +3147,26 @@ mod tests {
     fn strip_ansi_removes_csi_sequences_and_keeps_plain_text() {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m plain"), "red plain");
     }
+    #[tokio::test]
+    async fn command_bar_new_custom_takes_full_command_line() {
+        let mut app = make_app();
+        app.command_input = "new custom CLAUDE_CONFIG_DIR=/tmp/w claude --continue".into();
+        app.execute_command();
+        assert_eq!(app.sessions.len(), 1);
+        let s = &app.sessions[0];
+        assert_eq!(
+            s.kind,
+            SessionKind::Custom("CLAUDE_CONFIG_DIR=/tmp/w claude --continue".into())
+        );
+        // env-prefixed claude resolves to the Claude identity
+        assert_eq!(s.base, crate::session::BaseKind::Claude);
+
+        // single-token form still works: `new <cmd> [name]`
+        let mut app = make_app();
+        app.command_input = "new mytool build".into();
+        app.execute_command();
+        assert_eq!(app.sessions[0].kind, SessionKind::Custom("mytool".into()));
+        assert_eq!(app.sessions[0].name, "build");
+    }
+
 }

@@ -24,17 +24,6 @@ impl SessionKind {
         }
     }
 
-    pub fn command(&self) -> String {
-        match self {
-            SessionKind::Claude => "claude".to_string(),
-            SessionKind::Codex => "codex".to_string(),
-            SessionKind::Shell => {
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
-            }
-            SessionKind::Custom(c) => c.clone(),
-        }
-    }
-
     pub fn is_claude_based(&self) -> bool {
         matches!(self, SessionKind::Claude) || self.custom_base_name() == Some("claude")
     }
@@ -45,12 +34,59 @@ impl SessionKind {
 
     fn custom_base_name(&self) -> Option<&str> {
         if let SessionKind::Custom(cmd) = self {
-            let first = cmd.split_whitespace().next()?;
-            std::path::Path::new(first).file_name()?.to_str()
+            command_base_name(cmd)
         } else {
             None
         }
     }
+}
+
+/// Basename of the actual binary in a command line, skipping leading
+/// `VAR=value` environment assignments — so `CLAUDE_CONFIG_DIR=~/w claude -c`
+/// resolves to `claude`.
+pub fn command_base_name(cmd: &str) -> Option<&str> {
+    let first = cmd
+        .split_whitespace()
+        .find(|tok| !is_env_assignment(tok))?;
+    std::path::Path::new(first).file_name()?.to_str()
+}
+
+/// A token is an env assignment if it has `NAME=` where NAME is a valid
+/// identifier (letters, digits, underscore; not starting with a digit).
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// Extract the value of a leading `VAR=value` assignment from a command line.
+/// Only assignments *before* the command word count; strips simple quoting.
+pub fn command_env_assignment(cmd: &str, var: &str) -> Option<String> {
+    for tok in cmd.split_whitespace() {
+        if !is_env_assignment(tok) {
+            return None; // reached the command word
+        }
+        let (name, value) = tok.split_once('=')?;
+        if name == var {
+            let value = value.trim_matches('"').trim_matches('\'');
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// The underlying CLI identity of a session, independent of how the command
+/// was spelled (direct, env-prefixed, or aliased via config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseKind {
+    Claude,
+    Codex,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -119,6 +155,10 @@ pub struct Session {
     /// Raw bytes received since the last tick — used to detect active generation
     /// without relying on newlines (Claude Code streams via cursor movement, not \n).
     pub bytes_since_last_tick: usize,
+    /// Resolved CLI identity: which JSONL watcher / stats pipeline applies.
+    /// Defaults from the command's base name; spawn_session refines it with
+    /// the config alias table.
+    pub base: BaseKind,
 }
 
 impl Session {
@@ -131,6 +171,13 @@ impl Session {
         cols: u16,
         scroll_buffer_lines: usize,
     ) -> Self {
+        let base = if kind.is_claude_based() {
+            BaseKind::Claude
+        } else if kind.is_codex_based() {
+            BaseKind::Codex
+        } else {
+            BaseKind::Other
+        };
         Self {
             id,
             name,
@@ -151,6 +198,7 @@ impl Session {
             output_lines: VecDeque::new(),
             scroll_buffer_lines,
             bytes_since_last_tick: 0,
+            base,
         }
     }
 
@@ -233,9 +281,9 @@ impl Session {
         self.stats.total_cost_usd += new.total_cost_usd;
     }
 
-    /// Replace stats with an authoritative total (e.g. from /cost).
-    /// Only replaces when the reported value exceeds what we have accumulated,
-    /// so it acts as a correction when our running total drifted.
+    /// Replace stats with an externally reported cumulative total, but only if
+    /// the reported cost is higher than what we already have — protects against
+    /// stale or restarted watchers regressing the counters.
     pub fn apply_reported_total(&mut self, new: TokenStats) {
         if new.total_cost_usd > self.stats.total_cost_usd {
             self.stats = new;
@@ -418,4 +466,64 @@ mod tests {
         let lines: Vec<_> = session.output_lines.iter().cloned().collect();
         assert_eq!(lines, vec!["line-2", "line-3", "line-4"]);
     }
+    #[test]
+    fn command_base_name_skips_leading_env_assignments() {
+        assert_eq!(command_base_name("claude --continue"), Some("claude"));
+        assert_eq!(
+            command_base_name("CLAUDE_CONFIG_DIR=~/w claude --continue"),
+            Some("claude")
+        );
+        assert_eq!(
+            command_base_name("A=1 B=two /usr/local/bin/codex"),
+            Some("codex")
+        );
+        // '=' inside an option is not an assignment prefix
+        assert_eq!(command_base_name("mytool --opt=1"), Some("mytool"));
+        assert_eq!(command_base_name(""), None);
+        assert_eq!(command_base_name("ONLY=assignments HERE=1"), None);
+    }
+
+    #[test]
+    fn command_env_assignment_reads_only_leading_prefix() {
+        assert_eq!(
+            command_env_assignment("CLAUDE_CONFIG_DIR=/x/y claude", "CLAUDE_CONFIG_DIR"),
+            Some("/x/y".to_string())
+        );
+        assert_eq!(
+            command_env_assignment("CODEX_HOME='/quoted/path' codex", "CODEX_HOME"),
+            Some("/quoted/path".to_string())
+        );
+        // assignments after the command word do not count
+        assert_eq!(
+            command_env_assignment("claude CLAUDE_CONFIG_DIR=/x", "CLAUDE_CONFIG_DIR"),
+            None
+        );
+        assert_eq!(command_env_assignment("claude", "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn env_prefixed_custom_commands_classify_as_claude_or_codex() {
+        let k = SessionKind::Custom("CLAUDE_CONFIG_DIR=~/work claude -c".into());
+        assert!(k.is_claude_based());
+        let k = SessionKind::Custom("CODEX_HOME=~/alt codex".into());
+        assert!(k.is_codex_based());
+        let k = SessionKind::Custom("FOO=1 bash".into());
+        assert!(!k.is_claude_based() && !k.is_codex_based());
+    }
+
+    #[test]
+    fn session_base_defaults_from_kind_and_command() {
+        let mk = |kind: SessionKind| {
+            Session::new(0, "t".into(), kind, "/tmp".into(), PTY_ROWS, PTY_COLS, 100).base
+        };
+        assert_eq!(mk(SessionKind::Claude), BaseKind::Claude);
+        assert_eq!(mk(SessionKind::Codex), BaseKind::Codex);
+        assert_eq!(mk(SessionKind::Shell), BaseKind::Other);
+        assert_eq!(
+            mk(SessionKind::Custom("CLAUDE_CONFIG_DIR=/x claude".into())),
+            BaseKind::Claude
+        );
+        assert_eq!(mk(SessionKind::Custom("my-wrapper".into())), BaseKind::Other);
+    }
+
 }

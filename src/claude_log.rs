@@ -16,13 +16,16 @@ fn encode_cwd(cwd: &str) -> String {
     cwd.replace('/', "-")
 }
 
-fn project_dir(cwd: &str) -> Option<PathBuf> {
-    // Claude CLI writes logs to $CLAUDE_CONFIG_DIR/projects/ when that env var is
-    // set, otherwise to $HOME/.claude/projects/.
-    let config_base = std::env::var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".claude")))
-        .ok()?;
+fn project_dir(cwd: &str, config_home: Option<&str>) -> Option<PathBuf> {
+    // Precedence: per-session override (inline env prefix or config alias) →
+    // $CLAUDE_CONFIG_DIR in linkshell's own environment → $HOME/.claude.
+    let config_base = match config_home {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::var("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".claude")))
+            .ok()?,
+    };
     Some(config_base.join("projects").join(encode_cwd(cwd)))
 }
 
@@ -234,8 +237,9 @@ pub fn spawn_watcher(
     cwd: String,
     tx: tokio::sync::mpsc::Sender<AppEvent>,
     config: Arc<Config>,
+    config_home: Option<String>,
 ) {
-    let dir = match project_dir(&cwd) {
+    let dir = match project_dir(&cwd, config_home.as_deref()) {
         Some(d) => d,
         None => return,
     };
@@ -373,6 +377,22 @@ mod tests {
         assert_eq!(
             parse_state(&serde_json::json!({"type": "system", "subtype": "turn_duration"})),
             None
+        );
+    }
+
+    
+
+    #[test]
+    fn encode_cwd_matches_claude_cli_scheme() {
+        assert_eq!(encode_cwd("/home/u/proj"), "-home-u-proj");
+    }
+
+    #[test]
+    fn project_dir_prefers_per_session_config_home() {
+        let dir = project_dir("/home/u/proj", Some("/opt/claude-work")).unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/opt/claude-work/projects/-home-u-proj")
         );
     }
 }

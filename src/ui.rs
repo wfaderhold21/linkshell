@@ -33,6 +33,7 @@ pub struct LayoutInfo {
 /// where the terminal interprets them (e.g. \x1b[2J clears the screen mid-draw).
 /// This strips CSI, OSC, and other escape sequences, expands tabs, and drops
 /// remaining non-printable control characters.
+#[cfg_attr(not(test), allow(dead_code))]
 fn prepare_display(s: &str) -> String {
     // Phase 1: strip escape sequences
     let mut stripped = String::with_capacity(s.len());
@@ -227,12 +228,12 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
         let start_row = screen_rows.saturating_sub(display_rows);
         let end_row = screen_rows;
         let scroll_indicator = if scroll_offset > 0 {
-            format!(" ↑{} ", scroll_offset)
+            format!(" ↑{}", scroll_offset)
         } else {
             String::new()
         };
         let title = format!(
-            " {} [{}] {}{}",
+            " {} [{}] {}{} ",
             idx + 1,
             session.kind.label().to_uppercase(),
             session.name,
@@ -356,8 +357,16 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 // ── Status panel ───────────────────────────────────────────────────────────
 
 fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+    let title = match &app.council {
+        Some(r) if r.complete => format!(" Status ── council '{}' done ", r.group),
+        Some(r) => format!(
+            " Status ── council '{}' round {}/{} ",
+            r.group, r.round, r.max_rounds
+        ),
+        None => " Status ".to_string(),
+    };
     let block = Block::default()
-        .title(" Status ")
+        .title(title)
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
 
     let inner = block.inner(area);
@@ -458,7 +467,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         };
 
         let spans = vec![
-            Span::styled(format!(" {:1} ", i + 1), num_style),
+            Span::styled(format!("  {:1} ", i + 1), num_style),
             Span::raw("│ "),
             Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
             Span::raw("│ "),
@@ -838,12 +847,26 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         height: 1,
     };
     f.render_widget(Clear, bar);
-    let pos = app.command_cursor.min(app.command_input.len());
+    // Clamp to a char boundary — split_at panics mid-UTF-8. Same defensive
+    // walk-back draw_input_field uses, so both editors behave identically.
+    let mut pos = app.command_cursor.min(app.command_input.len());
+    while pos > 0 && !app.command_input.is_char_boundary(pos) {
+        pos -= 1;
+    }
     let (before, after) = app.command_input.split_at(pos);
+    // Render the cursor over the character under it (matching draw_input_field)
+    // instead of inserting a block that visually shifts the tail of the line.
+    let (cursor_ch, after) = match after.chars().next() {
+        Some(ch) => (&after[..ch.len_utf8()], &after[ch.len_utf8()..]),
+        None => (" ", ""),
+    };
     let line = Line::from(vec![
         Span::raw("> "),
         Span::raw(before.to_string()),
-        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::White)),
+        Span::styled(
+            cursor_ch.to_string(),
+            Style::default().fg(Color::Black).bg(Color::White),
+        ),
         Span::raw(after.to_string()),
     ]);
     let p = Paragraph::new(line).style(Style::default().fg(Color::White).bg(Color::DarkGray));
@@ -860,9 +883,12 @@ fn draw_command_result(f: &mut Frame<'_>, app: &App, area: Rect) {
     };
     f.render_widget(Clear, bar);
     let line = Line::from(vec![
-        Span::styled("Pipes: ", Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+        Span::styled("» ", Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
         Span::raw(app.command_result.clone()),
-        Span::styled("  [any key to close]", Style::default().fg(Color::DarkGray).bg(Color::DarkGray)),
+        Span::styled(
+            "  [any key to close]",
+            Style::default().fg(Color::Gray).bg(Color::DarkGray),
+        ),
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::White).bg(Color::DarkGray)),
@@ -998,6 +1024,19 @@ fn build_row(
     sel: Option<&Selection>,
     cursor_col: Option<u16>,
 ) -> ListItem<'static> {
+    ListItem::new(build_row_line(screen, vt_row, screen_cols, disp_row, sel, cursor_col))
+}
+
+/// Assemble the styled spans for one row. Split out from `build_row` so tests
+/// can inspect the rendered text directly.
+fn build_row_line(
+    screen: &Screen,
+    vt_row: u16,
+    screen_cols: u16,
+    disp_row: u16,
+    sel: Option<&Selection>,
+    cursor_col: Option<u16>,
+) -> Line<'static> {
     let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
     let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
 
@@ -1010,6 +1049,13 @@ fn build_row(
         let is_cursor = cursor_col == Some(col);
         let (content, style) = match screen.cell(vt_row, col) {
             Some(cell) => {
+                // The second cell of a double-width glyph (emoji, CJK) is a
+                // continuation marker with empty contents. Rendering it as a
+                // space would shift the rest of the line right by one column
+                // per wide char — skip it; the wide glyph already covers it.
+                if cell.is_wide_continuation() {
+                    continue;
+                }
                 let s = cell.contents();
                 let content = if s.is_empty() { " ".to_string() } else { s };
                 let style = if is_sel {
@@ -1051,7 +1097,7 @@ fn build_row(
         spans.push(Span::styled(trimmed, final_style));
     }
 
-    ListItem::new(Line::from(spans))
+    Line::from(spans)
 }
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
@@ -1069,6 +1115,41 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn build_row_skips_wide_continuation_cells() {
+        // A double-width glyph occupies two vt100 cells; the second is a
+        // continuation marker. It must not render as an extra space, or every
+        // wide char shifts the rest of the line right by one column.
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process("\u{4e16}x plain".as_bytes()); // 世 then ASCII
+        let screen = parser.screen();
+        assert!(screen.cell(0, 0).unwrap().is_wide());
+        assert!(screen.cell(0, 1).unwrap().is_wide_continuation());
+
+        let line = build_row_line(screen, 0, 20, 0, None, None);
+        assert_eq!(line_text(&line), "\u{4e16}x plain");
+    }
+
+    #[test]
+    fn build_row_renders_plain_ascii_unchanged() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"hello world");
+        let line = build_row_line(parser.screen(), 0, 20, 0, None, None);
+        assert_eq!(line_text(&line), "hello world");
+    }
+
+    #[test]
+    fn status_header_and_row_number_columns_have_equal_width() {
+        // Header uses "  # " (4 cols); rows must match so the │ separators align.
+        let header = "  # ";
+        let row = format!("  {:1} ", 1);
+        assert_eq!(header.chars().count(), row.chars().count());
+    }
 
     #[test]
     fn prepare_display_strips_escape_sequences_and_control_chars() {

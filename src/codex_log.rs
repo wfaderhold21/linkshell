@@ -11,9 +11,17 @@ use crate::config::Config;
 use crate::events::AppEvent;
 use crate::session::TokenStats;
 
-fn sessions_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".codex").join("sessions"))
+fn sessions_dir(codex_home: Option<&str>) -> Option<PathBuf> {
+    // Precedence: per-session override (inline env prefix or config alias) →
+    // $CODEX_HOME in linkshell's own environment → $HOME/.codex.
+    let base = match codex_home {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::var("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".codex")))
+            .ok()?,
+    };
+    Some(base.join("sessions"))
 }
 
 fn jsonl_files(dir: &Path) -> HashSet<PathBuf> {
@@ -204,9 +212,10 @@ pub fn spawn_watcher(
     cwd: String,
     tx: tokio::sync::mpsc::Sender<AppEvent>,
     config: Arc<Config>,
+    codex_home: Option<String>,
 ) {
     tokio::spawn(async move {
-        let dir = match sessions_dir() {
+        let dir = match sessions_dir(codex_home.as_deref()) {
             Some(d) => d,
             None => return,
         };
@@ -368,5 +377,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(cwd.as_deref(), Some("/tmp/linkshell"));
+    }
+
+    
+
+    #[test]
+    fn sessions_dir_prefers_per_session_codex_home() {
+        let dir = sessions_dir(Some("/opt/codex-personal")).unwrap();
+        assert_eq!(dir, PathBuf::from("/opt/codex-personal/sessions"));
     }
 }

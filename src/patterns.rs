@@ -1,4 +1,4 @@
-use crate::session::{SessionKind, SessionState, TokenStats};
+use crate::session::{BaseKind, SessionState, TokenStats};
 use regex::Regex;
 
 pub struct PatternMatcher {
@@ -70,15 +70,15 @@ impl PatternMatcher {
         }
     }
 
-    pub fn infer_state(&self, line: &str, kind: &SessionKind) -> Option<SessionState> {
+    pub fn infer_state(&self, line: &str, base: BaseKind) -> Option<SessionState> {
         if self.generic_waiting.is_match(line) {
             return Some(SessionState::Waiting);
         }
         if self.generic_error.is_match(line) {
             return Some(SessionState::Error);
         }
-        match kind {
-            SessionKind::Claude => {
+        match base {
+            BaseKind::Claude => {
                 if self.claude_thinking.is_match(line) {
                     return Some(SessionState::Thinking);
                 }
@@ -92,7 +92,7 @@ impl PatternMatcher {
                     return Some(SessionState::Running);
                 }
             }
-            SessionKind::Codex => {
+            BaseKind::Codex => {
                 if self.codex_waiting.is_match(line) {
                     return Some(SessionState::Waiting);
                 }
@@ -103,7 +103,7 @@ impl PatternMatcher {
                     return Some(SessionState::Running);
                 }
             }
-            SessionKind::Shell | SessionKind::Custom(_) => {
+            BaseKind::Other => {
                 if self.shell_ready.is_match(line) {
                     return Some(SessionState::Ready);
                 }
@@ -205,7 +205,7 @@ mod tests {
         let matcher = PatternMatcher::new();
 
         assert_eq!(
-            matcher.infer_state("looks like for codex if i type ?", &SessionKind::Codex),
+            matcher.infer_state("looks like for codex if i type ?", BaseKind::Codex),
             Some(SessionState::Running)
         );
     }
@@ -221,7 +221,7 @@ mod tests {
             "Do you want to continue?",
         ] {
             assert_eq!(
-                matcher.infer_state(line, &SessionKind::Codex),
+                matcher.infer_state(line, BaseKind::Codex),
                 Some(SessionState::Waiting),
                 "{line}"
             );
@@ -233,32 +233,27 @@ mod tests {
         let matcher = PatternMatcher::new();
 
         assert_eq!(
-            matcher.infer_state("user@host ~/repo $ ", &SessionKind::Shell),
+            matcher.infer_state("user@host ~/repo $ ", BaseKind::Other),
             Some(SessionState::Ready)
         );
         assert_eq!(
-            matcher.infer_state("building project", &SessionKind::Shell),
+            matcher.infer_state("building project", BaseKind::Other),
             Some(SessionState::Running)
         );
-        assert_eq!(matcher.infer_state("", &SessionKind::Shell), None);
+        assert_eq!(matcher.infer_state("", BaseKind::Other), None);
     }
 
     #[test]
     fn generic_waiting_and_error_take_precedence_for_all_session_kinds() {
         let matcher = PatternMatcher::new();
 
-        for kind in [
-            SessionKind::Claude,
-            SessionKind::Codex,
-            SessionKind::Shell,
-            SessionKind::Custom("tool".into()),
-        ] {
+        for base in [BaseKind::Claude, BaseKind::Codex, BaseKind::Other] {
             assert_eq!(
-                matcher.infer_state("Press Enter to continue", &kind),
+                matcher.infer_state("Press Enter to continue", base),
                 Some(SessionState::Waiting)
             );
             assert_eq!(
-                matcher.infer_state("fatal: command not found", &kind),
+                matcher.infer_state("fatal: command not found", base),
                 Some(SessionState::Error)
             );
         }
@@ -269,15 +264,15 @@ mod tests {
         let matcher = PatternMatcher::new();
 
         assert_eq!(
-            matcher.infer_state("Thinking...", &SessionKind::Claude),
+            matcher.infer_state("Thinking...", BaseKind::Claude),
             Some(SessionState::Thinking)
         );
         assert_eq!(
-            matcher.infer_state("Human:", &SessionKind::Claude),
+            matcher.infer_state("Human:", BaseKind::Claude),
             Some(SessionState::Ready)
         );
         assert_eq!(
-            matcher.infer_state("shall I proceed?", &SessionKind::Claude),
+            matcher.infer_state("shall I proceed?", BaseKind::Claude),
             Some(SessionState::Waiting)
         );
     }

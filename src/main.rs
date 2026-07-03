@@ -38,6 +38,19 @@ use keybindings::Action;
 async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config::load());
 
+    // Load and validate any council config *before* raw mode so parse errors
+    // print as normal terminal output instead of corrupting the TUI.
+    let council_cfg = match parse_council_flag() {
+        Some(path) => match council::load_config_file(&path) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("linkshell: --council {}: {}", path, e);
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     // Enable kitty keyboard protocol so the outer terminal (e.g. iTerm) sends
@@ -61,6 +74,15 @@ async fn main() -> anyhow::Result<()> {
         let rows = term_rows.saturating_sub(chrome_rows).max(1);
         let cols = term_cols.saturating_sub(2).max(1);
         app.pty_size = (rows, cols);
+    }
+
+    // Launch a council supplied via --council. Config was validated before raw
+    // mode; failures here (e.g. session limit) surface in the command result bar.
+    if let Some(cfg) = council_cfg {
+        if let Err(e) = app.launch_council(cfg) {
+            app.command_result = format!("council: {}", e);
+            app.mode = AppMode::CommandResult;
+        }
     }
 
     // Input reader task — forwards key and mouse events
@@ -276,12 +298,6 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::IpcAgentDisconnected { session_id } => {
             app.handle_ipc_agent_disconnected(session_id);
-        }
-        AppEvent::IpcSend {
-            session_id,
-            message,
-        } => {
-            app.handle_ipc_send(session_id, message);
         }
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
@@ -596,6 +612,24 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         }
         _ => vec![],
     }
+}
+
+fn parse_council_flag() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--council" {
+            return args.get(i + 1).cloned().or_else(|| {
+                eprintln!("linkshell: --council requires a path to a council.toml");
+                std::process::exit(1);
+            });
+        }
+        if let Some(p) = args[i].strip_prefix("--council=") {
+            return Some(p.to_string());
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_tcp_flag() -> Option<u16> {
