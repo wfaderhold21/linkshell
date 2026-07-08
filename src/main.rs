@@ -88,13 +88,13 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
     let mut app = App::new(tx.clone(), Arc::clone(&config));
-    // Seed pty_size from actual terminal dimensions (best-effort; refined on first draw)
+    // Seed pane size from actual terminal dimensions (best-effort; refined on first draw)
     if let Ok((term_cols, term_rows)) = crossterm::terminal::size() {
         // Reserve rows for session bar (3) + status panel (sessions+3, assume 1 session = 4)
         let chrome_rows = 3 + 4;
         let rows = term_rows.saturating_sub(chrome_rows).max(1);
         let cols = term_cols.saturating_sub(2).max(1);
-        app.pty_size = (rows, cols);
+        app.pane_sizes = [(rows, cols); 2];
     }
     if let Some(profile) = profile {
         if let Err(error) = app.apply_profile(&profile) {
@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
             terminal.draw(|f| {
                 layout = ui::draw(f, &app);
             })?;
-            app.output_area = layout.output_area;
+            app.output_areas = layout.output_areas.clone();
             app.session_bar_area = layout.session_bar_area;
             app.session_slot_areas = layout.session_slot_areas;
             app.status_row_areas = layout.status_row_areas;
@@ -187,12 +187,16 @@ async fn main() -> anyhow::Result<()> {
             app.needs_redraw = false;
             last_render = Instant::now();
 
-            // Resize PTYs to match the output pane (inner area = subtract 2 for borders)
-            let pty_rows = layout.output_area.height.saturating_sub(2).max(1);
-            let pty_cols = layout.output_area.width.saturating_sub(2).max(1);
-            let old_pty_size = app.pty_size;
-            app.handle_resize(pty_rows, pty_cols);
-            if app.pty_size != old_pty_size {
+            let mut sizes = app.pane_sizes;
+            for (idx, area) in layout.output_areas.iter().take(2).enumerate() {
+                sizes[idx] = (
+                    area.height.saturating_sub(2).max(1),
+                    area.width.saturating_sub(2).max(1),
+                );
+            }
+            let old_sizes = app.pane_sizes;
+            app.handle_pane_resize(sizes);
+            if app.pane_sizes != old_sizes {
                 app.needs_redraw = true;
             }
         }
@@ -393,6 +397,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollDownLine => app.scroll_down(3),
                     Action::OpenMenu => app.open_menu(),
                     Action::ToggleChat => app.toggle_chat(),
+                    Action::ToggleSplit => app.toggle_split(),
+                    Action::FocusNextPane => app.focus_next_pane(),
                 }
                 return;
             }

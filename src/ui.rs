@@ -6,13 +6,13 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, FileBrowserState, NewSessionField, Selection, MENU};
+use crate::app::{App, AppMode, FileBrowserState, LayoutMode, NewSessionField, Selection, MENU};
 use crate::session::{SessionKind, SessionState};
 use vt100::Screen;
 
 #[derive(Default)]
 pub struct LayoutInfo {
-    pub output_area: Rect,
+    pub output_areas: Vec<Rect>,
     pub session_bar_area: Rect,
     pub session_slot_areas: Vec<Rect>,
     pub status_row_areas: Vec<Rect>,
@@ -157,7 +157,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         ])
         .split(body);
 
-    draw_main_output(f, app, chunks[0]);
+    let output_areas = split_output_areas(chunks[0], app.layout);
+    for (pane_idx, area) in output_areas.iter().copied().enumerate() {
+        draw_pane_output(f, app, area, pane_idx, pane_idx == app.focused_pane);
+    }
     let slot_areas = draw_session_bar(f, app, chunks[1]);
     let status_row_areas = draw_status_panel(f, app, chunks[2]);
 
@@ -203,7 +206,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     }
 
     LayoutInfo {
-        output_area: chunks[0],
+        output_areas,
         session_bar_area: chunks[1],
         session_slot_areas: slot_areas,
         status_row_areas,
@@ -220,15 +223,26 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     }
 }
 
+fn split_output_areas(area: Rect, mode: LayoutMode) -> Vec<Rect> {
+    match mode {
+        LayoutMode::Single => vec![area],
+        LayoutMode::SplitV => Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area)
+            .to_vec(),
+    }
+}
+
 // ── Main output zone ───────────────────────────────────────────────────────
 
-fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let (title, lines, border_style) = if let Some(idx) = app.active_idx {
+fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, focused: bool) {
+    let (title, lines, border_style) = if let Some(idx) = app.panes[pane_idx] {
         let session = &app.sessions[idx];
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
         let display_rows = area.height.saturating_sub(2);
-        let scroll_offset = app.scroll_offset() as u16;
+        let scroll_offset = screen.scrollback().max(session.history_scroll) as u16;
         // vt100 handles the scrollback offset internally via set_scrollback;
         // just display the bottom display_rows rows of the virtual screen.
         let start_row = screen_rows.saturating_sub(display_rows);
@@ -245,7 +259,11 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
             session.name,
             scroll_indicator,
         );
-        let sel = app.selection.as_ref();
+        let sel = if focused {
+            app.selection.as_ref()
+        } else {
+            None
+        };
         let cursor = screen.cursor_position();
         let items: Vec<ListItem> = if session.history_scroll > 0 {
             // Alternate-screen apps have no vt100 scrollback; show a window of
@@ -281,14 +299,21 @@ fn draw_main_output(f: &mut Frame<'_>, app: &App, area: Rect) {
                 })
                 .collect()
         };
-        let style = state_border_style(&session.state, true);
+        let style = state_border_style(&session.state, focused);
         (title, items, style)
     } else {
-        let items = vec![ListItem::new(Line::from(
-            " No sessions. Press alt-n to create one.",
-        ))];
+        let message = if app.sessions.is_empty() {
+            " No sessions. Press alt-n to create one."
+        } else {
+            " No session in this pane. Use a session switch key."
+        };
+        let items = vec![ListItem::new(Line::from(message))];
         (
-            " linkshell ".to_string(),
+            if app.sessions.is_empty() {
+                " linkshell ".to_string()
+            } else {
+                " no session ".to_string()
+            },
             items,
             Style::default().fg(Color::DarkGray),
         )
@@ -337,13 +362,18 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             height: inner.height,
         };
 
-        let is_active = app.active_idx == Some(i);
+        let is_active = app.active_idx() == Some(i);
+        let is_visible = app.panes.contains(&Some(i));
         let label = format!("{} {}", i + 1, session.kind.label());
         let color = kind_color(&session.kind);
         let border_style = state_border_style(&session.state, is_active);
 
         let title_style = if is_active {
             Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else if is_visible {
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().fg(color)
         };
@@ -1443,6 +1473,22 @@ mod tests {
         assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
         assert_eq!(wrap_text("", 10), vec![""]);
         assert_eq!(wrap_text("one\ntwo", 10), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn split_layout_returns_two_non_overlapping_output_areas() {
+        let area = Rect::new(3, 4, 101, 20);
+
+        let single = split_output_areas(area, LayoutMode::Single);
+        let split = split_output_areas(area, LayoutMode::SplitV);
+
+        assert_eq!(single, vec![area]);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].x, area.x);
+        assert_eq!(split[1].x, split[0].x + split[0].width);
+        assert_eq!(split[0].width + split[1].width, area.width);
+        assert_eq!(split[0].height, area.height);
+        assert_eq!(split[1].height, area.height);
     }
 
 }
