@@ -116,6 +116,9 @@ pub enum AppEvent {
         dest: Option<usize>,
     },
     Paste(String),
+    /// Terminal window resized — triggers a redraw; pane sizes are recomputed
+    /// from the new layout after the draw
+    Resize,
     Tick,
     /// IPC handshake: resolve a token (or Unix peer) to a session_id + CapSet.
     Authenticate {
