@@ -16,9 +16,7 @@ fn encode_cwd(cwd: &str) -> String {
     cwd.replace('/', "-")
 }
 
-fn project_dir(cwd: &str, config_home: Option<&str>) -> Option<PathBuf> {
-    // Precedence: per-session override (inline env prefix or config alias) →
-    // $CLAUDE_CONFIG_DIR in linkshell's own environment → $HOME/.claude.
+pub fn projects_dir(config_home: Option<&str>) -> Option<PathBuf> {
     let config_base = match config_home {
         Some(dir) => PathBuf::from(dir),
         None => std::env::var("CLAUDE_CONFIG_DIR")
@@ -26,7 +24,13 @@ fn project_dir(cwd: &str, config_home: Option<&str>) -> Option<PathBuf> {
             .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".claude")))
             .ok()?,
     };
-    Some(config_base.join("projects").join(encode_cwd(cwd)))
+    Some(config_base.join("projects"))
+}
+
+fn project_dir(cwd: &str, config_home: Option<&str>) -> Option<PathBuf> {
+    // Precedence: per-session override (inline env prefix or config alias) →
+    // $CLAUDE_CONFIG_DIR in linkshell's own environment → $HOME/.claude.
+    Some(projects_dir(config_home)?.join(encode_cwd(cwd)))
 }
 
 fn jsonl_files(dir: &Path) -> HashSet<PathBuf> {

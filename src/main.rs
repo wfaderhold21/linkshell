@@ -5,6 +5,7 @@ mod claude_log;
 mod codex_log;
 mod config;
 mod council;
+mod doctor;
 mod events;
 mod ipc;
 mod keybindings;
@@ -37,6 +38,9 @@ use ui::FILE_BROWSER_VISIBLE_ROWS;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("doctor") {
+        std::process::exit(doctor::run());
+    }
     let config = Arc::new(config::load());
     let profile = match parse_profile_flag() {
         Some(name) => match config.profiles.iter().find(|profile| profile.name == name) {
