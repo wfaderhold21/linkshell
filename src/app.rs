@@ -221,9 +221,17 @@ impl FileBrowserState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Single,
+    SplitV,
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
-    pub active_idx: Option<usize>,
+    pub layout: LayoutMode,
+    pub panes: [Option<usize>; 2],
+    pub focused_pane: usize,
     pub mode: AppMode,
     pub new_session_state: NewSessionState,
     pub command_input: String,
@@ -235,9 +243,9 @@ pub struct App {
     pub config: Arc<Config>,
     pub pipes: Vec<Pipe>,
     // Current PTY size derived from the output pane (rows, cols)
-    pub pty_size: (u16, u16),
+    pub pane_sizes: [(u16, u16); 2],
     // Layout cache (updated after each draw, used for mouse hit-testing)
-    pub output_area: Rect,
+    pub output_areas: Vec<Rect>,
     pub session_bar_area: Rect,
     pub session_slot_areas: Vec<Rect>,
     pub status_row_areas: Vec<Rect>,
@@ -299,7 +307,9 @@ impl App {
         }
         Self {
             sessions: Vec::new(),
-            active_idx: None,
+            layout: LayoutMode::Single,
+            panes: [None, None],
+            focused_pane: 0,
             mode: AppMode::Normal,
             new_session_state: NewSessionState::default(),
             command_input: String::new(),
@@ -310,8 +320,8 @@ impl App {
             event_tx,
             config,
             pipes: Vec::new(),
-            pty_size: (PTY_ROWS, PTY_COLS),
-            output_area: Rect::default(),
+            pane_sizes: [(PTY_ROWS, PTY_COLS); 2],
+            output_areas: Vec::new(),
             session_bar_area: Rect::default(),
             session_slot_areas: Vec::new(),
             status_row_areas: Vec::new(),
@@ -342,11 +352,15 @@ impl App {
     }
 
     pub fn active_session(&self) -> Option<&Session> {
-        self.active_idx.and_then(|i| self.sessions.get(i))
+        self.active_idx().and_then(|i| self.sessions.get(i))
     }
 
     pub fn active_session_mut(&mut self) -> Option<&mut Session> {
-        self.active_idx.and_then(|i| self.sessions.get_mut(i))
+        self.active_idx().and_then(|i| self.sessions.get_mut(i))
+    }
+
+    pub fn active_idx(&self) -> Option<usize> {
+        self.panes[self.focused_pane]
     }
 
     pub fn apply_profile(&mut self, profile: &config::Profile) -> anyhow::Result<()> {
@@ -435,7 +449,7 @@ impl App {
         // Safety: refuse any command containing forbidden flags.
         config::validate_command(&cmd_str).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        let (pty_rows, pty_cols) = self.pty_size;
+        let (pty_rows, pty_cols) = self.pane_sizes[self.focused_pane];
         let session = Session::new(
             id,
             session_name,
@@ -448,8 +462,8 @@ impl App {
         let idx = self.sessions.len();
         self.sessions.push(session);
 
-        if self.active_idx.is_none() {
-            self.active_idx = Some(idx);
+        if self.panes[0].is_none() {
+            self.panes[0] = Some(idx);
         }
 
         // Mint a capability token for this session. Interactive shells belong
@@ -594,7 +608,7 @@ impl App {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string())
         };
-        let (pty_rows, pty_cols) = self.pty_size;
+        let (pty_rows, pty_cols) = self.pane_sizes[self.focused_pane];
         let mut session = Session::new(
             id,
             label,
@@ -607,12 +621,16 @@ impl App {
         session.headless = true;
         session.group = group;
         session.state = SessionState::Ready;
+        let idx = self.sessions.len();
         self.sessions.push(session);
+        if self.panes[0].is_none() {
+            self.panes[0] = Some(idx);
+        }
         Ok(id)
     }
 
     pub fn kill_active_session(&mut self) {
-        if let Some(idx) = self.active_idx {
+        if let Some(idx) = self.active_idx() {
             self.remove_session(idx);
         }
     }
@@ -624,13 +642,31 @@ impl App {
         // Drop the PTY write channel so the background task exits
         self.sessions[idx].pty_writer = None;
         self.sessions.remove(idx);
-        let n = self.sessions.len();
-        self.active_idx = if n == 0 { None } else { Some(idx.min(n - 1)) };
+        for pane in &mut self.panes {
+            *pane = match *pane {
+                Some(i) if i == idx => None,
+                Some(i) if i > idx => Some(i - 1),
+                other => other,
+            };
+        }
+        if self.layout == LayoutMode::Single && self.panes[0].is_none() && !self.sessions.is_empty()
+        {
+            self.panes[0] = Some(idx.min(self.sessions.len() - 1));
+        }
     }
 
     pub fn switch_to(&mut self, idx: usize) {
-        if idx < self.sessions.len() {
-            self.active_idx = Some(idx);
+        let other = self.focused_pane ^ 1;
+        if idx < self.sessions.len()
+            && (self.layout == LayoutMode::Single || self.panes[other] != Some(idx))
+        {
+            self.panes[self.focused_pane] = Some(idx);
+            let (rows, cols) = self.pane_sizes[self.focused_pane];
+            let session = &mut self.sessions[idx];
+            session.resize_screen(rows, cols);
+            if let Some(tx) = &session.pty_resizer {
+                let _ = tx.try_send((rows, cols));
+            }
         }
     }
 
@@ -639,7 +675,15 @@ impl App {
         if n == 0 {
             return;
         }
-        self.active_idx = Some(self.active_idx.map_or(0, |i| (i + 1) % n));
+        let start = self.active_idx().map_or(0, |i| (i + 1) % n);
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            let before = self.active_idx();
+            self.switch_to(idx);
+            if self.active_idx() != before || before == Some(idx) {
+                break;
+            }
+        }
     }
 
     pub fn prev_session(&mut self) {
@@ -647,10 +691,43 @@ impl App {
         if n == 0 {
             return;
         }
-        self.active_idx = Some(
-            self.active_idx
-                .map_or(0, |i| if i == 0 { n - 1 } else { i - 1 }),
-        );
+        let start = self
+            .active_idx()
+            .map_or(0, |i| if i == 0 { n - 1 } else { i - 1 });
+        for offset in 0..n {
+            let idx = (start + n - offset) % n;
+            let before = self.active_idx();
+            self.switch_to(idx);
+            if self.active_idx() != before || before == Some(idx) {
+                break;
+            }
+        }
+    }
+
+    pub fn toggle_split(&mut self) {
+        match self.layout {
+            LayoutMode::Single => {
+                self.layout = LayoutMode::SplitV;
+                if self.panes[1].is_none() {
+                    self.panes[1] =
+                        (0..self.sessions.len()).find(|idx| Some(*idx) != self.panes[0]);
+                }
+            }
+            LayoutMode::SplitV => {
+                self.panes[0] = self.active_idx();
+                self.panes[1] = None;
+                self.focused_pane = 0;
+                self.layout = LayoutMode::Single;
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn focus_next_pane(&mut self) {
+        if self.layout == LayoutMode::SplitV {
+            self.focused_pane ^= 1;
+            self.needs_redraw = true;
+        }
     }
 
     /// Unified scrollback. Normal-screen apps (shells) use vt100's native
@@ -658,7 +735,7 @@ impl App {
     /// alternate screen where vt100 keeps none, so we scroll through our own
     /// captured `output_lines` history instead. Same keys, every session type.
     pub fn scroll_up(&mut self, lines: usize) {
-        if let Some(idx) = self.active_idx {
+        if let Some(idx) = self.active_idx() {
             if let Some(session) = self.sessions.get_mut(idx) {
                 if session.screen.screen().alternate_screen() {
                     let max = session.output_lines.len();
@@ -672,7 +749,7 @@ impl App {
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        if let Some(idx) = self.active_idx {
+        if let Some(idx) = self.active_idx() {
             if let Some(session) = self.sessions.get_mut(idx) {
                 if session.history_scroll > 0 {
                     session.history_scroll = session.history_scroll.saturating_sub(lines);
@@ -691,8 +768,9 @@ impl App {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn scroll_offset(&self) -> usize {
-        self.active_idx
+        self.active_idx()
             .and_then(|i| self.sessions.get(i))
             .map(|s| s.screen.screen().scrollback().max(s.history_scroll))
             .unwrap_or(0)
@@ -718,17 +796,30 @@ impl App {
     }
 
     /// Called from the main loop after each draw when the output area changes size.
-    pub fn handle_resize(&mut self, rows: u16, cols: u16) {
-        if self.pty_size == (rows, cols) {
-            return;
-        }
-        self.pty_size = (rows, cols);
-        for session in &mut self.sessions {
-            session.resize_screen(rows, cols);
-            if let Some(tx) = &session.pty_resizer {
-                let _ = tx.try_send((rows, cols));
+    pub fn handle_pane_resize(&mut self, sizes: [(u16, u16); 2]) {
+        for (pane_idx, size) in sizes.iter().copied().enumerate() {
+            if self.layout == LayoutMode::Single && pane_idx == 1 {
+                continue;
+            }
+            if self.pane_sizes[pane_idx] == sizes[pane_idx] {
+                continue;
+            }
+            self.pane_sizes[pane_idx] = size;
+            if let Some(session_idx) = self.panes[pane_idx] {
+                if let Some(session) = self.sessions.get_mut(session_idx) {
+                    let (rows, cols) = size;
+                    session.resize_screen(rows, cols);
+                    if let Some(tx) = &session.pty_resizer {
+                        let _ = tx.try_send((rows, cols));
+                    }
+                }
             }
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn handle_resize(&mut self, rows: u16, cols: u16) {
+        self.handle_pane_resize([(rows, cols), self.pane_sizes[1]]);
     }
 
     pub fn handle_session_bytes(&mut self, session_id: usize, data: Vec<u8>) {
@@ -1521,8 +1612,9 @@ impl App {
                     }
                 }
                 // Output area click → begin selection
-                if rect_inner_hit(self.output_area, col, row) {
-                    let (c, r) = to_content_coords(self.output_area, col, row);
+                if let Some((pane, area)) = self.output_area_at(col, row) {
+                    self.focused_pane = pane;
+                    let (c, r) = to_content_coords(area, col, row);
                     self.selection = Some(Selection {
                         start_col: c,
                         start_row: r,
@@ -1539,9 +1631,13 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left)
-                if rect_inner_hit(self.output_area, col, row) =>
+                if self
+                    .output_areas
+                    .iter()
+                    .any(|area| rect_inner_hit(*area, col, row)) =>
             {
-                let (c, r) = to_content_coords(self.output_area, col, row);
+                let area = self.output_areas[self.focused_pane];
+                let (c, r) = to_content_coords(area, col, row);
                 if let Some(sel) = &mut self.selection {
                     sel.end_col = c;
                     sel.end_row = r;
@@ -1565,7 +1661,7 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if matches!(self.mode, AppMode::NewSession) {
                     self.new_session_select_kind(-1);
-                } else if rect_hit(self.output_area, col, row) {
+                } else if self.focus_pane_at(col, row) {
                     self.scroll_up(3);
                 } else if rect_hit(self.session_bar_area, col, row) {
                     self.prev_session();
@@ -1574,13 +1670,30 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if matches!(self.mode, AppMode::NewSession) {
                     self.new_session_select_kind(1);
-                } else if rect_hit(self.output_area, col, row) {
+                } else if self.focus_pane_at(col, row) {
                     self.scroll_down(3);
                 } else if rect_hit(self.session_bar_area, col, row) {
                     self.next_session();
                 }
             }
             _ => {}
+        }
+    }
+
+    fn output_area_at(&self, col: u16, row: u16) -> Option<(usize, Rect)> {
+        self.output_areas
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, area)| rect_hit(*area, col, row))
+    }
+
+    fn focus_pane_at(&mut self, col: u16, row: u16) -> bool {
+        if let Some((pane, _)) = self.output_area_at(col, row) {
+            self.focused_pane = pane;
+            true
+        } else {
+            false
         }
     }
 
@@ -1680,7 +1793,13 @@ impl App {
         let session = self.active_session()?;
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
-        let display_rows = self.output_area.height.saturating_sub(2);
+        let display_rows = self
+            .output_areas
+            .get(self.focused_pane)
+            .copied()
+            .unwrap_or_default()
+            .height
+            .saturating_sub(2);
         let start_vt_row = screen_rows.saturating_sub(display_rows);
 
         let ((min_row, min_col), (max_row, max_col)) = sel.normalized();
@@ -2730,7 +2849,7 @@ impl App {
     /// `restart [n]` — respawn a session with the same command, name, and cwd.
     fn execute_restart_command(&mut self, args: &[&str]) {
         let idx = match args {
-            [] => self.active_idx,
+            [] => self.active_idx(),
             [n] => n
                 .parse::<usize>()
                 .ok()
@@ -3449,15 +3568,15 @@ mod tests {
         let _ = app.spawn_headless_session("three".into(), None).unwrap();
 
         app.switch_to(2);
-        assert_eq!(app.active_idx, Some(2));
+        assert_eq!(app.active_idx(), Some(2));
         app.kill_active_session();
         assert_eq!(app.sessions.len(), 2);
-        assert_eq!(app.active_idx, Some(1));
+        assert_eq!(app.active_idx(), Some(1));
 
         app.prev_session();
-        assert_eq!(app.active_idx, Some(0));
+        assert_eq!(app.active_idx(), Some(0));
         app.next_session();
-        assert_eq!(app.active_idx, Some(1));
+        assert_eq!(app.active_idx(), Some(1));
     }
 
     #[test]
@@ -3498,9 +3617,114 @@ mod tests {
 
         app.handle_resize(12, 80);
 
-        assert_eq!(app.pty_size, (12, 80));
+        assert_eq!(app.pane_sizes[0], (12, 80));
         assert_eq!(app.sessions[0].screen.screen().size(), (12, 80));
         assert_eq!(rx.try_recv().unwrap(), (12, 80));
+    }
+
+    #[test]
+    fn split_focus_controls_active_session_and_session_switching() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+        app.spawn_headless_session("three".into(), None).unwrap();
+
+        app.toggle_split();
+        assert_eq!(app.layout, LayoutMode::SplitV);
+        assert_eq!(app.panes, [Some(0), Some(1)]);
+        assert_eq!(app.active_idx(), Some(0));
+
+        app.focus_next_pane();
+        assert_eq!(app.focused_pane, 1);
+        assert_eq!(app.active_idx(), Some(1));
+
+        app.switch_to(2);
+        assert_eq!(app.panes, [Some(0), Some(2)]);
+        app.switch_to(0);
+        assert_eq!(
+            app.panes,
+            [Some(0), Some(2)],
+            "a session cannot be displayed in both panes"
+        );
+    }
+
+    #[test]
+    fn collapsing_split_keeps_the_focused_session() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+        app.toggle_split();
+        app.focus_next_pane();
+
+        app.toggle_split();
+
+        assert_eq!(app.layout, LayoutMode::Single);
+        assert_eq!(app.focused_pane, 0);
+        assert_eq!(app.panes, [Some(1), None]);
+        assert_eq!(app.active_idx(), Some(1));
+    }
+
+    #[test]
+    fn killing_split_pane_session_clears_it_and_preserves_other_pane() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+        app.spawn_headless_session("three".into(), None).unwrap();
+        app.toggle_split();
+        app.focus_next_pane();
+
+        app.kill_active_session();
+
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.panes, [Some(0), None]);
+        assert_eq!(app.focused_pane, 1);
+
+        app.panes[1] = Some(1);
+        app.focus_next_pane();
+        app.kill_active_session();
+        assert_eq!(app.panes, [None, Some(0)]);
+    }
+
+    #[test]
+    fn split_resize_updates_only_visible_sessions_with_each_pane_size() {
+        let mut app = make_app();
+        let first = app.spawn_headless_session("one".into(), None).unwrap();
+        let second = app.spawn_headless_session("two".into(), None).unwrap();
+        let hidden = app.spawn_headless_session("hidden".into(), None).unwrap();
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let (hidden_tx, mut hidden_rx) = mpsc::channel(1);
+        app.handle_session_resizer(first, first_tx);
+        app.handle_session_resizer(second, second_tx);
+        app.handle_session_resizer(hidden, hidden_tx);
+        app.toggle_split();
+
+        app.handle_pane_resize([(12, 40), (12, 39)]);
+
+        assert_eq!(app.pane_sizes, [(12, 40), (12, 39)]);
+        assert_eq!(app.sessions[0].screen.screen().size(), (12, 40));
+        assert_eq!(app.sessions[1].screen.screen().size(), (12, 39));
+        assert_eq!(first_rx.try_recv().unwrap(), (12, 40));
+        assert_eq!(second_rx.try_recv().unwrap(), (12, 39));
+        assert!(hidden_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn switching_a_pane_resizes_the_newly_visible_session() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+        let third = app.spawn_headless_session("three".into(), None).unwrap();
+        app.toggle_split();
+        app.handle_pane_resize([(12, 40), (12, 39)]);
+        let (tx, mut rx) = mpsc::channel(1);
+        app.handle_session_resizer(third, tx);
+        app.focus_next_pane();
+
+        app.switch_to(2);
+
+        assert_eq!(app.sessions[2].screen.screen().size(), (12, 39));
+        assert_eq!(rx.try_recv().unwrap(), (12, 39));
     }
 
     #[test]
@@ -3843,7 +4067,7 @@ mod tests {
     async fn scrollback_is_unified_across_screen_modes() {
         let mut app = make_app();
         let id = app.spawn_headless_session("tui".to_string(), None).unwrap();
-        app.active_idx = app.sessions.iter().position(|s| s.id == id);
+        app.panes[0] = app.sessions.iter().position(|s| s.id == id);
         {
             let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
             for i in 0..100 {

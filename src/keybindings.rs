@@ -18,6 +18,8 @@ pub enum Action {
     ScrollDownLine,
     OpenMenu,
     ToggleChat,
+    ToggleSplit,
+    FocusNextPane,
 }
 
 pub type Keymap = HashMap<(KeyModifiers, KeyCode), Action>;
@@ -55,6 +57,8 @@ fn default_keymap() -> Keymap {
     m.insert((ctrl, KeyCode::Char('q')), Action::Quit);
     m.insert((ctrl, KeyCode::Char(' ')), Action::OpenMenu);
     m.insert((alt, KeyCode::Char('t')), Action::ToggleChat);
+    m.insert((alt, KeyCode::Char('\\')), Action::ToggleSplit);
+    m.insert((alt, KeyCode::Char('o')), Action::FocusNextPane);
     m.insert((alt, KeyCode::Left), Action::PrevSession);
     m.insert((alt, KeyCode::Right), Action::NextSession);
     m.insert((alt, KeyCode::Tab), Action::NextSession);
@@ -142,6 +146,8 @@ fn parse_action(s: &str) -> Option<Action> {
         "scroll_down_line" => Some(Action::ScrollDownLine),
         "toggle_chat" | "chat" => Some(Action::ToggleChat),
         "open_menu" => Some(Action::OpenMenu),
+        "toggle_split" => Some(Action::ToggleSplit),
+        "focus_next_pane" => Some(Action::FocusNextPane),
         _ => None,
     }
 }
@@ -165,6 +171,14 @@ mod tests {
         assert_eq!(
             map.get(&(KeyModifiers::ALT, KeyCode::Char('8'))),
             Some(&Action::SwitchSession(7))
+        );
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::Char('\\'))),
+            Some(&Action::ToggleSplit)
+        );
+        assert_eq!(
+            map.get(&(KeyModifiers::ALT, KeyCode::Char('o'))),
+            Some(&Action::FocusNextPane)
         );
     }
 
@@ -223,6 +237,8 @@ mod tests {
     fn parse_action_accepts_only_valid_switch_ranges() {
         assert_eq!(parse_action("switch_1"), Some(Action::SwitchSession(0)));
         assert_eq!(parse_action("switch_8"), Some(Action::SwitchSession(7)));
+        assert_eq!(parse_action("toggle_split"), Some(Action::ToggleSplit));
+        assert_eq!(parse_action("focus_next_pane"), Some(Action::FocusNextPane));
         assert_eq!(parse_action("switch_0"), None);
         assert_eq!(parse_action("switch_9"), None);
     }
