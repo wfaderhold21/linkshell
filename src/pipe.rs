@@ -16,11 +16,38 @@ pub enum ExtractMode {
     Summarize(u32),
 }
 
+impl ExtractMode {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "last_block" => Ok(Self::LastBlock),
+            "diff" => Ok(Self::Diff),
+            value if value.starts_with("summarize:") => {
+                Ok(Self::Summarize(value["summarize:".len()..].parse()?))
+            }
+            value if value.starts_with("last:") => {
+                Ok(Self::LastN(value["last:".len()..].parse()?))
+            }
+            _ => anyhow::bail!("unknown extract mode: {s}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipeTrigger {
     OnReady,
     OnWaiting,
     Manual,
+}
+
+impl PipeTrigger {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "on_ready" => Ok(Self::OnReady),
+            "on_waiting" => Ok(Self::OnWaiting),
+            "manual" => Ok(Self::Manual),
+            _ => anyhow::bail!("unknown trigger: {s}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +192,21 @@ mod tests {
             session.push_output_line((*line).to_string());
         }
         session
+    }
+
+    #[test]
+    fn profile_pipe_strings_parse_strictly() {
+        assert!(matches!(ExtractMode::parse("last_block").unwrap(), ExtractMode::LastBlock));
+        assert!(matches!(ExtractMode::parse("diff").unwrap(), ExtractMode::Diff));
+        assert!(matches!(ExtractMode::parse("last:40").unwrap(), ExtractMode::LastN(40)));
+        assert!(matches!(ExtractMode::parse("summarize:500").unwrap(), ExtractMode::Summarize(500)));
+        assert!(ExtractMode::parse("last:nope").is_err());
+        assert!(ExtractMode::parse("everything").is_err());
+
+        assert_eq!(PipeTrigger::parse("on_ready").unwrap(), PipeTrigger::OnReady);
+        assert_eq!(PipeTrigger::parse("on_waiting").unwrap(), PipeTrigger::OnWaiting);
+        assert_eq!(PipeTrigger::parse("manual").unwrap(), PipeTrigger::Manual);
+        assert!(PipeTrigger::parse("sometimes").is_err());
     }
 
     #[test]
