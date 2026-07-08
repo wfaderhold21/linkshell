@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::events::AppEvent;
 use crate::session::TokenStats;
 
-fn sessions_dir(codex_home: Option<&str>) -> Option<PathBuf> {
+pub fn sessions_dir(codex_home: Option<&str>) -> Option<PathBuf> {
     // Precedence: per-session override (inline env prefix or config alias) →
     // $CODEX_HOME in linkshell's own environment → $HOME/.codex.
     let base = match codex_home {

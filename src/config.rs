@@ -418,6 +418,27 @@ pub fn load() -> Config {
     }
 }
 
+/// Load and validate the primary config without silently falling back to defaults.
+/// Used by diagnostics where hiding an invalid file would defeat the check.
+pub fn load_strict(path: &std::path::Path) -> anyhow::Result<Config> {
+    let content = std::fs::read_to_string(path)?;
+    let mut cfg = parse(&content)?;
+    if let Some(dir) = path.parent().map(|parent| parent.join("profiles.d")) {
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if entry.path().extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                    continue;
+                }
+                let content = std::fs::read_to_string(entry.path())?;
+                cfg.profiles.extend(parse(&content)?.profiles);
+            }
+        }
+    }
+    validate_profiles(&cfg)?;
+    Ok(cfg)
+}
+
 pub fn save_profile(profile: &Profile) -> anyhow::Result<std::path::PathBuf> {
     if profile.name.is_empty()
         || !profile.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
