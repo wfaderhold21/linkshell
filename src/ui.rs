@@ -147,7 +147,15 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 
     // ── Top-level vertical split ───────────────────────────────────────────
     // main output | session bar | status panel
-    let status_rows = app.sessions.len().max(1) as u16 + 4; // border + header + rows + socket footer
+    let previews = app
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.state == SessionState::Waiting && session.waiting_prompt.is_some()
+        })
+        .count() as u16;
+    let desired_status_rows = app.sessions.len().max(1) as u16 + 4 + previews;
+    let status_rows = desired_status_rows.min((body.height / 3).max(4));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -192,6 +200,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         }
         AppMode::Help => {
             help_area = draw_help(f, size);
+        }
+        AppMode::PipeList => {
+            help_area = draw_pipe_list(f, app, size);
         }
         AppMode::Chat => {
             chat_area = draw_chat(f, app, size);
@@ -439,7 +450,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:<6} ", "Kind"), hdr_style),
             Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:<5} ", "Pipe"), hdr_style),
+            Span::styled(format!("{:<20} ", "Pipe"), hdr_style),
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:<8} ", "State"), hdr_style),
             Span::styled("│ ", hdr_style),
@@ -461,17 +472,19 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     }
 
     let mut row_areas = Vec::new();
+    let mut row_y = inner.y + 1;
     for (i, session) in app.sessions.iter().enumerate() {
-        if i + 2 >= inner.height as usize {
+        if row_y >= inner.y + inner.height {
             break;
         }
 
         let row = Rect {
             x: inner.x,
-            y: inner.y + 1 + i as u16,
+            y: row_y,
             width: inner.width,
             height: 1,
         };
+        row_y += 1;
         row_areas.push(row);
 
         let num_style = Style::default()
@@ -495,42 +508,36 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         let cost = session.cost_display();
         let elapsed = session.elapsed_display();
 
-        // Pipe destinations: "→2,→3" or blank; bold for 1s after firing
-        let (pipe_label, pipe_recently_fired) = {
-            let mut fired = false;
-            let dests: Vec<String> = app
-                .pipes
-                .iter()
-                .filter(|p| p.source == session.id && p.active)
-                .filter_map(|p| {
-                    if p.last_fired
-                        .map(|t| t.elapsed().as_millis() < 1000)
-                        .unwrap_or(false)
-                    {
-                        fired = true;
-                    }
-                    app.sessions
-                        .iter()
-                        .position(|s| s.id == p.dest)
-                        .map(|idx| format!("→{}", idx + 1))
-                })
-                .collect();
-            let label = if dests.is_empty() {
-                String::new()
-            } else {
-                dests.join(",")
-            };
-            (label, fired)
-        };
+        let glyphs = app.pipe_summary_for(session.id, std::time::Instant::now());
+        let mut labels: Vec<String> = glyphs
+            .iter()
+            .take(2)
+            .map(|glyph| {
+                format!(
+                    "{}{}{}",
+                    if glyph.outgoing { "→" } else { "←" },
+                    glyph.peer,
+                    if glyph.recent { " ●" } else { "" }
+                )
+            })
+            .collect();
+        if glyphs.len() > 2 {
+            labels.push(format!("+{}", glyphs.len() - 2));
+        }
+        let pipe_label = labels.join(",");
+        let pipe_recently_fired = glyphs.iter().any(|glyph| glyph.recent);
+        let all_inactive = !glyphs.is_empty() && glyphs.iter().all(|glyph| !glyph.active);
 
         let spans = vec![
             Span::styled(format!("  {:1} ", i + 1), num_style),
             Span::raw("│ "),
             Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
             Span::raw("│ "),
-            Span::styled(format!("{:<5} ", pipe_label), {
+            Span::styled(format!("{:<20} ", pipe_label), {
                 let s = Style::default().fg(Color::Cyan);
-                if pipe_recently_fired {
+                if all_inactive {
+                    s.add_modifier(Modifier::DIM)
+                } else if pipe_recently_fired {
                     s.add_modifier(Modifier::BOLD)
                 } else {
                     s
@@ -556,6 +563,28 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
         let line = Paragraph::new(Line::from(spans));
         f.render_widget(line, row);
+        if session.state == SessionState::Waiting {
+            if let Some(prompt) = &session.waiting_prompt {
+                if row_y < inner.y + inner.height {
+                    let preview = Rect {
+                        x: inner.x,
+                        y: row_y,
+                        width: inner.width,
+                        height: 1,
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::styled(
+                            format!("    ↳ {prompt}"),
+                            Style::default()
+                                .fg(Color::Gray)
+                                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                        )),
+                        preview,
+                    );
+                    row_y += 1;
+                }
+            }
+        }
     }
 
     // Socket path footer — always at the last row of inner area
@@ -911,6 +940,69 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
     popup
 }
 
+fn draw_pipe_list(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let height = (app.pipes.len() as u16 + 4).clamp(6, 18);
+    let popup = centered_rect(90, height, area);
+    f.render_widget(Clear, popup);
+    let rows: Vec<Line<'_>> = if app.pipes.is_empty() {
+        vec![Line::from("No pipes configured")]
+    } else {
+        app.pipes
+            .iter()
+            .enumerate()
+            .map(|(index, pipe)| {
+                let name = |id| {
+                    app.sessions
+                        .iter()
+                        .find(|session| session.id == id)
+                        .map(|session| session.name.as_str())
+                        .unwrap_or("?")
+                };
+                let trigger = match pipe.trigger {
+                    crate::pipe::PipeTrigger::OnReady => "on_ready",
+                    crate::pipe::PipeTrigger::OnWaiting => "on_waiting",
+                    crate::pipe::PipeTrigger::Manual => "manual",
+                };
+                let extract = match pipe.extract {
+                    crate::pipe::ExtractMode::LastBlock => "last_block".into(),
+                    crate::pipe::ExtractMode::LastN(n) => format!("last:{n}"),
+                    crate::pipe::ExtractMode::Diff => "diff".into(),
+                    crate::pipe::ExtractMode::Summarize(n) => format!("summarize:{n}"),
+                };
+                let fired = pipe
+                    .last_fired
+                    .map(|instant| format!("{}s ago", instant.elapsed().as_secs()))
+                    .unwrap_or_else(|| "never".into());
+                let text = format!(
+                    "{} → {} │ {} │ {} │ {} │ {} │ {}",
+                    name(pipe.source),
+                    name(pipe.dest),
+                    trigger,
+                    extract,
+                    pipe.prefix.as_deref().unwrap_or("—"),
+                    fired,
+                    if pipe.active { "active" } else { "paused" },
+                );
+                let style = if index == app.pipe_list_selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if !pipe.active {
+                    Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                };
+                Line::styled(text, style)
+            })
+            .collect()
+    };
+    let widget = Paragraph::new(rows).block(
+        Block::default()
+            .title(" Pipes — ↑/↓ select  Space toggle  Enter fire  d delete ")
+            .borders(Borders::ALL),
+    );
+    f.render_widget(widget, popup);
+    popup
+}
+
 // ── Chat pane ───────────────────────────────────────────────────────────────
 
 /// Greedy word wrap; falls back to hard breaks for unbroken runs.
@@ -954,7 +1046,9 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 fn chat_from_style(from: &str) -> Style {
     if from.starts_with("you") {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else if from == "linkshell" {
         Style::default().fg(Color::DarkGray)
     } else {
@@ -1001,10 +1095,7 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
                     Span::raw(l),
                 ]));
             } else {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::raw(l),
-                ]));
+                lines.push(Line::from(vec![Span::raw(indent.clone()), Span::raw(l)]));
             }
         }
     }
@@ -1080,6 +1171,35 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
 // ── Command bar ────────────────────────────────────────────────────────────
 
 fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let match_count = app.palette.matches.len().min(8) as u16;
+    if match_count > 0 {
+        let popup = Rect {
+            x: area.x,
+            y: area.y + area.height - 1 - match_count,
+            width: area.width,
+            height: match_count,
+        };
+        f.render_widget(Clear, popup);
+        let lines: Vec<Line<'_>> = app
+            .palette
+            .matches
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(index, entry)| {
+                let style = if index == app.palette.selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::DarkGray)
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {:<38}", entry.template), style),
+                    Span::styled(entry.summary.clone(), style.add_modifier(Modifier::DIM)),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), popup);
+    }
     let bar = Rect {
         x: area.x,
         y: area.y + area.height - 1,
@@ -1490,5 +1610,4 @@ mod tests {
         assert_eq!(split[0].height, area.height);
         assert_eq!(split[1].height, area.height);
     }
-
 }

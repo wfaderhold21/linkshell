@@ -18,7 +18,30 @@ pub struct Config {
     pub pipe: PipeConfig,
     pub pricing: PricingConfig,
     pub keybindings: KeybindingsConfig,
+    pub notifications: NotificationsConfig,
     pub profiles: Vec<Profile>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub on_states: Vec<String>,
+    pub method: crate::notify::Method,
+    pub min_session_age_secs: u64,
+    pub debounce_secs: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_states: vec!["waiting".into(), "error".into()],
+            method: crate::notify::Method::Auto,
+            min_session_age_secs: 10,
+            debounce_secs: 30,
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -55,8 +78,12 @@ pub struct ProfilePipe {
     pub prefix: Option<String>,
 }
 
-fn default_trigger() -> String { "on_ready".into() }
-fn default_extract() -> String { "last_block".into() }
+fn default_trigger() -> String {
+    "on_ready".into()
+}
+fn default_extract() -> String {
+    "last_block".into()
+}
 
 // ── [general] ─────────────────────────────────────────────────────────────
 
@@ -441,7 +468,10 @@ pub fn load_strict(path: &std::path::Path) -> anyhow::Result<Config> {
 
 pub fn save_profile(profile: &Profile) -> anyhow::Result<std::path::PathBuf> {
     if profile.name.is_empty()
-        || !profile.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !profile
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         anyhow::bail!("profile name may contain only letters, numbers, '-' and '_'");
     }
@@ -450,12 +480,17 @@ pub fn save_profile(profile: &Profile) -> anyhow::Result<std::path::PathBuf> {
         profiles: [&'a Profile; 1],
     }
     let base = config_path().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let dir = base.parent().expect("config path has parent").join("profiles.d");
+    let dir = base
+        .parent()
+        .expect("config path has parent")
+        .join("profiles.d");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.toml", profile.name));
     std::fs::write(
         &path,
-        toml::to_string_pretty(&ProfilesFile { profiles: [profile] })?,
+        toml::to_string_pretty(&ProfilesFile {
+            profiles: [profile],
+        })?,
     )?;
     Ok(path)
 }
@@ -475,18 +510,33 @@ fn validate_profiles(cfg: &Config) -> anyhow::Result<()> {
         }
         let mut session_names = HashSet::new();
         for session in &profile.sessions {
-            if !matches!(session.kind.as_str(), "claude" | "codex" | "shell" | "custom") {
-                anyhow::bail!("profile '{}': unknown session kind '{}'", profile.name, session.kind);
+            if !matches!(
+                session.kind.as_str(),
+                "claude" | "codex" | "shell" | "custom"
+            ) {
+                anyhow::bail!(
+                    "profile '{}': unknown session kind '{}'",
+                    profile.name,
+                    session.kind
+                );
             }
             if session.name.is_empty() {
                 anyhow::bail!("profile '{}': sessions require a name", profile.name);
             }
             if !session_names.insert(session.name.as_str()) {
-                anyhow::bail!("profile '{}': duplicate session name '{}'", profile.name, session.name);
+                anyhow::bail!(
+                    "profile '{}': duplicate session name '{}'",
+                    profile.name,
+                    session.name
+                );
             }
             if session.kind == "custom" {
                 if session.command.is_empty() {
-                    anyhow::bail!("profile '{}': custom session '{}' requires command", profile.name, session.name);
+                    anyhow::bail!(
+                        "profile '{}': custom session '{}' requires command",
+                        profile.name,
+                        session.name
+                    );
                 }
                 validate_command(&session.command).map_err(anyhow::Error::msg)?;
             }
@@ -495,7 +545,10 @@ fn validate_profiles(cfg: &Config) -> anyhow::Result<()> {
             if !session_names.contains(pipe.source.as_str())
                 || !session_names.contains(pipe.dest.as_str())
             {
-                anyhow::bail!("profile '{}': pipe references undefined session", profile.name);
+                anyhow::bail!(
+                    "profile '{}': pipe references undefined session",
+                    profile.name
+                );
             }
             crate::pipe::PipeTrigger::parse(&pipe.trigger)?;
             crate::pipe::ExtractMode::parse(&pipe.extract)?;
@@ -554,11 +607,17 @@ prefix = "Review this:"
         let decoded = parse(&encoded).unwrap();
 
         assert_eq!(decoded.profiles[0].name, "dev");
-        assert_eq!(decoded.profiles[0].sessions[0].group.as_deref(), Some("council"));
+        assert_eq!(
+            decoded.profiles[0].sessions[0].group.as_deref(),
+            Some("council")
+        );
         assert_eq!(decoded.profiles[0].sessions[1].command, "qwen-agent");
         assert_eq!(decoded.profiles[0].pipes[0].trigger, "manual");
         assert_eq!(decoded.profiles[0].pipes[0].extract, "summarize:500");
-        assert_eq!(decoded.profiles[0].pipes[0].prefix.as_deref(), Some("Review this:"));
+        assert_eq!(
+            decoded.profiles[0].pipes[0].prefix.as_deref(),
+            Some("Review this:")
+        );
     }
 
     #[test]
@@ -587,6 +646,27 @@ prefix = "Review this:"
         assert_eq!(cfg.sessions.commands.codex, "codex");
         assert_eq!(cfg.pipe.summarize.max_tokens, 150);
         assert_eq!(cfg.pipe.summarize.cooldown_secs, 2);
+        assert!(cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.on_states, vec!["waiting", "error"]);
+    }
+
+    #[test]
+    fn notifications_config_parses_method_states_age_and_debounce() {
+        let cfg = parse(
+            r#"
+[notifications]
+enabled = false
+on_states = ["error"]
+method = "bell"
+min_session_age_secs = 5
+debounce_secs = 12
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.method, crate::notify::Method::Bell);
+        assert_eq!(cfg.notifications.min_session_age_secs, 5);
+        assert_eq!(cfg.notifications.debounce_secs, 12);
     }
 
     #[test]
