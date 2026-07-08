@@ -38,6 +38,21 @@ use ui::FILE_BROWSER_VISIBLE_ROWS;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config::load());
+    let profile = match parse_profile_flag() {
+        Some(name) => match config.profiles.iter().find(|profile| profile.name == name) {
+            Some(profile) => Some(profile.clone()),
+            None => {
+                let available = config.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
+                eprintln!(
+                    "linkshell: unknown profile '{}'; available profiles: {}",
+                    name,
+                    if available.is_empty() { "(none)".into() } else { available.join(", ") }
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     // Load and validate any council config *before* raw mode so parse errors
     // print as normal terminal output instead of corrupting the TUI.
@@ -80,6 +95,13 @@ async fn main() -> anyhow::Result<()> {
         let rows = term_rows.saturating_sub(chrome_rows).max(1);
         let cols = term_cols.saturating_sub(2).max(1);
         app.pty_size = (rows, cols);
+    }
+    if let Some(profile) = profile {
+        if let Err(error) = app.apply_profile(&profile) {
+            disable_raw_mode()?;
+            eprintln!("linkshell: profile '{}': {}", profile.name, error);
+            std::process::exit(1);
+        }
     }
 
     // Launch a council supplied via --council. Config was validated before raw
@@ -643,6 +665,28 @@ fn parse_council_flag() -> Option<String> {
         }
         if let Some(p) = args[i].strip_prefix("--council=") {
             return Some(p.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_profile_flag() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--profile" {
+            return args.get(i + 1).cloned().or_else(|| {
+                eprintln!("linkshell: --profile requires a name");
+                std::process::exit(2);
+            });
+        }
+        if let Some(name) = args[i].strip_prefix("--profile=") {
+            if name.is_empty() {
+                eprintln!("linkshell: --profile requires a name");
+                std::process::exit(2);
+            }
+            return Some(name.to_string());
         }
         i += 1;
     }

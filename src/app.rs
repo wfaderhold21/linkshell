@@ -15,6 +15,15 @@ use crate::patterns::PatternMatcher;
 use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
 use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS};
 
+fn expand_home(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
 /// Screen-coordinate selection (col, row both relative to output area inner content).
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -338,6 +347,42 @@ impl App {
 
     pub fn active_session_mut(&mut self) -> Option<&mut Session> {
         self.active_idx.and_then(|i| self.sessions.get_mut(i))
+    }
+
+    pub fn apply_profile(&mut self, profile: &config::Profile) -> anyhow::Result<()> {
+        let mut ids = HashMap::new();
+        for profile_session in &profile.sessions {
+            let kind = match profile_session.kind.as_str() {
+                "claude" => SessionKind::Claude,
+                "codex" => SessionKind::Codex,
+                "shell" => SessionKind::Shell,
+                "custom" => SessionKind::Custom(profile_session.command.clone()),
+                other => anyhow::bail!("profile '{}': unknown kind '{}'", profile.name, other),
+            };
+            let cwd = expand_home(&profile_session.cwd);
+            self.spawn_session(kind, profile_session.name.clone(), cwd)?;
+            let session = self.sessions.last_mut().expect("spawned session is present");
+            session.group = profile_session.group.clone();
+            ids.insert(session.name.clone(), session.id);
+        }
+        for profile_pipe in &profile.pipes {
+            let source = ids.get(&profile_pipe.source).copied().ok_or_else(|| {
+                anyhow::anyhow!("profile '{}': unknown source '{}'", profile.name, profile_pipe.source)
+            })?;
+            let dest = ids.get(&profile_pipe.dest).copied().ok_or_else(|| {
+                anyhow::anyhow!("profile '{}': unknown destination '{}'", profile.name, profile_pipe.dest)
+            })?;
+            self.pipes.push(Pipe {
+                source,
+                dest,
+                trigger: PipeTrigger::parse(&profile_pipe.trigger)?,
+                extract: ExtractMode::parse(&profile_pipe.extract)?,
+                prefix: profile_pipe.prefix.clone(),
+                active: true,
+                last_fired: None,
+            });
+        }
+        Ok(())
     }
 
     // ── Session management ─────────────────────────────────────────────────
@@ -1949,6 +1994,10 @@ impl App {
                 self.execute_council_command(&all_parts[1..]);
                 return;
             }
+            Some("profile") => {
+                self.execute_profile_command(&all_parts[1..]);
+                return;
+            }
             Some("config") => {
                 self.execute_config_command(&all_parts[1..]);
                 return;
@@ -2085,6 +2134,60 @@ impl App {
             active: true,
             last_fired: None,
         });
+    }
+
+    fn execute_profile_command(&mut self, args: &[&str]) {
+        let ["save", name] = args else {
+            self.command_result = "usage: profile save <name>".into();
+            self.mode = AppMode::CommandResult;
+            return;
+        };
+        let names: HashMap<usize, String> = self
+            .sessions
+            .iter()
+            .map(|session| (session.id, session.name.clone()))
+            .collect();
+        let profile = config::Profile {
+            name: (*name).to_string(),
+            sessions: self.sessions.iter().map(|session| {
+                let (kind, command) = match &session.kind {
+                    SessionKind::Claude => ("claude".into(), String::new()),
+                    SessionKind::Codex => ("codex".into(), String::new()),
+                    SessionKind::Shell => ("shell".into(), String::new()),
+                    SessionKind::Custom(command) => ("custom".into(), command.clone()),
+                };
+                config::ProfileSession {
+                    kind,
+                    command,
+                    name: session.name.clone(),
+                    cwd: session.cwd.clone(),
+                    group: session.group.clone(),
+                }
+            }).collect(),
+            pipes: self.pipes.iter().filter_map(|pipe| {
+                Some(config::ProfilePipe {
+                    source: names.get(&pipe.source)?.clone(),
+                    dest: names.get(&pipe.dest)?.clone(),
+                    trigger: match pipe.trigger {
+                        PipeTrigger::OnReady => "on_ready",
+                        PipeTrigger::OnWaiting => "on_waiting",
+                        PipeTrigger::Manual => "manual",
+                    }.into(),
+                    extract: match pipe.extract {
+                        ExtractMode::LastBlock => "last_block".into(),
+                        ExtractMode::LastN(n) => format!("last:{n}"),
+                        ExtractMode::Diff => "diff".into(),
+                        ExtractMode::Summarize(n) => format!("summarize:{n}"),
+                    },
+                    prefix: pipe.prefix.clone(),
+                })
+            }).collect(),
+        };
+        self.command_result = match config::save_profile(&profile) {
+            Ok(path) => format!("saved profile '{}' to {}", name, path.display()),
+            Err(error) => format!("profile save: {error}"),
+        };
+        self.mode = AppMode::CommandResult;
     }
 
     fn execute_unpipe_command(&mut self, args: &[&str]) {
@@ -3062,6 +3165,49 @@ mod tests {
 
     fn cursor_pos(app: &App) -> usize {
         app.new_session_state.cursor_pos()
+    }
+
+    #[tokio::test]
+    async fn apply_profile_spawns_named_sessions_and_resolves_pipe_ids() {
+        let mut app = make_app();
+        let profile = crate::config::Profile {
+            name: "dev".into(),
+            sessions: vec![
+                crate::config::ProfileSession {
+                    kind: "shell".into(),
+                    command: String::new(),
+                    name: "source".into(),
+                    cwd: "/tmp".into(),
+                    group: Some("team".into()),
+                },
+                crate::config::ProfileSession {
+                    kind: "custom".into(),
+                    command: "true".into(),
+                    name: "dest".into(),
+                    cwd: "/tmp".into(),
+                    group: None,
+                },
+            ],
+            pipes: vec![crate::config::ProfilePipe {
+                source: "source".into(),
+                dest: "dest".into(),
+                trigger: "manual".into(),
+                extract: "last:7".into(),
+                prefix: Some("Review:".into()),
+            }],
+        };
+
+        app.apply_profile(&profile).unwrap();
+
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[0].name, "source");
+        assert_eq!(app.sessions[0].group.as_deref(), Some("team"));
+        assert_eq!(app.sessions[1].name, "dest");
+        assert_eq!(app.pipes.len(), 1);
+        assert_eq!(app.pipes[0].source, app.sessions[0].id);
+        assert_eq!(app.pipes[0].dest, app.sessions[1].id);
+        assert_eq!(app.pipes[0].trigger, PipeTrigger::Manual);
+        assert!(matches!(app.pipes[0].extract, ExtractMode::LastN(7)));
     }
 
     #[test]
