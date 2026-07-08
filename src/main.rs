@@ -82,20 +82,35 @@ async fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    // Enable kitty keyboard protocol so the outer terminal (e.g. iTerm) sends
-    // extended sequences for keys like Shift+Enter that would otherwise be
-    // indistinguishable from plain Enter.
-    let kitty_supported = execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-    )
-    .is_ok();
     execute!(
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+    // Restore the terminal even on panic — otherwise raw mode + alternate
+    // screen are left active and the user's shell needs `reset`.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal(true);
+        default_panic(info);
+    }));
+    // Enable kitty keyboard protocol so the outer terminal (e.g. iTerm) sends
+    // extended sequences for keys like Shift+Enter that would otherwise be
+    // indistinguishable from plain Enter. Pushed *after* entering the alternate
+    // screen: the protocol keeps independent per-screen-buffer stacks, so push
+    // and pop must happen on the same buffer or Shift+Enter is dead while the
+    // TUI runs and the main screen is left with the flags stuck on after exit
+    // (garbled Ctrl+R etc. until `reset`). Must run before the input reader
+    // task spawns — the support probe reads the reply from stdin.
+    let kitty_supported =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kitty_supported {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        )?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -111,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(profile) = profile {
         if let Err(error) = app.apply_profile(&profile) {
-            disable_raw_mode()?;
+            restore_terminal(kitty_supported);
             eprintln!("linkshell: profile '{}': {}", profile.name, error);
             std::process::exit(1);
         }
@@ -142,6 +157,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(Event::Paste(text))
                         if key_tx.send(AppEvent::Paste(text.clone())).await.is_err() =>
+                    {
+                        break;
+                    }
+                    Ok(Event::Resize(_, _))
+                        if key_tx.send(AppEvent::Resize).await.is_err() =>
                     {
                         break;
                     }
@@ -237,19 +257,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     ipc::cleanup(&config);
-    disable_raw_mode()?;
-    if kitty_supported {
-        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    }
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
+    restore_terminal(kitty_supported);
 
     Ok(())
+}
+
+/// Undo everything terminal-init set up, in reverse order: pop the kitty
+/// keyboard flags while still on the alternate screen (each screen buffer has
+/// its own flag stack), then leave it. Best-effort so it is safe from the
+/// panic hook.
+fn restore_terminal(kitty_supported: bool) {
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    if kitty_supported {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        crossterm::cursor::Show
+    );
 }
 
 fn handle_event(app: &mut App, event: AppEvent) {
@@ -349,6 +378,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
         AppEvent::Paste(text) => handle_paste(app, text),
+        // needs_redraw is set below; the draw autoresizes the backend and the
+        // post-draw pane-size pass propagates new dimensions to session PTYs.
+        AppEvent::Resize => {}
         AppEvent::Authenticate {
             token,
             transport,
