@@ -9,6 +9,7 @@ mod doctor;
 mod events;
 mod ipc;
 mod keybindings;
+mod notify;
 mod patterns;
 mod pipe;
 mod protocol;
@@ -46,11 +47,19 @@ async fn main() -> anyhow::Result<()> {
         Some(name) => match config.profiles.iter().find(|profile| profile.name == name) {
             Some(profile) => Some(profile.clone()),
             None => {
-                let available = config.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
+                let available = config
+                    .profiles
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>();
                 eprintln!(
                     "linkshell: unknown profile '{}'; available profiles: {}",
                     name,
-                    if available.is_empty() { "(none)".into() } else { available.join(", ") }
+                    if available.is_empty() {
+                        "(none)".into()
+                    } else {
+                        available.join(", ")
+                    }
                 );
                 std::process::exit(1);
             }
@@ -499,6 +508,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Enter => {
                 app.execute_command();
             }
+            KeyCode::Up => app.command_palette_move(-1),
+            KeyCode::Down => app.command_palette_move(1),
+            KeyCode::Tab => app.command_palette_insert_selected(),
             KeyCode::Backspace => {
                 app.command_backspace();
             }
@@ -523,6 +535,16 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         AppMode::Chat => {
             app.chat_key(key);
         }
+
+        AppMode::PipeList => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Normal,
+            KeyCode::Up => app.pipe_list_move(-1),
+            KeyCode::Down => app.pipe_list_move(1),
+            KeyCode::Char(' ') => app.pipe_list_toggle(),
+            KeyCode::Char('d') | KeyCode::Delete => app.pipe_list_delete(),
+            KeyCode::Enter => app.pipe_list_fire(),
+            _ => {}
+        },
 
         AppMode::Help | AppMode::CommandResult => {
             app.mode = AppMode::Normal; // any key dismisses
@@ -722,6 +744,37 @@ fn parse_tcp_flag() -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documentation_index_links_required_guides_and_recipes_cover_core_workflows() {
+        let readme = include_str!("../README.md");
+        let recipes = include_str!("../docs/recipes.md");
+        let config = include_str!("../docs/config-reference.md");
+        assert!(readme.contains("docs/recipes.md"));
+        assert!(readme.contains("docs/config-reference.md"));
+        for heading in [
+            "Reviewer pipe",
+            "Council quickstart",
+            "Remote agent",
+            "Local LLM",
+        ] {
+            assert!(recipes.contains(heading), "missing recipe: {heading}");
+        }
+        for section in [
+            "[general]",
+            "[socket]",
+            "[sessions]",
+            "[pipe.summarize]",
+            "[pricing]",
+            "[keybindings]",
+            "[notifications]",
+        ] {
+            assert!(
+                config.contains(section),
+                "missing config section: {section}"
+            );
+        }
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

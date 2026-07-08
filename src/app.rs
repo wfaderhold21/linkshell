@@ -13,7 +13,9 @@ use crate::events::AppEvent;
 use crate::keybindings::{self, Keymap};
 use crate::patterns::PatternMatcher;
 use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
-use crate::session::{Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS};
+use crate::session::{
+    extract_waiting_prompt, Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS,
+};
 
 fn expand_home(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
@@ -22,6 +24,25 @@ fn expand_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0;
+    let mut position = 0;
+    let bytes = candidate.as_bytes();
+    for needle in query.bytes() {
+        let relative = bytes[position..].iter().position(|byte| *byte == needle)?;
+        position += relative;
+        score += 100 - relative as i32;
+        if position == 0 || candidate.as_bytes().get(position.wrapping_sub(1)) == Some(&b' ') {
+            score += 25;
+        }
+        position += 1;
+    }
+    Some(score)
 }
 
 /// Screen-coordinate selection (col, row both relative to output area inner content).
@@ -136,10 +157,19 @@ pub enum AppMode {
     CommandBar,
     CommandResult,
     Help,
+    PipeList,
     Menu {
         selected_top: usize,
         selected_sub: Option<usize>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipeGlyph {
+    pub outgoing: bool,
+    pub peer: String,
+    pub recent: bool,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +199,57 @@ pub struct ChatState {
     pub histories: std::collections::HashMap<String, Vec<(String, String)>>,
     pub pending: Vec<PendingChat>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub template: String,
+    pub summary: String,
+    pub insert: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PaletteState {
+    pub matches: Vec<PaletteEntry>,
+    pub selected: usize,
+}
+
+const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
+    ("new claude <name>", "Start a Claude session", "new claude "),
+    ("new codex <name>", "Start a Codex session", "new codex "),
+    ("new shell <name>", "Start a shell session", "new shell "),
+    (
+        "new custom <command>",
+        "Start a custom command",
+        "new custom ",
+    ),
+    ("kill <session>", "Stop a session", "kill "),
+    (
+        "pipe <src> <dst> [options]",
+        "Wire session output to another session",
+        "pipe ",
+    ),
+    ("pipe fire <src> [dst]", "Fire a manual pipe", "pipe fire "),
+    ("unpipe <src> [dst]", "Remove matching pipes", "unpipe "),
+    ("pipes", "Inspect and manage pipes", "pipes"),
+    ("council <command>", "Control the agent council", "council "),
+    (
+        "profile save <name>",
+        "Save the current layout as a profile",
+        "profile save ",
+    ),
+    (
+        "config <command>",
+        "Inspect or reload configuration",
+        "config ",
+    ),
+    (
+        "grant <session> <tier>",
+        "Change session capabilities",
+        "grant ",
+    ),
+    ("restart <session>", "Restart a session", "restart "),
+    ("quit", "Exit linkshell", "quit"),
+];
 
 #[derive(Debug, Clone)]
 pub struct FileBrowserState {
@@ -237,6 +318,8 @@ pub struct App {
     pub command_input: String,
     pub command_cursor: usize,
     pub command_result: String,
+    pub palette: PaletteState,
+    pub pipe_list_selected: usize,
     pub should_quit: bool,
     pub needs_redraw: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -315,6 +398,8 @@ impl App {
             command_input: String::new(),
             command_cursor: 0,
             command_result: String::new(),
+            palette: PaletteState::default(),
+            pipe_list_selected: 0,
             should_quit: false,
             needs_redraw: true,
             event_tx,
@@ -375,16 +460,27 @@ impl App {
             };
             let cwd = expand_home(&profile_session.cwd);
             self.spawn_session(kind, profile_session.name.clone(), cwd)?;
-            let session = self.sessions.last_mut().expect("spawned session is present");
+            let session = self
+                .sessions
+                .last_mut()
+                .expect("spawned session is present");
             session.group = profile_session.group.clone();
             ids.insert(session.name.clone(), session.id);
         }
         for profile_pipe in &profile.pipes {
             let source = ids.get(&profile_pipe.source).copied().ok_or_else(|| {
-                anyhow::anyhow!("profile '{}': unknown source '{}'", profile.name, profile_pipe.source)
+                anyhow::anyhow!(
+                    "profile '{}': unknown source '{}'",
+                    profile.name,
+                    profile_pipe.source
+                )
             })?;
             let dest = ids.get(&profile_pipe.dest).copied().ok_or_else(|| {
-                anyhow::anyhow!("profile '{}': unknown destination '{}'", profile.name, profile_pipe.dest)
+                anyhow::anyhow!(
+                    "profile '{}': unknown destination '{}'",
+                    profile.name,
+                    profile_pipe.dest
+                )
             })?;
             self.pipes.push(Pipe {
                 source,
@@ -850,6 +946,13 @@ impl App {
                     session.state = new_state;
                 }
             }
+            if state_before.as_ref() != Some(&session.state) {
+                session.waiting_prompt = if session.state == SessionState::Waiting {
+                    extract_waiting_prompt(&session.output_lines)
+                } else {
+                    None
+                };
+            }
             // Claude and Codex stats come from their JSONL watchers; skip terminal scraping.
             // Uses the resolved base identity so aliased/env-prefixed CLIs are
             // treated the same as plain `claude` / `codex`.
@@ -866,6 +969,7 @@ impl App {
 
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
+                self.maybe_notify(session_id, &before, &after);
                 self.check_pipes(session_id, &after);
                 self.check_chat_pending(session_id, &after);
                 let council_relays = if let Some(router) = &mut self.council {
@@ -978,11 +1082,21 @@ impl App {
                     session.state = new_state;
                 }
             }
+            if state_before.as_ref() != Some(&session.state) {
+                session.waiting_prompt = if session.state == SessionState::Waiting {
+                    let current = std::collections::VecDeque::from([stripped]);
+                    extract_waiting_prompt(&current)
+                        .or_else(|| extract_waiting_prompt(&session.output_lines))
+                } else {
+                    None
+                };
+            }
             state_after = Some(session.state.clone());
         }
 
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
+                self.maybe_notify(session_id, &before, &after);
                 self.check_pipes(session_id, &after);
             }
         }
@@ -1005,10 +1119,18 @@ impl App {
             .map(|s| s.state.clone());
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.state = state.clone();
+            session.waiting_prompt = if state == SessionState::Waiting {
+                extract_waiting_prompt(&session.output_lines)
+            } else {
+                None
+            };
             session.ipc_state = true;
             session.ipc_state_set_at = Some(std::time::Instant::now());
         }
         if old.as_ref() != Some(&state) {
+            if let Some(old) = old.as_ref() {
+                self.maybe_notify(session_id, old, &state);
+            }
             self.check_pipes(session_id, &state);
             self.check_chat_pending(session_id, &state);
             let council_relays = if let Some(router) = &mut self.council {
@@ -1024,6 +1146,53 @@ impl App {
                 self.flush_pending_relays(session_id);
             }
         }
+    }
+
+    fn maybe_notify(&mut self, session_id: usize, old: &SessionState, new: &SessionState) {
+        let config = &self.config.notifications;
+        if !config.enabled || old == new {
+            return;
+        }
+        let state_name = match new {
+            SessionState::Waiting => "waiting",
+            SessionState::Error => "error",
+            SessionState::Starting => "starting",
+            SessionState::Ready => "ready",
+            SessionState::Thinking => "thinking",
+            SessionState::Running => "running",
+            SessionState::Dead => "dead",
+        };
+        if !config
+            .on_states
+            .iter()
+            .any(|configured| configured.eq_ignore_ascii_case(state_name))
+        {
+            return;
+        }
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        if session.started_at.elapsed().as_secs() < config.min_session_age_secs {
+            return;
+        }
+        if session
+            .last_notified
+            .is_some_and(|last| last.elapsed().as_secs() < config.debounce_secs)
+        {
+            return;
+        }
+        session.last_notified = Some(std::time::Instant::now());
+        let title = format!("{} {}", session.name, new.label());
+        let body = session
+            .waiting_prompt
+            .as_deref()
+            .unwrap_or("needs attention")
+            .to_string();
+        crate::notify::notify(config.method, &title, &body);
     }
 
     pub fn handle_named_action(&mut self, session_name: String, msg: serde_json::Value) {
@@ -1600,6 +1769,10 @@ impl App {
                         self.mode = AppMode::Normal;
                         return;
                     }
+                    AppMode::PipeList => {
+                        self.mode = AppMode::Normal;
+                        return;
+                    }
                     AppMode::Normal | AppMode::Menu { .. } => {}
                 }
 
@@ -2040,11 +2213,13 @@ impl App {
         self.command_input.clear();
         self.command_cursor = 0;
         self.mode = AppMode::CommandBar;
+        self.refresh_command_palette();
     }
 
     pub fn command_input_char(&mut self, c: char) {
         self.command_input.insert(self.command_cursor, c);
         self.command_cursor += c.len_utf8();
+        self.refresh_command_palette();
     }
 
     pub fn command_backspace(&mut self) {
@@ -2056,7 +2231,69 @@ impl App {
                 .unwrap_or(0);
             self.command_input.remove(prev);
             self.command_cursor = prev;
+            self.refresh_command_palette();
         }
+    }
+
+    pub fn command_palette_move(&mut self, delta: isize) {
+        if self.palette.matches.is_empty() {
+            self.palette.selected = 0;
+            return;
+        }
+        self.palette.selected = (self.palette.selected as isize + delta)
+            .clamp(0, self.palette.matches.len() as isize - 1)
+            as usize;
+    }
+
+    pub fn command_palette_insert_selected(&mut self) {
+        if let Some(entry) = self.palette.matches.get(self.palette.selected) {
+            self.command_input = entry.insert.clone();
+            self.command_cursor = self.command_input.len();
+            self.refresh_command_palette();
+        }
+    }
+
+    fn refresh_command_palette(&mut self) {
+        let query = self.command_input.trim().to_lowercase();
+        let mut matches: Vec<(i32, PaletteEntry)> = COMMAND_PALETTE
+            .iter()
+            .filter_map(|(template, summary, insert)| {
+                fuzzy_score(&query, &template.to_lowercase()).map(|score| {
+                    (
+                        score,
+                        PaletteEntry {
+                            template: (*template).into(),
+                            summary: (*summary).into(),
+                            insert: (*insert).into(),
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        if self.command_input.starts_with("pipe ") && self.sessions.len() >= 2 {
+            for source in &self.sessions {
+                for dest in &self.sessions {
+                    if source.id != dest.id {
+                        let insert = format!("pipe {} {} ", source.name, dest.name);
+                        matches.push((
+                            10_000,
+                            PaletteEntry {
+                                template: insert.trim_end().into(),
+                                summary: "Wire these sessions".into(),
+                                insert,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.template.cmp(&b.1.template)));
+        self.palette.matches = matches.into_iter().map(|(_, entry)| entry).collect();
+        self.palette.selected = self
+            .palette
+            .selected
+            .min(self.palette.matches.len().saturating_sub(1));
     }
 
     pub fn command_cursor_left(&mut self) {
@@ -2101,6 +2338,10 @@ impl App {
         // Pipe commands need the full token list; handle before the splitn block.
         let all_parts: Vec<&str> = cmd.split_whitespace().collect();
         match all_parts.first().copied() {
+            Some("pipes") => {
+                self.open_pipe_list();
+                return;
+            }
             Some("pipe") => {
                 self.execute_pipe_command(&all_parts[1..]);
                 return;
@@ -2173,14 +2414,10 @@ impl App {
         if args.first() == Some(&"fire") {
             let src_id = args
                 .get(1)
-                .and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
-                .map(|s| s.id);
+                .and_then(|reference| self.resolve_session_ref(reference));
             let dst_id = args
                 .get(2)
-                .and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
-                .map(|s| s.id);
+                .and_then(|reference| self.resolve_session_ref(reference));
             if let Some(source) = src_id {
                 self.fire_manual_pipes(source, dst_id);
             }
@@ -2190,16 +2427,8 @@ impl App {
         if args.len() < 2 {
             return;
         }
-        let src_id = args[0]
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
-            .map(|s| s.id);
-        let dst_id = args[1]
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| self.sessions.get(n.wrapping_sub(1)))
-            .map(|s| s.id);
+        let src_id = self.resolve_session_ref(args[0]);
+        let dst_id = self.resolve_session_ref(args[1]);
 
         let (source, dest) = match (src_id, dst_id) {
             (Some(s), Some(d)) => (s, d),
@@ -2255,6 +2484,84 @@ impl App {
         });
     }
 
+    fn resolve_session_ref(&self, reference: &str) -> Option<usize> {
+        reference
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| self.sessions.get(number.wrapping_sub(1)))
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.name == reference)
+            })
+            .map(|session| session.id)
+    }
+
+    pub fn pipe_summary_for(&self, session_id: usize, now: std::time::Instant) -> Vec<PipeGlyph> {
+        self.pipes
+            .iter()
+            .filter(|pipe| pipe.source == session_id || pipe.dest == session_id)
+            .map(|pipe| {
+                let outgoing = pipe.source == session_id;
+                let peer_id = if outgoing { pipe.dest } else { pipe.source };
+                PipeGlyph {
+                    outgoing,
+                    peer: self
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == peer_id)
+                        .map(|session| session.name.clone())
+                        .unwrap_or_else(|| format!("#{peer_id}")),
+                    recent: pipe
+                        .last_fired
+                        .and_then(|fired| now.checked_duration_since(fired))
+                        .is_some_and(|elapsed| elapsed < Duration::from_secs(5)),
+                    active: pipe.active,
+                }
+            })
+            .collect()
+    }
+
+    pub fn open_pipe_list(&mut self) {
+        self.pipe_list_selected = self
+            .pipe_list_selected
+            .min(self.pipes.len().saturating_sub(1));
+        self.mode = AppMode::PipeList;
+    }
+
+    pub fn pipe_list_move(&mut self, delta: isize) {
+        if self.pipes.is_empty() {
+            self.pipe_list_selected = 0;
+        } else {
+            self.pipe_list_selected = (self.pipe_list_selected as isize + delta)
+                .clamp(0, self.pipes.len() as isize - 1)
+                as usize;
+        }
+    }
+
+    pub fn pipe_list_toggle(&mut self) {
+        if let Some(pipe) = self.pipes.get_mut(self.pipe_list_selected) {
+            pipe.active = !pipe.active;
+        }
+    }
+
+    pub fn pipe_list_delete(&mut self) {
+        if self.pipe_list_selected < self.pipes.len() {
+            let removed = self.pipes.remove(self.pipe_list_selected);
+            let key = PipeKey::from_pipe(&removed);
+            self.abort_pipe_tasks(|candidate| candidate == key);
+            self.pipe_list_selected = self
+                .pipe_list_selected
+                .min(self.pipes.len().saturating_sub(1));
+        }
+    }
+
+    pub fn pipe_list_fire(&mut self) {
+        if let Some(pipe) = self.pipes.get(self.pipe_list_selected) {
+            self.fire_manual_pipes(pipe.source, Some(pipe.dest));
+        }
+    }
+
     fn execute_profile_command(&mut self, args: &[&str]) {
         let ["save", name] = args else {
             self.command_result = "usage: profile save <name>".into();
@@ -2268,39 +2575,48 @@ impl App {
             .collect();
         let profile = config::Profile {
             name: (*name).to_string(),
-            sessions: self.sessions.iter().map(|session| {
-                let (kind, command) = match &session.kind {
-                    SessionKind::Claude => ("claude".into(), String::new()),
-                    SessionKind::Codex => ("codex".into(), String::new()),
-                    SessionKind::Shell => ("shell".into(), String::new()),
-                    SessionKind::Custom(command) => ("custom".into(), command.clone()),
-                };
-                config::ProfileSession {
-                    kind,
-                    command,
-                    name: session.name.clone(),
-                    cwd: session.cwd.clone(),
-                    group: session.group.clone(),
-                }
-            }).collect(),
-            pipes: self.pipes.iter().filter_map(|pipe| {
-                Some(config::ProfilePipe {
-                    source: names.get(&pipe.source)?.clone(),
-                    dest: names.get(&pipe.dest)?.clone(),
-                    trigger: match pipe.trigger {
-                        PipeTrigger::OnReady => "on_ready",
-                        PipeTrigger::OnWaiting => "on_waiting",
-                        PipeTrigger::Manual => "manual",
-                    }.into(),
-                    extract: match pipe.extract {
-                        ExtractMode::LastBlock => "last_block".into(),
-                        ExtractMode::LastN(n) => format!("last:{n}"),
-                        ExtractMode::Diff => "diff".into(),
-                        ExtractMode::Summarize(n) => format!("summarize:{n}"),
-                    },
-                    prefix: pipe.prefix.clone(),
+            sessions: self
+                .sessions
+                .iter()
+                .map(|session| {
+                    let (kind, command) = match &session.kind {
+                        SessionKind::Claude => ("claude".into(), String::new()),
+                        SessionKind::Codex => ("codex".into(), String::new()),
+                        SessionKind::Shell => ("shell".into(), String::new()),
+                        SessionKind::Custom(command) => ("custom".into(), command.clone()),
+                    };
+                    config::ProfileSession {
+                        kind,
+                        command,
+                        name: session.name.clone(),
+                        cwd: session.cwd.clone(),
+                        group: session.group.clone(),
+                    }
                 })
-            }).collect(),
+                .collect(),
+            pipes: self
+                .pipes
+                .iter()
+                .filter_map(|pipe| {
+                    Some(config::ProfilePipe {
+                        source: names.get(&pipe.source)?.clone(),
+                        dest: names.get(&pipe.dest)?.clone(),
+                        trigger: match pipe.trigger {
+                            PipeTrigger::OnReady => "on_ready",
+                            PipeTrigger::OnWaiting => "on_waiting",
+                            PipeTrigger::Manual => "manual",
+                        }
+                        .into(),
+                        extract: match pipe.extract {
+                            ExtractMode::LastBlock => "last_block".into(),
+                            ExtractMode::LastN(n) => format!("last:{n}"),
+                            ExtractMode::Diff => "diff".into(),
+                            ExtractMode::Summarize(n) => format!("summarize:{n}"),
+                        },
+                        prefix: pipe.prefix.clone(),
+                    })
+                })
+                .collect(),
         };
         self.command_result = match config::save_profile(&profile) {
             Ok(path) => format!("saved profile '{}' to {}", name, path.display()),
@@ -2486,33 +2802,27 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = AppMode::Normal,
             KeyCode::Enter => self.chat_send(),
-            KeyCode::Backspace => {
-                if self.chat.cursor > 0 {
-                    let mut i = self.chat.cursor - 1;
-                    while i > 0 && !self.chat.input.is_char_boundary(i) {
-                        i -= 1;
-                    }
-                    self.chat.input.replace_range(i..self.chat.cursor, "");
-                    self.chat.cursor = i;
+            KeyCode::Backspace if self.chat.cursor > 0 => {
+                let mut i = self.chat.cursor - 1;
+                while i > 0 && !self.chat.input.is_char_boundary(i) {
+                    i -= 1;
                 }
+                self.chat.input.replace_range(i..self.chat.cursor, "");
+                self.chat.cursor = i;
             }
-            KeyCode::Left => {
-                if self.chat.cursor > 0 {
-                    let mut i = self.chat.cursor - 1;
-                    while i > 0 && !self.chat.input.is_char_boundary(i) {
-                        i -= 1;
-                    }
-                    self.chat.cursor = i;
+            KeyCode::Left if self.chat.cursor > 0 => {
+                let mut i = self.chat.cursor - 1;
+                while i > 0 && !self.chat.input.is_char_boundary(i) {
+                    i -= 1;
                 }
+                self.chat.cursor = i;
             }
-            KeyCode::Right => {
-                if self.chat.cursor < self.chat.input.len() {
-                    let mut i = self.chat.cursor + 1;
-                    while i < self.chat.input.len() && !self.chat.input.is_char_boundary(i) {
-                        i += 1;
-                    }
-                    self.chat.cursor = i;
+            KeyCode::Right if self.chat.cursor < self.chat.input.len() => {
+                let mut i = self.chat.cursor + 1;
+                while i < self.chat.input.len() && !self.chat.input.is_char_boundary(i) {
+                    i += 1;
                 }
+                self.chat.cursor = i;
             }
             KeyCode::PageUp => self.chat.scroll += 10,
             KeyCode::PageDown => self.chat.scroll = self.chat.scroll.saturating_sub(10),
@@ -2594,9 +2904,7 @@ impl App {
             match &self.chat.target {
                 Some(t) => (t.clone(), raw),
                 None => {
-                    self.chat_system(
-                        "address someone first: @name message (see /agents)",
-                    );
+                    self.chat_system("address someone first: @name message (see /agents)");
                     return;
                 }
             }
@@ -2798,8 +3106,7 @@ impl App {
                         .parent()
                         .map(|d| d.to_string_lossy().to_string())
                         .unwrap_or_else(|| "~".to_string());
-                    match self.spawn_session(SessionKind::Custom(cmd), "config".to_string(), cwd)
-                    {
+                    match self.spawn_session(SessionKind::Custom(cmd), "config".to_string(), cwd) {
                         Ok(_) => "editing config — run `config reload` when done".to_string(),
                         Err(e) => format!("config edit: {}", e),
                     }
@@ -2808,7 +3115,7 @@ impl App {
             },
             ["reload"] => {
                 self.config = std::sync::Arc::new(crate::config::load());
-                    self.keymap = keybindings::build_keymap(&self.config.keybindings);
+                self.keymap = keybindings::build_keymap(&self.config.keybindings);
                 "config reloaded — commands, aliases, agents, pricing, and keybindings apply now; \
                  socket settings and running watchers keep their old values"
                     .to_string()
@@ -2822,7 +3129,10 @@ impl App {
     fn execute_grant_command(&mut self, args: &[&str]) {
         self.command_result = match args {
             [n, tier] => match n.parse::<usize>().ok().and_then(|n| {
-                self.sessions.iter().find(|s| s.id + 1 == n || s.id == n).map(|s| s.id)
+                self.sessions
+                    .iter()
+                    .find(|s| s.id + 1 == n || s.id == n)
+                    .map(|s| s.id)
             }) {
                 Some(id) => {
                     let caps = match *tier {
@@ -2850,10 +3160,11 @@ impl App {
     fn execute_restart_command(&mut self, args: &[&str]) {
         let idx = match args {
             [] => self.active_idx(),
-            [n] => n
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| self.sessions.iter().position(|s| s.id + 1 == n || s.id == n)),
+            [n] => n.parse::<usize>().ok().and_then(|n| {
+                self.sessions
+                    .iter()
+                    .position(|s| s.id + 1 == n || s.id == n)
+            }),
             _ => None,
         };
         let Some(idx) = idx else {
@@ -3284,6 +3595,144 @@ mod tests {
 
     fn cursor_pos(app: &App) -> usize {
         app.new_session_state.cursor_pos()
+    }
+
+    #[test]
+    fn command_palette_lists_and_fuzzy_filters_registered_commands() {
+        let mut app = make_app();
+        app.open_command_bar();
+        assert!(app
+            .palette
+            .matches
+            .iter()
+            .any(|entry| entry.template.starts_with("pipe ")));
+
+        for ch in "pfsv".chars() {
+            app.command_input_char(ch);
+        }
+
+        assert_eq!(
+            app.palette
+                .matches
+                .first()
+                .map(|entry| entry.template.as_str()),
+            Some("profile save <name>")
+        );
+    }
+
+    #[test]
+    fn command_palette_completes_session_arguments_and_preserves_exact_commands() {
+        let mut app = make_app();
+        app.spawn_headless_session("reviewer".into(), None).unwrap();
+        app.spawn_headless_session("local-llm".into(), None)
+            .unwrap();
+        app.open_command_bar();
+        for ch in "pipe ".chars() {
+            app.command_input_char(ch);
+        }
+
+        assert!(app
+            .palette
+            .matches
+            .iter()
+            .any(|entry| entry.insert == "pipe reviewer local-llm "));
+        app.palette.selected = app
+            .palette
+            .matches
+            .iter()
+            .position(|entry| entry.insert == "pipe reviewer local-llm ")
+            .unwrap();
+        app.command_palette_insert_selected();
+        assert_eq!(app.command_input, "pipe reviewer local-llm ");
+
+        app.command_input = "q".into();
+        app.command_cursor = 1;
+        app.execute_command();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn pipe_topology_summaries_use_peer_names_direction_and_activity() {
+        let mut app = make_app();
+        let source = app.spawn_headless_session("reviewer".into(), None).unwrap();
+        let dest = app
+            .spawn_headless_session("local-llm".into(), None)
+            .unwrap();
+        app.pipes.push(Pipe {
+            source,
+            dest,
+            trigger: PipeTrigger::Manual,
+            extract: ExtractMode::LastBlock,
+            prefix: None,
+            active: false,
+            last_fired: Some(std::time::Instant::now()),
+        });
+
+        let outgoing = app.pipe_summary_for(source, std::time::Instant::now());
+        assert_eq!(outgoing[0].peer, "local-llm");
+        assert!(outgoing[0].outgoing);
+        assert!(outgoing[0].recent);
+        assert!(!outgoing[0].active);
+        assert!(!app.pipe_summary_for(dest, std::time::Instant::now())[0].outgoing);
+    }
+
+    #[test]
+    fn pipe_list_can_select_toggle_and_delete_pipes() {
+        let mut app = make_app();
+        let source = app.spawn_headless_session("a".into(), None).unwrap();
+        let dest = app.spawn_headless_session("b".into(), None).unwrap();
+        for _ in 0..2 {
+            app.pipes.push(Pipe {
+                source,
+                dest,
+                trigger: PipeTrigger::Manual,
+                extract: ExtractMode::LastBlock,
+                prefix: None,
+                active: true,
+                last_fired: None,
+            });
+        }
+        app.open_pipe_list();
+        app.pipe_list_move(1);
+        app.pipe_list_toggle();
+        assert!(!app.pipes[1].active);
+        app.pipe_list_delete();
+        assert_eq!(app.pipes.len(), 1);
+        assert_eq!(app.pipe_list_selected, 0);
+    }
+
+    #[test]
+    fn waiting_transition_captures_prompt_and_later_state_clears_it() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+        app.sessions[0].state = SessionState::Running;
+        app.handle_session_output(id, "Should I apply this change? [y/n]".into());
+        assert_eq!(app.sessions[0].state, SessionState::Waiting);
+        assert_eq!(
+            app.sessions[0].waiting_prompt.as_deref(),
+            Some("Should I apply this change? [y/n]")
+        );
+
+        app.handle_session_output(id, "$ ".into());
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+        assert_eq!(app.sessions[0].waiting_prompt, None);
+    }
+
+    #[test]
+    fn notifications_respect_state_age_and_per_session_debounce() {
+        let mut config = Config::default();
+        config.notifications.method = crate::notify::Method::None;
+        config.notifications.min_session_age_secs = 0;
+        config.notifications.debounce_secs = 30;
+        let mut app = make_app_with_config(config);
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+
+        app.handle_ipc_state(id, SessionState::Waiting);
+        let first = app.sessions[0].last_notified;
+        assert!(first.is_some());
+        app.handle_ipc_state(id, SessionState::Running);
+        app.handle_ipc_state(id, SessionState::Error);
+        assert_eq!(app.sessions[0].last_notified, first);
     }
 
     #[tokio::test]
@@ -3989,7 +4438,9 @@ mod tests {
     #[tokio::test]
     async fn chat_addresses_sessions_and_captures_ready_reply() {
         let mut app = make_app();
-        let id = app.spawn_headless_session("critic".to_string(), None).unwrap();
+        let id = app
+            .spawn_headless_session("critic".to_string(), None)
+            .unwrap();
 
         // Bare message with no target yet → guidance, no pending
         app.chat.input = "hello?".into();
@@ -4048,7 +4499,10 @@ mod tests {
         }
         app.handle_chat_reply("qwen".to_string(), "answer".to_string());
         let h = &app.chat.histories["qwen"];
-        assert_eq!(h.last().unwrap(), &("assistant".to_string(), "answer".to_string()));
+        assert_eq!(
+            h.last().unwrap(),
+            &("assistant".to_string(), "answer".to_string())
+        );
         assert_eq!(app.chat.messages.last().unwrap().from, "qwen");
     }
 
@@ -4092,7 +4546,4 @@ mod tests {
         assert_eq!(app.sessions[0].history_scroll, 0);
         assert_eq!(app.scroll_offset(), 0);
     }
-
-
-
 }

@@ -2,6 +2,9 @@
 
 A terminal multiplexer built for AI coding agents. Run Claude, Codex, and shell sessions side by side — and actually know what each one is doing.
 
+See the [workflow recipes](docs/recipes.md), [configuration reference](docs/config-reference.md),
+and [changelog](CHANGELOG.md).
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                 │
@@ -40,6 +43,7 @@ tmux doesn't know your Claude session is blocked waiting on you. It doesn't know
 - **Capability security** — every IPC connection is scoped: human shells hold operator rights, AI agents get worker capabilities, council members can only report state; TCP requires a valid token
 - **Remote agent support** — opt-in TCP listener for agents on other machines; same typed JSONL protocol as the Unix socket
 - **WAITING alerts** — yellow border when an agent is blocked on your input
+- **Desktop notifications** — configurable WAITING/ERROR alerts via notify-send, OSC 9, or bell
 - **ERROR alerts** — red flashing border on failure
 - **Mouse text selection** — drag to select, auto-copies to clipboard
 - **Centered session bar** — slots reflow based on how many sessions are open
@@ -65,6 +69,7 @@ linkshell               # Unix socket at $XDG_RUNTIME_DIR/linkshell/<pid>.sock
 linkshell --tcp         # also open TCP agent listener on port 7373
 linkshell --tcp 9000    # custom TCP port
 linkshell --council examples/council.toml   # launch a multi-agent council
+linkshell --profile ucc-dev                 # launch a named session profile
 ```
 
 Then create your first session with `alt-n`.
@@ -223,6 +228,7 @@ pipe <src> <dst> [--extract=last-block|last-n=N|diff] [--summarize=N] [--on=read
                       Forward output from src to dst on state change
 pipe fire [src] [dst] Manually fire a pipe with trigger=manual
 unpipe <src> [dst]    Remove pipe(s) from src
+pipes                 Inspect, pause, fire, or delete configured pipes
 quit                  Exit linkshell
 ```
 

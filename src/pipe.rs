@@ -24,9 +24,7 @@ impl ExtractMode {
             value if value.starts_with("summarize:") => {
                 Ok(Self::Summarize(value["summarize:".len()..].parse()?))
             }
-            value if value.starts_with("last:") => {
-                Ok(Self::LastN(value["last:".len()..].parse()?))
-            }
+            value if value.starts_with("last:") => Ok(Self::LastN(value["last:".len()..].parse()?)),
             _ => anyhow::bail!("unknown extract mode: {s}"),
         }
     }
@@ -196,15 +194,33 @@ mod tests {
 
     #[test]
     fn profile_pipe_strings_parse_strictly() {
-        assert!(matches!(ExtractMode::parse("last_block").unwrap(), ExtractMode::LastBlock));
-        assert!(matches!(ExtractMode::parse("diff").unwrap(), ExtractMode::Diff));
-        assert!(matches!(ExtractMode::parse("last:40").unwrap(), ExtractMode::LastN(40)));
-        assert!(matches!(ExtractMode::parse("summarize:500").unwrap(), ExtractMode::Summarize(500)));
+        assert!(matches!(
+            ExtractMode::parse("last_block").unwrap(),
+            ExtractMode::LastBlock
+        ));
+        assert!(matches!(
+            ExtractMode::parse("diff").unwrap(),
+            ExtractMode::Diff
+        ));
+        assert!(matches!(
+            ExtractMode::parse("last:40").unwrap(),
+            ExtractMode::LastN(40)
+        ));
+        assert!(matches!(
+            ExtractMode::parse("summarize:500").unwrap(),
+            ExtractMode::Summarize(500)
+        ));
         assert!(ExtractMode::parse("last:nope").is_err());
         assert!(ExtractMode::parse("everything").is_err());
 
-        assert_eq!(PipeTrigger::parse("on_ready").unwrap(), PipeTrigger::OnReady);
-        assert_eq!(PipeTrigger::parse("on_waiting").unwrap(), PipeTrigger::OnWaiting);
+        assert_eq!(
+            PipeTrigger::parse("on_ready").unwrap(),
+            PipeTrigger::OnReady
+        );
+        assert_eq!(
+            PipeTrigger::parse("on_waiting").unwrap(),
+            PipeTrigger::OnWaiting
+        );
         assert_eq!(PipeTrigger::parse("manual").unwrap(), PipeTrigger::Manual);
         assert!(PipeTrigger::parse("sometimes").is_err());
     }

@@ -96,8 +96,15 @@ pub enum BaseKind {
 }
 
 /// Command basenames recognized as local coding agents / LLM CLIs.
-pub const LOCAL_AGENT_BASENAMES: &[&str] =
-    &["opencode", "omp", "pi", "aider", "llama-cli", "llama", "ollama"];
+pub const LOCAL_AGENT_BASENAMES: &[&str] = &[
+    "opencode",
+    "omp",
+    "pi",
+    "aider",
+    "llama-cli",
+    "llama",
+    "ollama",
+];
 
 pub fn is_local_agent_basename(name: &str) -> bool {
     LOCAL_AGENT_BASENAMES.contains(&name)
@@ -143,6 +150,8 @@ pub struct Session {
     pub name: String,
     pub kind: SessionKind,
     pub state: SessionState,
+    pub waiting_prompt: Option<String>,
+    pub last_notified: Option<Instant>,
     /// No PTY — managed entirely via IPC socket.
     pub headless: bool,
     /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
@@ -209,6 +218,8 @@ impl Session {
             name,
             kind,
             state: SessionState::Starting,
+            waiting_prompt: None,
+            last_notified: None,
             headless: false,
             ipc_state: false,
             ipc_state_set_at: None,
@@ -332,9 +343,40 @@ impl Session {
     }
 }
 
+pub fn extract_waiting_prompt(lines: &VecDeque<String>) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .filter(|line| {
+            !line.is_empty()
+                && !line
+                    .chars()
+                    .all(|character| "─│╭╮╰╯>❯ ".contains(character))
+        })
+        .find(|line| {
+            line.ends_with('?') || line.to_ascii_lowercase().contains("(y/n)") || line.len() > 10
+        })
+        .map(|line| line.chars().take(80).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_prompt_prefers_recent_question_and_ignores_box_drawing() {
+        let lines = VecDeque::from([
+            "Earlier useful output".to_string(),
+            "────────────".to_string(),
+            "Should I update the tests too?".to_string(),
+            "❯".to_string(),
+        ]);
+        assert_eq!(
+            extract_waiting_prompt(&lines).as_deref(),
+            Some("Should I update the tests too?")
+        );
+    }
 
     fn session(kind: SessionKind) -> Session {
         Session::new(
