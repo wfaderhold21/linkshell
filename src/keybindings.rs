@@ -20,6 +20,7 @@ pub enum Action {
     ToggleChat,
     ToggleSplit,
     FocusNextPane,
+    BroadcastToggle,
 }
 
 pub type Keymap = HashMap<(KeyModifiers, KeyCode), Action>;
@@ -59,6 +60,7 @@ fn default_keymap() -> Keymap {
     m.insert((alt, KeyCode::Char('t')), Action::ToggleChat);
     m.insert((alt, KeyCode::Char('\\')), Action::ToggleSplit);
     m.insert((alt, KeyCode::Char('o')), Action::FocusNextPane);
+    m.insert((alt, KeyCode::Char('b')), Action::BroadcastToggle);
     m.insert((alt, KeyCode::Left), Action::PrevSession);
     m.insert((alt, KeyCode::Right), Action::NextSession);
     m.insert((alt, KeyCode::Tab), Action::NextSession);
@@ -148,6 +150,7 @@ fn parse_action(s: &str) -> Option<Action> {
         "open_menu" => Some(Action::OpenMenu),
         "toggle_split" => Some(Action::ToggleSplit),
         "focus_next_pane" => Some(Action::FocusNextPane),
+        "broadcast_toggle" => Some(Action::BroadcastToggle),
         _ => None,
     }
 }

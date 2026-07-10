@@ -501,6 +501,16 @@ pub fn parse(content: &str) -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
+pub fn save(config: &Config) -> anyhow::Result<()> {
+    let path = config_path().ok_or_else(|| anyhow::anyhow!("cannot determine config path"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = toml::to_string_pretty(config)?;
+    std::fs::write(&path, content)?;
+    Ok(())
+}
+
 fn validate_profiles(cfg: &Config) -> anyhow::Result<()> {
     use std::collections::HashSet;
     let mut profile_names = HashSet::new();

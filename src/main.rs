@@ -397,7 +397,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
 }
 
 fn handle_paste(app: &mut App, text: String) {
-    match app.mode {
+    match &app.mode {
         AppMode::Normal => {
             // Forward to PTY wrapped in bracketed paste sequences so the inner
             // program can distinguish pasted text from typed input.
@@ -426,8 +426,18 @@ fn handle_paste(app: &mut App, text: String) {
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    match app.mode {
+    match app.mode.clone() {
         AppMode::Normal => {
+            // Ctrl+F → enter search mode
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
+                app.mode = AppMode::Search {
+                    query: String::new(),
+                    cursor: 0,
+                    matches: vec![],
+                    selected: 0,
+                };
+                return;
+            }
             if let Some(action) = app.keymap.get(&(key.modifiers, key.code)).cloned() {
                 match action {
                     Action::NewSession => app.open_new_session(),
@@ -446,6 +456,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ToggleChat => app.toggle_chat(),
                     Action::ToggleSplit => app.toggle_split(),
                     Action::FocusNextPane => app.focus_next_pane(),
+                    Action::BroadcastToggle => {
+                        app.broadcast_mode = !app.broadcast_mode;
+                        app.command_result = if app.broadcast_mode {
+                            "Broadcast mode ON".to_string()
+                        } else {
+                            "Broadcast mode OFF".to_string()
+                        };
+                        app.mode = AppMode::CommandResult;
+                    }
                 }
                 return;
             }
@@ -623,6 +642,161 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     }
                     _ => {}
                 },
+                _ => {}
+            }
+        }
+
+        AppMode::Search { mut query, mut cursor, matches, mut selected } => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.mode = AppMode::Normal;
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some(&line_idx) = matches.get(selected) {
+                        if let Some(session) = app.active_session_mut() {
+                            let total = session.output_lines.len();
+                            let from_end = total.saturating_sub(line_idx + 1);
+                            session.history_scroll = from_end;
+                        }
+                    }
+                    app.mode = AppMode::Normal;
+                    return;
+                }
+                KeyCode::Up => {
+                    if !matches.is_empty() && selected > 0 {
+                        selected -= 1;
+                    }
+                    app.mode = AppMode::Search { query, cursor, matches, selected };
+                    return;
+                }
+                KeyCode::Down => {
+                    if !matches.is_empty() && selected + 1 < matches.len() {
+                        selected += 1;
+                    }
+                    app.mode = AppMode::Search { query, cursor, matches, selected };
+                    return;
+                }
+                KeyCode::Backspace => {
+                    if cursor > 0 {
+                        let prev = query[..cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        query.remove(prev);
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    query.insert(cursor, c);
+                    cursor += c.len_utf8();
+                }
+                _ => {
+                    app.mode = AppMode::Search { query, cursor, matches, selected };
+                    return;
+                }
+            }
+            // After query change, update matches
+            let new_matches = app.search_compute_matches(&query);
+            app.mode = AppMode::Search {
+                query,
+                cursor,
+                matches: new_matches,
+                selected: 0,
+            };
+        }
+
+        AppMode::Settings => {
+            match key.code {
+                KeyCode::Esc => {
+                    if app.settings_state.editing {
+                        app.settings_state.editing = false;
+                        app.settings_state.edit_buf.clear();
+                        app.settings_state.edit_cursor = 0;
+                    } else {
+                        app.mode = AppMode::Normal;
+                    }
+                }
+                KeyCode::Up if !app.settings_state.editing => {
+                    if app.settings_state.selected > 0 {
+                        app.settings_state.selected -= 1;
+                    }
+                }
+                KeyCode::Down if !app.settings_state.editing => {
+                    let max = app.settings_state.fields.len().saturating_sub(1);
+                    if app.settings_state.selected < max {
+                        app.settings_state.selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if app.settings_state.editing {
+                        // Commit the edit
+                        let sel = app.settings_state.selected;
+                        let new_val = app.settings_state.edit_buf.clone();
+                        if let Some(field) = app.settings_state.fields.get_mut(sel) {
+                            field.value = new_val;
+                        }
+                        app.settings_state.editing = false;
+                        app.settings_state.edit_buf.clear();
+                        app.settings_state.edit_cursor = 0;
+                    } else {
+                        // Start editing
+                        let sel = app.settings_state.selected;
+                        if let Some(field) = app.settings_state.fields.get(sel) {
+                            app.settings_state.edit_buf = field.value.clone();
+                            app.settings_state.edit_cursor = field.value.len();
+                            app.settings_state.editing = true;
+                        }
+                    }
+                }
+                KeyCode::Char('s') if !app.settings_state.editing => {
+                    match app.apply_settings() {
+                        Ok(()) => {
+                            app.command_result = "Saved. Some settings require restart.".to_string();
+                        }
+                        Err(e) => {
+                            app.command_result = format!("Save failed: {}", e);
+                        }
+                    }
+                    app.mode = AppMode::CommandResult;
+                }
+                KeyCode::Char(c) if app.settings_state.editing => {
+                    let cursor = app.settings_state.edit_cursor;
+                    app.settings_state.edit_buf.insert(cursor, c);
+                    app.settings_state.edit_cursor += c.len_utf8();
+                }
+                KeyCode::Backspace if app.settings_state.editing => {
+                    let cursor = app.settings_state.edit_cursor;
+                    if cursor > 0 {
+                        let prev = app.settings_state.edit_buf[..cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        app.settings_state.edit_buf.remove(prev);
+                        app.settings_state.edit_cursor = prev;
+                    }
+                }
+                KeyCode::Left if app.settings_state.editing => {
+                    let cursor = app.settings_state.edit_cursor;
+                    if cursor > 0 {
+                        let prev = app.settings_state.edit_buf[..cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        app.settings_state.edit_cursor = prev;
+                    }
+                }
+                KeyCode::Right if app.settings_state.editing => {
+                    let cursor = app.settings_state.edit_cursor;
+                    let len = app.settings_state.edit_buf.len();
+                    if cursor < len {
+                        let ch = app.settings_state.edit_buf[cursor..].chars().next().unwrap();
+                        app.settings_state.edit_cursor += ch.len_utf8();
+                    }
+                }
                 _ => {}
             }
         }

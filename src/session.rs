@@ -190,6 +190,8 @@ pub struct Session {
     pub base: BaseKind,
     /// Last time we received output from this session; used for idle timeout detection.
     pub last_output_at: Option<Instant>,
+    /// Optional path to log session output lines to disk.
+    pub log_path: Option<std::path::PathBuf>,
 }
 
 impl Session {
@@ -240,6 +242,7 @@ impl Session {
             bytes_since_last_tick: 0,
             history_scroll: 0,
             base,
+            log_path: None,
         }
     }
 

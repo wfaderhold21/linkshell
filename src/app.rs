@@ -148,7 +148,7 @@ impl Default for NewSessionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Normal,
     Chat,
@@ -162,6 +162,42 @@ pub enum AppMode {
         selected_top: usize,
         selected_sub: Option<usize>,
     },
+    Search {
+        query: String,
+        cursor: usize,
+        matches: Vec<usize>,
+        selected: usize,
+    },
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsField {
+    pub label: &'static str,
+    pub value: String,
+    #[allow(dead_code)]
+    pub description: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsState {
+    pub fields: Vec<SettingsField>,
+    pub selected: usize,
+    pub editing: bool,
+    pub edit_buf: String,
+    pub edit_cursor: usize,
+}
+
+impl SettingsState {
+    pub fn new_empty() -> Self {
+        Self {
+            fields: Vec::new(),
+            selected: 0,
+            editing: false,
+            edit_buf: String::new(),
+            edit_cursor: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +284,13 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
         "grant ",
     ),
     ("restart <session>", "Restart a session", "restart "),
+    ("move <from> <to>", "Swap session positions", "move "),
+    ("rename <session> <name>", "Rename a session", "rename "),
+    ("log <session> <path>", "Log session output to file", "log "),
+    ("log stop <session>", "Stop logging session output", "log stop "),
+    ("broadcast toggle", "Toggle broadcast mode", "broadcast"),
+    ("search <query>", "Search session output", "search "),
+    ("settings", "Open settings menu", "settings"),
     ("quit", "Exit linkshell", "quit"),
 ];
 
@@ -363,6 +406,9 @@ pub struct App {
     /// Optional council router for multi-agent orchestration
     pub council: Option<CouncilRouter>,
     pub chat: ChatState,
+    /// When true, key input is forwarded to all non-dead sessions
+    pub broadcast_mode: bool,
+    pub settings_state: SettingsState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -433,6 +479,8 @@ impl App {
             caps: HashMap::new(),
             council: None,
             chat: ChatState::default(),
+            broadcast_mode: false,
+            settings_state: SettingsState::new_empty(),
         }
     }
 
@@ -490,6 +538,7 @@ impl App {
                 prefix: profile_pipe.prefix.clone(),
                 active: true,
                 last_fired: None,
+                condition: None,
             });
         }
         Ok(())
@@ -935,6 +984,17 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&line);
+            // Log to file if configured
+            if let Some(log_path) = &session.log_path {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(log_path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{}", stripped);
+                }
+            }
             session.push_output_line(stripped.clone());
             if let Some(new_state) = self.matcher.infer_state(&stripped, session.base) {
                 // When JSONL is active it owns Thinking/Running/Ready transitions, but it
@@ -1016,6 +1076,11 @@ impl App {
         for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract)
             {
+                if let Some(cond) = &p.condition {
+                    if !content.to_lowercase().contains(&cond.to_lowercase()) {
+                        continue;
+                    }
+                }
                 self.fire_pipe_task(p, content);
             }
         }
@@ -1044,6 +1109,11 @@ impl App {
         for p in to_fire {
             if let Some(content) = pipe::extract_from_session(&self.sessions, p.source, &p.extract)
             {
+                if let Some(cond) = &p.condition {
+                    if !content.to_lowercase().contains(&cond.to_lowercase()) {
+                        continue;
+                    }
+                }
                 self.fire_pipe_task(p, content);
             }
         }
@@ -1277,6 +1347,7 @@ impl App {
             prefix,
             active: true,
             last_fired: None,
+            condition: None,
         });
     }
 
@@ -1732,7 +1803,7 @@ impl App {
 
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                match self.mode {
+                match self.mode.clone() {
                     AppMode::Chat => {
                         if !rect_hit(self.chat_area, col, row) {
                             self.mode = AppMode::Normal;
@@ -1770,6 +1841,14 @@ impl App {
                         return;
                     }
                     AppMode::PipeList => {
+                        self.mode = AppMode::Normal;
+                        return;
+                    }
+                    AppMode::Search { .. } => {
+                        self.mode = AppMode::Normal;
+                        return;
+                    }
+                    AppMode::Settings => {
                         self.mode = AppMode::Normal;
                         return;
                     }
@@ -2370,6 +2449,43 @@ impl App {
                 self.execute_restart_command(&all_parts[1..]);
                 return;
             }
+            Some("move") => {
+                self.execute_move_command(&all_parts[1..]);
+                return;
+            }
+            Some("rename") => {
+                self.execute_rename_command(&all_parts[1..]);
+                return;
+            }
+            Some("log") => {
+                self.execute_log_command(&all_parts[1..]);
+                return;
+            }
+            Some("broadcast") => {
+                self.broadcast_mode = !self.broadcast_mode;
+                self.command_result = if self.broadcast_mode {
+                    "Broadcast mode ON".to_string()
+                } else {
+                    "Broadcast mode OFF".to_string()
+                };
+                self.mode = AppMode::CommandResult;
+                return;
+            }
+            Some("search") => {
+                let query = all_parts[1..].join(" ");
+                self.mode = AppMode::Search {
+                    query: query.clone(),
+                    cursor: query.len(),
+                    matches: vec![],
+                    selected: 0,
+                };
+                self.search_update_matches();
+                return;
+            }
+            Some("settings") => {
+                self.open_settings();
+                return;
+            }
             _ => {}
         }
 
@@ -2438,6 +2554,7 @@ impl App {
         let mut extract = ExtractMode::LastBlock;
         let mut trigger = PipeTrigger::OnReady;
         let mut prefix: Option<String> = None;
+        let mut condition: Option<String> = None;
 
         let flags = &args[2..];
         let mut i = 0;
@@ -2459,6 +2576,8 @@ impl App {
                     "manual" => PipeTrigger::Manual,
                     _ => PipeTrigger::OnReady,
                 };
+            } else if let Some(val) = flag.strip_prefix("--if-matches=") {
+                condition = Some(val.trim_matches('"').to_string());
             } else if let Some(val) = flag.strip_prefix("--prefix=") {
                 // Consume rest of tokens as the prefix value
                 let rest = flags[i + 1..].join(" ");
@@ -2481,6 +2600,7 @@ impl App {
             prefix,
             active: true,
             last_fired: None,
+            condition,
         });
     }
 
@@ -2660,7 +2780,17 @@ impl App {
     pub fn write_to_active(&mut self, data: &[u8]) {
         // Typing returns the view to the live tail.
         self.clear_scroll();
-        if let Some(session) = self.active_session() {
+        if self.broadcast_mode {
+            let ids: Vec<usize> = self.sessions.iter()
+                .filter(|s| s.state != SessionState::Dead)
+                .map(|s| s.id)
+                .collect();
+            for id in ids {
+                if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+                    s.write_bytes(data.to_vec());
+                }
+            }
+        } else if let Some(session) = self.active_session() {
             session.write_bytes(data.to_vec());
         }
     }
@@ -3185,6 +3315,245 @@ impl App {
         self.mode = AppMode::CommandResult;
     }
 
+    fn execute_move_command(&mut self, args: &[&str]) {
+        if args.len() < 2 {
+            self.command_result = "usage: move <from> <to>".to_string();
+            self.mode = AppMode::CommandResult;
+            return;
+        }
+        let from_1: usize = match args[0].parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.command_result = "move: invalid session number".to_string();
+                self.mode = AppMode::CommandResult;
+                return;
+            }
+        };
+        let to_1: usize = match args[1].parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.command_result = "move: invalid session number".to_string();
+                self.mode = AppMode::CommandResult;
+                return;
+            }
+        };
+        let n = self.sessions.len();
+        if from_1 < 1 || from_1 > n || to_1 < 1 || to_1 > n {
+            self.command_result = format!("move: session index out of range (1–{})", n);
+            self.mode = AppMode::CommandResult;
+            return;
+        }
+        let from_idx = from_1 - 1;
+        let to_idx = to_1 - 1;
+        self.sessions.swap(from_idx, to_idx);
+        // Update pane indices to follow the swapped sessions
+        for pane in &mut self.panes {
+            if let Some(ref mut idx) = pane {
+                if *idx == from_idx {
+                    *idx = to_idx;
+                } else if *idx == to_idx {
+                    *idx = from_idx;
+                }
+            }
+        }
+        self.command_result = format!("moved session {} ↔ {}", from_1, to_1);
+        self.mode = AppMode::CommandResult;
+    }
+
+    fn execute_rename_command(&mut self, args: &[&str]) {
+        if args.len() < 2 {
+            self.command_result = "usage: rename <session> <new_name>".to_string();
+            self.mode = AppMode::CommandResult;
+            return;
+        }
+        let id = self.resolve_session_ref(args[0]);
+        let new_name = args[1..].join(" ");
+        match id {
+            None => {
+                self.command_result = format!("rename: session '{}' not found", args[0]);
+                self.mode = AppMode::CommandResult;
+            }
+            Some(session_id) => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    s.name = new_name.clone();
+                    self.command_result = format!("renamed to '{}'", new_name);
+                    self.mode = AppMode::CommandResult;
+                }
+            }
+        }
+    }
+
+    fn execute_log_command(&mut self, args: &[&str]) {
+        if args.first() == Some(&"stop") {
+            let id = args.get(1).and_then(|r| self.resolve_session_ref(r))
+                .or_else(|| self.active_session().map(|s| s.id));
+            match id {
+                None => {
+                    self.command_result = "log stop: no session found".to_string();
+                    self.mode = AppMode::CommandResult;
+                }
+                Some(session_id) => {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        s.log_path = None;
+                        self.command_result = "logging stopped".to_string();
+                        self.mode = AppMode::CommandResult;
+                    }
+                }
+            }
+            return;
+        }
+        if args.len() < 2 {
+            self.command_result = "usage: log <session> <path>  or  log stop <session>".to_string();
+            self.mode = AppMode::CommandResult;
+            return;
+        }
+        let id = self.resolve_session_ref(args[0]);
+        let path = std::path::PathBuf::from(args[1]);
+        match id {
+            None => {
+                self.command_result = format!("log: session '{}' not found", args[0]);
+                self.mode = AppMode::CommandResult;
+            }
+            Some(session_id) => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    let display = path.display().to_string();
+                    s.log_path = Some(path);
+                    self.command_result = format!("logging to {}", display);
+                    self.mode = AppMode::CommandResult;
+                }
+            }
+        }
+    }
+
+    pub fn search_compute_matches(&self, query: &str) -> Vec<usize> {
+        if query.is_empty() {
+            return vec![];
+        }
+        let query_lower = query.to_lowercase();
+        if let Some(session) = self.active_session() {
+            session.output_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn search_update_matches(&mut self) {
+        let query = match &self.mode {
+            AppMode::Search { query, .. } => query.clone(),
+            _ => return,
+        };
+        let matches = self.search_compute_matches(&query);
+        if let AppMode::Search { query: q, cursor, selected, .. } = &self.mode {
+            let q = q.clone();
+            let c = *cursor;
+            let s = (*selected).min(matches.len().saturating_sub(1));
+            self.mode = AppMode::Search {
+                query: q,
+                cursor: c,
+                matches,
+                selected: s,
+            };
+        }
+    }
+
+    pub fn open_settings(&mut self) {
+        let fields = vec![
+            SettingsField {
+                label: "Tick interval (ms)",
+                value: self.config.general.tick_interval_ms.to_string(),
+                description: "How often the event loop ticks",
+            },
+            SettingsField {
+                label: "Scroll buffer (lines)",
+                value: self.config.general.scroll_buffer_lines.to_string(),
+                description: "Number of output lines retained per session",
+            },
+            SettingsField {
+                label: "Notifications enabled",
+                value: self.config.notifications.enabled.to_string(),
+                description: "Enable desktop/terminal notifications",
+            },
+            SettingsField {
+                label: "Notification method",
+                value: format!("{:?}", self.config.notifications.method),
+                description: "auto, osc9, notify-send, bell, none",
+            },
+            SettingsField {
+                label: "Notification debounce (s)",
+                value: self.config.notifications.debounce_secs.to_string(),
+                description: "Minimum seconds between notifications per session",
+            },
+            SettingsField {
+                label: "Default CWD",
+                value: self.config.sessions.default_cwd.clone(),
+                description: "Default working directory for new sessions",
+            },
+            SettingsField {
+                label: "Claude command",
+                value: self.config.sessions.commands.claude.clone(),
+                description: "Command used to start Claude sessions",
+            },
+            SettingsField {
+                label: "Codex command",
+                value: self.config.sessions.commands.codex.clone(),
+                description: "Command used to start Codex sessions",
+            },
+            SettingsField {
+                label: "Shell command",
+                value: self.config.sessions.commands.shell.clone(),
+                description: "Shell command (empty = $SHELL)",
+            },
+        ];
+        self.settings_state = SettingsState {
+            fields,
+            selected: 0,
+            editing: false,
+            edit_buf: String::new(),
+            edit_cursor: 0,
+        };
+        self.mode = AppMode::Settings;
+    }
+
+    pub fn apply_settings(&mut self) -> anyhow::Result<()> {
+        let mut cfg = (*self.config).clone();
+        for field in &self.settings_state.fields {
+            match field.label {
+                "Tick interval (ms)" => {
+                    cfg.general.tick_interval_ms = field.value.parse().unwrap_or(cfg.general.tick_interval_ms);
+                }
+                "Scroll buffer (lines)" => {
+                    cfg.general.scroll_buffer_lines = field.value.parse().unwrap_or(cfg.general.scroll_buffer_lines);
+                }
+                "Notifications enabled" => {
+                    cfg.notifications.enabled = field.value.parse().unwrap_or(cfg.notifications.enabled);
+                }
+                "Notification debounce (s)" => {
+                    cfg.notifications.debounce_secs = field.value.parse().unwrap_or(cfg.notifications.debounce_secs);
+                }
+                "Default CWD" => {
+                    cfg.sessions.default_cwd = field.value.clone();
+                }
+                "Claude command" => {
+                    cfg.sessions.commands.claude = field.value.clone();
+                }
+                "Codex command" => {
+                    cfg.sessions.commands.codex = field.value.clone();
+                }
+                "Shell command" => {
+                    cfg.sessions.commands.shell = field.value.clone();
+                }
+                _ => {}
+            }
+        }
+        config::save(&cfg)?;
+        Ok(())
+    }
+
     /// Read and parse a council.toml, then launch it.
     pub fn load_council_file(&mut self, path: &str) -> anyhow::Result<()> {
         let cfg = crate::council::load_config_file(path)?;
@@ -3666,6 +4035,7 @@ mod tests {
             prefix: None,
             active: false,
             last_fired: Some(std::time::Instant::now()),
+            condition: None,
         });
 
         let outgoing = app.pipe_summary_for(source, std::time::Instant::now());
@@ -3690,6 +4060,7 @@ mod tests {
                 prefix: None,
                 active: true,
                 last_fired: None,
+                condition: None,
             });
         }
         app.open_pipe_list();
