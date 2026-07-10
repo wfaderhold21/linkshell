@@ -216,9 +216,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // SIGHUP → detach (SSH drop, controlling terminal closed, etc.)
-    let mut sighup = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::hangup(),
-    )?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     let frame_cap = Duration::from_millis(16);
     let mut last_render = Instant::now() - frame_cap;
@@ -374,6 +372,18 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::SessionStats { session_id, stats } => {
             app.handle_session_stats(session_id, stats);
+        }
+        AppEvent::SessionBaseDetected { session_id, base } => {
+            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
+                // Only upgrade unresolved identities; never override a base
+                // that was already pinned at spawn time or by an alias.
+                if matches!(
+                    s.base,
+                    session::BaseKind::Other | session::BaseKind::LocalAgent
+                ) {
+                    s.base = base;
+                }
+            }
         }
         AppEvent::SessionModel { session_id, model } => {
             if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
@@ -715,7 +725,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
-        AppMode::Search { mut query, mut cursor, matches, mut selected } => {
+        AppMode::Search {
+            mut query,
+            mut cursor,
+            matches,
+            mut selected,
+        } => {
             match key.code {
                 KeyCode::Esc => {
                     app.mode = AppMode::Normal;
@@ -736,14 +751,24 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     if !matches.is_empty() && selected > 0 {
                         selected -= 1;
                     }
-                    app.mode = AppMode::Search { query, cursor, matches, selected };
+                    app.mode = AppMode::Search {
+                        query,
+                        cursor,
+                        matches,
+                        selected,
+                    };
                     return;
                 }
                 KeyCode::Down => {
                     if !matches.is_empty() && selected + 1 < matches.len() {
                         selected += 1;
                     }
-                    app.mode = AppMode::Search { query, cursor, matches, selected };
+                    app.mode = AppMode::Search {
+                        query,
+                        cursor,
+                        matches,
+                        selected,
+                    };
                     return;
                 }
                 KeyCode::Backspace => {
@@ -757,12 +782,20 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         cursor = prev;
                     }
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
                     query.insert(cursor, c);
                     cursor += c.len_utf8();
                 }
                 _ => {
-                    app.mode = AppMode::Search { query, cursor, matches, selected };
+                    app.mode = AppMode::Search {
+                        query,
+                        cursor,
+                        matches,
+                        selected,
+                    };
                     return;
                 }
             }
@@ -822,7 +855,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 KeyCode::Char('s') if !app.settings_state.editing => {
                     match app.apply_settings() {
                         Ok(()) => {
-                            app.command_result = "Saved. Some settings require restart.".to_string();
+                            app.command_result =
+                                "Saved. Some settings require restart.".to_string();
                         }
                         Err(e) => {
                             app.command_result = format!("Save failed: {}", e);
@@ -862,7 +896,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     let cursor = app.settings_state.edit_cursor;
                     let len = app.settings_state.edit_buf.len();
                     if cursor < len {
-                        let ch = app.settings_state.edit_buf[cursor..].chars().next().unwrap();
+                        let ch = app.settings_state.edit_buf[cursor..]
+                            .chars()
+                            .next()
+                            .unwrap();
                         app.settings_state.edit_cursor += ch.len_utf8();
                     }
                 }
@@ -1009,9 +1046,13 @@ async fn do_reattach(
     kitty_supported: bool,
 ) {
     // Convert to std UnixStream so we can clone the fd for the sync writer.
-    let Ok(std_stream) = stream.into_std() else { return };
+    let Ok(std_stream) = stream.into_std() else {
+        return;
+    };
     let _ = std_stream.set_nonblocking(false); // writer clone must be blocking
-    let Ok(writer_clone) = std_stream.try_clone() else { return };
+    let Ok(writer_clone) = std_stream.try_clone() else {
+        return;
+    };
     let _ = std_stream.set_nonblocking(true); // back to non-blocking for tokio
     let Ok(relay_reader) = tokio::net::UnixStream::from_std(std_stream) else {
         return;
@@ -1035,9 +1076,7 @@ async fn do_reattach(
         if kitty_supported {
             let _ = crossterm::execute!(
                 &mut buf,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                ),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             );
         }
         let mut w = writer_handle.lock().unwrap();
@@ -1057,9 +1096,7 @@ async fn do_reattach(
         let mut reader = tokio::io::BufReader::new(relay_reader);
         let mut line = String::new();
         // Propagate the terminal size the relay client reported.
-        let _ = tx
-            .send(AppEvent::Resize)
-            .await;
+        let _ = tx.send(AppEvent::Resize).await;
         loop {
             line.clear();
             match reader.read_line(&mut line).await {

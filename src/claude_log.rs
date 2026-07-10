@@ -254,6 +254,32 @@ pub fn spawn_watcher(
     config: Arc<Config>,
     config_home: Option<String>,
 ) {
+    spawn_watcher_inner(session_id, cwd, tx, config, config_home, false);
+}
+
+/// Like [`spawn_watcher`], but for sessions whose command didn't resolve to a
+/// known CLI (wrapper scripts, arbitrary custom commands). If a new claude
+/// JSONL ever appears for this cwd, the session is evidently claude behind a
+/// name the classifier can't see through: announce the identity upgrade via
+/// `SessionBaseDetected`, then tail the log like a native claude session.
+pub fn spawn_detecting_watcher(
+    session_id: usize,
+    cwd: String,
+    tx: tokio::sync::mpsc::Sender<AppEvent>,
+    config: Arc<Config>,
+    config_home: Option<String>,
+) {
+    spawn_watcher_inner(session_id, cwd, tx, config, config_home, true);
+}
+
+fn spawn_watcher_inner(
+    session_id: usize,
+    cwd: String,
+    tx: tokio::sync::mpsc::Sender<AppEvent>,
+    config: Arc<Config>,
+    config_home: Option<String>,
+    announce_detection: bool,
+) {
     let dir = match project_dir(&cwd, config_home.as_deref()) {
         Some(d) => d,
         None => return,
@@ -281,6 +307,15 @@ pub fn spawn_watcher(
             Some(p) => p,
             None => return,
         };
+
+        if announce_detection {
+            let _ = tx
+                .send(AppEvent::SessionBaseDetected {
+                    session_id,
+                    base: crate::session::BaseKind::Claude,
+                })
+                .await;
+        }
 
         tail(session_id, &jsonl, &tx, &config).await;
     });

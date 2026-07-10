@@ -25,11 +25,19 @@ impl SessionKind {
     }
 
     pub fn is_claude_based(&self) -> bool {
-        matches!(self, SessionKind::Claude) || self.custom_base_name() == Some("claude")
+        matches!(self, SessionKind::Claude)
+            || self
+                .custom_base_name()
+                .map(is_claude_basename)
+                .unwrap_or(false)
     }
 
     pub fn is_codex_based(&self) -> bool {
-        matches!(self, SessionKind::Codex) || self.custom_base_name() == Some("codex")
+        matches!(self, SessionKind::Codex)
+            || self
+                .custom_base_name()
+                .map(is_codex_basename)
+                .unwrap_or(false)
     }
 
     pub(crate) fn custom_base_name_pub(&self) -> Option<&str> {
@@ -43,6 +51,20 @@ impl SessionKind {
             None
         }
     }
+}
+
+/// True when a command basename is `claude` or a claude wrapper following the
+/// common naming convention: `claude-work`, `claude.sh`, `claude_glm`. Wrappers
+/// with unrelated names still need a [sessions.aliases] entry.
+pub fn is_claude_basename(name: &str) -> bool {
+    name.strip_prefix("claude")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.', '_']))
+}
+
+/// Codex analogue of [`is_claude_basename`].
+pub fn is_codex_basename(name: &str) -> bool {
+    name.strip_prefix("codex")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.', '_']))
 }
 
 /// Basename of the actual binary in a command line, skipping leading
@@ -567,6 +589,17 @@ mod tests {
         assert!(k.is_codex_based());
         let k = SessionKind::Custom("FOO=1 bash".into());
         assert!(!k.is_claude_based() && !k.is_codex_based());
+    }
+
+    #[test]
+    fn wrapper_basenames_classify_as_claude_or_codex() {
+        assert!(SessionKind::Custom("claude-work --continue".into()).is_claude_based());
+        assert!(SessionKind::Custom("~/bin/claude.sh".into()).is_claude_based());
+        assert!(SessionKind::Custom("claude_glm".into()).is_claude_based());
+        assert!(SessionKind::Custom("codex-alt".into()).is_codex_based());
+        // similar-but-unrelated names stay unclassified
+        assert!(!SessionKind::Custom("claudette".into()).is_claude_based());
+        assert!(!SessionKind::Custom("codexplorer".into()).is_codex_based());
     }
 
     #[test]
