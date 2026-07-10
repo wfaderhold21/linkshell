@@ -13,7 +13,7 @@ path = "src/bin/ctl.rs"
 
 [dependencies]
 ratatui = "0.25"
-crossterm = "0.27"
+crossterm = { version = "0.27", features = ["serde"] }
 pty-process = { version = "0.4", features = ["async"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

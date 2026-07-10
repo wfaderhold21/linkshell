@@ -125,6 +125,17 @@ pub enum AppEvent {
     /// from the new layout after the draw
     Resize,
     Tick,
+    /// Voluntary detach (`:detach` / Alt+D) or SIGHUP: release the terminal
+    /// and continue running headlessly. Sessions and pipes keep going.
+    Detach,
+    /// A relay client connected via the reattach socket (`linkshell -r`).
+    /// The stream carries JSON-encoded crossterm events inbound and raw
+    /// terminal bytes outbound.
+    Reattach {
+        stream: tokio::net::UnixStream,
+        rows: u16,
+        cols: u16,
+    },
     /// IPC handshake: resolve a token (or Unix peer) to a session_id + CapSet.
     Authenticate {
         token: Option<String>,

@@ -291,6 +291,7 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
     ("broadcast toggle", "Toggle broadcast mode", "broadcast"),
     ("search <query>", "Search session output", "search "),
     ("settings", "Open settings menu", "settings"),
+    ("detach", "Detach from terminal (keep sessions running)", "detach"),
     ("quit", "Exit linkshell", "quit"),
 ];
 
@@ -2484,6 +2485,10 @@ impl App {
             }
             Some("settings") => {
                 self.open_settings();
+                return;
+            }
+            Some("detach") => {
+                let _ = self.event_tx.try_send(AppEvent::Detach);
                 return;
             }
             _ => {}

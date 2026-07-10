@@ -78,6 +78,9 @@ name = "bitflags"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bumpalo"
@@ -180,6 +183,7 @@ dependencies = [
  "libc",
  "mio 0.8.11",
  "parking_lot",
+ "serde",
  "signal-hook",
  "signal-hook-mio",
  "winapi",

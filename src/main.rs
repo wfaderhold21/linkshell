@@ -13,10 +13,11 @@ mod notify;
 mod patterns;
 mod pipe;
 mod protocol;
+mod reattach;
 mod session;
 mod ui;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -35,13 +36,20 @@ use tokio::time;
 use app::{App, AppMode, NewSessionField};
 use events::AppEvent;
 use keybindings::Action;
+use reattach::{SwappableWriter, WriterBox};
 use ui::FILE_BROWSER_VISIBLE_ROWS;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // ── Subcommands that don't enter the TUI ──────────────────────────────
     if std::env::args().nth(1).as_deref() == Some("doctor") {
         std::process::exit(doctor::run());
     }
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-r" || a == "--reattach") {
+        return reattach::run_relay_client().await;
+    }
+
     let config = Arc::new(config::load());
     let profile = match parse_profile_flag() {
         Some(name) => match config.profiles.iter().find(|profile| profile.name == name) {
@@ -110,7 +118,14 @@ async fn main() -> anyhow::Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         )?;
     }
-    let backend = CrosstermBackend::new(stdout);
+    // SwappableWriter lets us redirect ratatui output to a relay socket on
+    // reattach without reconstructing the Terminal object.
+    let (swappable, writer_handle) = SwappableWriter::with_stdout();
+    // The initial backend targets stdout (already captured above); the
+    // SwappableWriter holds an Arc<Mutex<WriterBox>> that we swap on reattach.
+    // Drop `stdout` — SwappableWriter owns the Write target from here.
+    drop(stdout);
+    let backend = CrosstermBackend::new(swappable);
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
@@ -170,6 +185,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Write the reattach info file so `linkshell -r` can find this session.
+    let ipc_socket_path = ipc::socket_path(&config);
+    reattach::write_reattach_info(std::process::id(), &ipc_socket_path);
+
+    // Reattach socket — accepts a single relay client (`linkshell -r`).
+    let reattach_socket_path = reattach::reattach_socket_from_ipc(&ipc_socket_path);
+    spawn_reattach_listener(tx.clone(), reattach_socket_path.clone());
+
     // IPC listener — external orchestrators connect to the per-instance socket.
     ipc::spawn_listener(tx.clone(), Arc::clone(&config));
 
@@ -192,10 +215,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // SIGHUP → detach (SSH drop, controlling terminal closed, etc.)
+    let mut sighup = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::hangup(),
+    )?;
+
     let frame_cap = Duration::from_millis(16);
     let mut last_render = Instant::now() - frame_cap;
+    let mut headless = false;
     loop {
-        if app.needs_redraw && last_render.elapsed() >= frame_cap {
+        if !headless && app.needs_redraw && last_render.elapsed() >= frame_cap {
             let mut layout = ui::LayoutInfo::default();
             terminal.draw(|f| {
                 layout = ui::draw(f, &app);
@@ -243,16 +272,51 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             event = rx.recv() => {
-                if let Some(event) = event {
-                    handle_event(&mut app, event);
-                } else {
-                    break;
+                match event {
+                    None => break,
+                    Some(AppEvent::Detach) => {
+                        if !headless {
+                            restore_terminal(kitty_supported);
+                            headless = true;
+                            // Swap the backend back to a sink so ratatui
+                            // doesn't try to write to the now-dead terminal.
+                            *writer_handle.lock().unwrap() = Box::new(std::io::sink());
+                        }
+                    }
+                    Some(AppEvent::Reattach { stream, rows, cols }) => {
+                        do_reattach(
+                            &mut terminal,
+                            &writer_handle,
+                            &tx,
+                            stream,
+                            rows,
+                            cols,
+                            kitty_supported,
+                        ).await;
+                        headless = false;
+                        app.needs_redraw = true;
+                        // Resize all sessions to the relay client's dimensions.
+                        let chrome_rows = 3 + (app.sessions.len().max(1) as u16 + 4);
+                        let pty_rows = rows.saturating_sub(chrome_rows).max(1);
+                        let pty_cols = cols.saturating_sub(2).max(1);
+                        app.handle_pane_resize([(pty_rows, pty_cols); 2]);
+                    }
+                    Some(other) => handle_event(&mut app, other),
+                }
+            }
+            _ = sighup.recv() => {
+                if !headless {
+                    restore_terminal(kitty_supported);
+                    headless = true;
+                    *writer_handle.lock().unwrap() = Box::new(std::io::sink());
                 }
             }
             _ = time::sleep(wait) => {}
         }
     }
 
+    reattach::clear_reattach_info();
+    let _ = std::fs::remove_file(&reattach_socket_path);
     ipc::cleanup(&config);
     restore_terminal(kitty_supported);
 
@@ -392,6 +456,8 @@ fn handle_event(app: &mut App, event: AppEvent) {
         } => {
             app.handle_authenticate(token, transport, name, group, response_tx);
         }
+        // Intercepted in the main select! loop before handle_event is reached.
+        AppEvent::Detach | AppEvent::Reattach { .. } => {}
     }
     app.needs_redraw = true;
 }
@@ -464,6 +530,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                             "Broadcast mode OFF".to_string()
                         };
                         app.mode = AppMode::CommandResult;
+                    }
+                    Action::Detach => {
+                        let _ = app.event_tx.try_send(AppEvent::Detach);
                     }
                 }
                 return;
@@ -891,6 +960,127 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         }
         _ => vec![],
     }
+}
+
+// ── Reattach socket listener ───────────────────────────────────────────────
+
+fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String) {
+    tokio::spawn(async move {
+        let _ = std::fs::remove_file(&path);
+        let Ok(listener) = tokio::net::UnixListener::bind(&path) else {
+            return;
+        };
+        // Accept connections in a loop so a failed attempt doesn't kill
+        // the listener. Only one relay client is active at a time, enforced
+        // by the server-side headless flag.
+        while let Ok((stream, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    return;
+                };
+                if v["type"].as_str() != Some("reattach") {
+                    return;
+                }
+                let rows = v["rows"].as_u64().unwrap_or(40) as u16;
+                let cols = v["cols"].as_u64().unwrap_or(200) as u16;
+                let stream = reader.into_inner();
+                let _ = tx.send(AppEvent::Reattach { stream, rows, cols }).await;
+            });
+        }
+    });
+}
+
+// ── Reattach: swap the terminal backend and spawn the relay reader task ────
+
+async fn do_reattach(
+    terminal: &mut Terminal<CrosstermBackend<SwappableWriter>>,
+    writer_handle: &Arc<Mutex<WriterBox>>,
+    event_tx: &mpsc::Sender<AppEvent>,
+    stream: tokio::net::UnixStream,
+    rows: u16,
+    cols: u16,
+    kitty_supported: bool,
+) {
+    // Convert to std UnixStream so we can clone the fd for the sync writer.
+    let Ok(std_stream) = stream.into_std() else { return };
+    let _ = std_stream.set_nonblocking(false); // writer clone must be blocking
+    let Ok(writer_clone) = std_stream.try_clone() else { return };
+    let _ = std_stream.set_nonblocking(true); // back to non-blocking for tokio
+    let Ok(relay_reader) = tokio::net::UnixStream::from_std(std_stream) else {
+        return;
+    };
+
+    // Point the ratatui backend at the relay socket.
+    *writer_handle.lock().unwrap() = Box::new(std::io::BufWriter::new(writer_clone));
+
+    // Re-issue terminal init sequences to the relay client: enter alternate
+    // screen and re-enable mouse capture so the relay terminal is ready.
+    // We buffer into Vec<u8> first because crossterm::execute! requires Sized
+    // and our writer_handle holds a dyn Write trait object.
+    {
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = crossterm::execute!(
+            &mut buf,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+        );
+        if kitty_supported {
+            let _ = crossterm::execute!(
+                &mut buf,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                ),
+            );
+        }
+        let mut w = writer_handle.lock().unwrap();
+        let _ = w.write_all(&buf);
+        let _ = w.flush();
+    }
+
+    // Force ratatui to repaint everything on the relay client's terminal.
+    let _ = terminal.clear();
+
+    // Spawn relay reader: deserialize JSON events from the relay client and
+    // inject them into the main event loop.
+    let tx = event_tx.clone();
+    let tx2 = event_tx.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(relay_reader);
+        let mut line = String::new();
+        // Propagate the terminal size the relay client reported.
+        let _ = tx
+            .send(AppEvent::Resize)
+            .await;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Some(ev) = reattach::decode_relay_line(&line) {
+                        if tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Relay client disconnected → go headless again.
+        let _ = tx2.send(AppEvent::Detach).await;
+    });
+
+    // Notify main loop of the new terminal dimensions.
+    let _ = event_tx.send(AppEvent::Resize).await;
+    let _ = rows; // used via the Resize path
+    let _ = cols;
 }
 
 fn parse_council_flag() -> Option<String> {
