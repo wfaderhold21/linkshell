@@ -164,6 +164,8 @@ pub struct Session {
     /// vt100 screen buffer — updated with raw PTY bytes, used for display
     pub screen: vt100::Parser,
     pub stats: TokenStats,
+    /// Model ID reported in the CLI's JSONL log, once known.
+    pub model: Option<String>,
     pub pro_sub: bool,
     pub started_at: Instant,
     #[allow(dead_code)] // only read in tests; kept for debugging and future use
@@ -226,6 +228,7 @@ impl Session {
             group: None,
             screen: vt100::Parser::new(rows, cols, 1000),
             stats: TokenStats::default(),
+            model: None,
             pro_sub: false,
             started_at: Instant::now(),
             last_output_at: None,

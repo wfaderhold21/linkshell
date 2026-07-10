@@ -103,8 +103,7 @@ async fn main() -> anyhow::Result<()> {
     // TUI runs and the main screen is left with the flags stuck on after exit
     // (garbled Ctrl+R etc. until `reset`). Must run before the input reader
     // task spawns — the support probe reads the reply from stdin.
-    let kitty_supported =
-        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let kitty_supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if kitty_supported {
         execute!(
             stdout,
@@ -160,9 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         break;
                     }
-                    Ok(Event::Resize(_, _))
-                        if key_tx.send(AppEvent::Resize).await.is_err() =>
-                    {
+                    Ok(Event::Resize(_, _)) if key_tx.send(AppEvent::Resize).await.is_err() => {
                         break;
                     }
                     _ => {}
@@ -313,6 +310,11 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::SessionStats { session_id, stats } => {
             app.handle_session_stats(session_id, stats);
+        }
+        AppEvent::SessionModel { session_id, model } => {
+            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.model = Some(model);
+            }
         }
         AppEvent::SessionBillingKnown { session_id, is_pro } => {
             if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {

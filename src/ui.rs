@@ -424,6 +424,22 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
 // ── Status panel ───────────────────────────────────────────────────────────
 
+/// Shorten a model ID for the 12-char status column: drop the "claude-"
+/// prefix and any trailing -YYYYMMDD date stamp, then truncate.
+fn model_display(model: Option<&str>) -> String {
+    let Some(model) = model else {
+        return "-".to_string();
+    };
+    let mut m = model.strip_prefix("claude-").unwrap_or(model);
+    if let Some(idx) = m.rfind('-') {
+        let tail = &m[idx + 1..];
+        if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) {
+            m = &m[..idx];
+        }
+    }
+    m.chars().take(12).collect()
+}
+
 fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let title = match &app.council {
         Some(r) if r.complete => format!(" Status ── council '{}' done ", r.group),
@@ -449,6 +465,8 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             Span::styled("  # ", hdr_style),
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:<6} ", "Kind"), hdr_style),
+            Span::styled("│ ", hdr_style),
+            Span::styled(format!("{:<12} ", "Model"), hdr_style),
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:<20} ", "Pipe"), hdr_style),
             Span::styled("│ ", hdr_style),
@@ -532,6 +550,11 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             Span::styled(format!("  {:1} ", i + 1), num_style),
             Span::raw("│ "),
             Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
+            Span::raw("│ "),
+            Span::styled(
+                format!("{:<12} ", model_display(session.model.as_deref())),
+                Style::default().fg(Color::Gray),
+            ),
             Span::raw("│ "),
             Span::styled(format!("{:<20} ", pipe_label), {
                 let s = Style::default().fg(Color::Cyan);
@@ -1508,6 +1531,21 @@ mod tests {
         parser.process(b"hello world");
         let line = build_row_line(parser.screen(), 0, 20, 0, None, None);
         assert_eq!(line_text(&line), "hello world");
+    }
+
+    #[test]
+    fn model_display_shortens_ids_for_the_status_column() {
+        assert_eq!(model_display(None), "-");
+        assert_eq!(model_display(Some("claude-sonnet-4-6")), "sonnet-4-6");
+        assert_eq!(
+            model_display(Some("claude-haiku-4-5-20251001")),
+            "haiku-4-5"
+        );
+        assert_eq!(model_display(Some("gpt-5.4-mini")), "gpt-5.4-mini");
+        assert_eq!(
+            model_display(Some("some-very-long-model-name")),
+            "some-very-lo"
+        );
     }
 
     #[test]

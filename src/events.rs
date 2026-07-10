@@ -42,6 +42,11 @@ pub enum AppEvent {
         session_id: usize,
         stats: crate::session::TokenStats,
     },
+    /// Model ID parsed from the session's JSONL log (Claude or Codex)
+    SessionModel {
+        session_id: usize,
+        model: String,
+    },
     /// Billing type detected from service_tier in JSONL; emitted once per session
     SessionBillingKnown {
         session_id: usize,

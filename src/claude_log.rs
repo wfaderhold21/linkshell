@@ -43,24 +43,25 @@ fn jsonl_files(dir: &Path) -> HashSet<PathBuf> {
         .collect()
 }
 
-/// Wait up to `timeout` for a JSONL file to appear in `dir` that wasn't in
-/// `existing`. Returns the path of the first new file found.
+/// Wait for a JSONL file to appear in `dir` that wasn't in `existing`.
+/// Claude only creates the session file when the user submits their first
+/// prompt, which can be arbitrarily long after the session spawns — so there
+/// is no deadline here; poll until the file appears or the app shuts down.
 async fn wait_for_new_jsonl(
     dir: &Path,
     existing: &HashSet<PathBuf>,
-    timeout: Duration,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
 ) -> Option<PathBuf> {
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         for path in jsonl_files(dir) {
             if !existing.contains(&path) {
                 return Some(path);
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if tx.is_closed() {
             return None;
         }
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -142,6 +143,7 @@ async fn tail(
     let mut acc_cost: f64 = 0.0;
     let mut context_tokens: u64 = 0;
     let mut billing_detected: bool = false;
+    let mut last_model: Option<String> = None;
     let mut offset: u64 = 0;
 
     loop {
@@ -187,6 +189,15 @@ async fn tail(
                                     .await;
                             }
                             if let Some(raw) = parse_usage_from_value(&v) {
+                                if last_model.as_deref() != Some(&raw.model) {
+                                    last_model = Some(raw.model.clone());
+                                    let _ = tx
+                                        .send(AppEvent::SessionModel {
+                                            session_id,
+                                            model: raw.model.clone(),
+                                        })
+                                        .await;
+                                }
                                 if !billing_detected {
                                     if let Some(ref tier) = raw.service_tier {
                                         billing_detected = true;
@@ -259,20 +270,14 @@ pub fn spawn_watcher(
 
     tokio::spawn(async move {
         // Wait for the project dir to exist (first session in this cwd).
-        if !dir.exists() {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                if dir.exists() {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return;
-                }
-                sleep(Duration::from_millis(200)).await;
+        while !dir.exists() {
+            if tx.is_closed() {
+                return;
             }
+            sleep(Duration::from_millis(500)).await;
         }
 
-        let jsonl = match wait_for_new_jsonl(&dir, &existing, Duration::from_secs(30)).await {
+        let jsonl = match wait_for_new_jsonl(&dir, &existing, &tx).await {
             Some(p) => p,
             None => return,
         };
