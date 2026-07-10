@@ -57,6 +57,7 @@ pub struct Pipe {
     pub prefix: Option<String>,
     pub active: bool,
     pub last_fired: Option<Instant>,
+    pub condition: Option<String>,
 }
 
 pub fn extract_from_session(sessions: &[Session], id: usize, mode: &ExtractMode) -> Option<String> {
@@ -315,6 +316,7 @@ mod tests {
             prefix: Some("Review this".into()),
             active: true,
             last_fired: None,
+            condition: None,
         };
 
         fire_pipe_task(pipe, "payload".into(), tx, Arc::new(Config::default()));

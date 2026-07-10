@@ -213,6 +213,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             menu_submenu_area = menu.1;
             menu_submenu_item_areas = menu.2;
         }
+        AppMode::Search { .. } => {
+            help_area = draw_search_overlay(f, app, size);
+        }
+        AppMode::Settings => {
+            help_area = draw_settings_overlay(f, app, size);
+        }
         AppMode::Normal => {}
     }
 
@@ -347,6 +353,24 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     // outer block
     let outer = Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
     f.render_widget(outer, area);
+
+    // Broadcast mode indicator
+    if app.broadcast_mode {
+        let indicator = Rect {
+            x: area.x + 1,
+            y: area.y,
+            width: 13,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new("[BROADCAST]").style(
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            indicator,
+        );
+    }
 
     if n == 0 {
         return vec![];
@@ -1359,6 +1383,201 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
         .collect();
 
     (item_areas, popup, item_rows)
+}
+
+// ── Search overlay ─────────────────────────────────────────────────────────
+
+fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let (query, cursor, matches, selected) = match &app.mode {
+        AppMode::Search { query, cursor, matches, selected } => {
+            (query.clone(), *cursor, matches.clone(), *selected)
+        }
+        _ => return Rect::default(),
+    };
+
+    let visible_matches = 14usize;
+    let height = (visible_matches + 4).min(area.height as usize) as u16;
+    let popup = centered_rect(70, height, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Search (↑↓ navigate  Enter jump  Esc cancel) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Query input line
+    if inner.height == 0 {
+        return popup;
+    }
+    let input_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+
+    // Render query with cursor
+    let mut pos = cursor.min(query.len());
+    while pos > 0 && !query.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let before = &query[..pos];
+    let (cursor_ch, after) = if pos < query.len() {
+        let ch = query[pos..].chars().next().unwrap();
+        let end = pos + ch.len_utf8();
+        (&query[pos..end], &query[end..])
+    } else {
+        (" ", "")
+    };
+    let cursor_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let input_line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Yellow)),
+        Span::raw(before.to_string()),
+        Span::styled(cursor_ch.to_string(), cursor_style),
+        Span::raw(after.to_string()),
+    ]);
+    f.render_widget(Paragraph::new(input_line), input_area);
+
+    // Separator
+    if inner.height < 2 {
+        return popup;
+    }
+    let sep_area = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize))
+            .style(Style::default().fg(Color::DarkGray)),
+        sep_area,
+    );
+
+    // Match list
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(3),
+    };
+    let session_lines: Vec<String> = if let Some(session) = app.active_session() {
+        session.output_lines.iter().cloned().collect()
+    } else {
+        vec![]
+    };
+
+    let items: Vec<ListItem> = matches.iter()
+        .enumerate()
+        .take(visible_matches)
+        .map(|(i, &line_idx)| {
+            let text = session_lines.get(line_idx).cloned().unwrap_or_default();
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ListItem::new(format!(" {:4}: {}", line_idx + 1, text)).style(style)
+        })
+        .collect();
+    f.render_widget(List::new(items), list_area);
+
+    // Footer: match count
+    if inner.height > 0 {
+        let footer_area = Rect {
+            x: inner.x,
+            y: popup.y + popup.height - 2,
+            width: inner.width,
+            height: 1,
+        };
+        let count_text = if query.is_empty() {
+            "type to search".to_string()
+        } else {
+            format!("{} match{}", matches.len(), if matches.len() == 1 { "" } else { "es" })
+        };
+        f.render_widget(
+            Paragraph::new(count_text)
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+                .alignment(Alignment::Center),
+            footer_area,
+        );
+    }
+
+    popup
+}
+
+// ── Settings overlay ────────────────────────────────────────────────────────
+
+fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let ss = &app.settings_state;
+    let n_fields = ss.fields.len() as u16;
+    let height = (n_fields + 6).min(area.height);
+    let popup = centered_rect(70, height, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Settings (↑↓ navigate  Enter edit  s save  Esc cancel) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let list_height = inner.height.saturating_sub(1);
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_height,
+    };
+
+    let items: Vec<ListItem> = ss.fields.iter().enumerate().map(|(i, field)| {
+        let is_selected = i == ss.selected;
+        let value_str = if is_selected && ss.editing {
+            // Show edit buffer with cursor
+            let cursor = ss.edit_cursor.min(ss.edit_buf.len());
+            let before = &ss.edit_buf[..cursor];
+            let (cursor_ch, after) = if cursor < ss.edit_buf.len() {
+                let ch = ss.edit_buf[cursor..].chars().next().unwrap();
+                let end = cursor + ch.len_utf8();
+                (&ss.edit_buf[cursor..end], &ss.edit_buf[end..])
+            } else {
+                (" ", "")
+            };
+            format!("{}{}{}|", before, cursor_ch, after)
+        } else {
+            field.value.clone()
+        };
+
+        let row_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let text = format!(" {:<28} │  {}", field.label, value_str);
+        ListItem::new(text).style(row_style)
+    }).collect();
+
+    f.render_widget(List::new(items), list_area);
+
+    // Footer
+    if inner.height > 0 {
+        let footer_area = Rect {
+            x: inner.x,
+            y: popup.y + popup.height - 2,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new("Changes are saved to ~/.config/linkshell/config.toml")
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+                .alignment(Alignment::Center),
+            footer_area,
+        );
+    }
+
+    popup
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
