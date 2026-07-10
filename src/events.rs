@@ -42,6 +42,12 @@ pub enum AppEvent {
         session_id: usize,
         stats: crate::session::TokenStats,
     },
+    /// A speculative log watcher identified the real CLI behind a custom
+    /// command (e.g. a claude wrapper script) — upgrade the session's base.
+    SessionBaseDetected {
+        session_id: usize,
+        base: crate::session::BaseKind,
+    },
     /// Model ID parsed from the session's JSONL log (Claude or Codex)
     SessionModel {
         session_id: usize,

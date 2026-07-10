@@ -17,9 +17,10 @@ pub struct SwappableWriter {
 
 impl SwappableWriter {
     pub fn with_stdout() -> (Self, Arc<Mutex<WriterBox>>) {
-        let handle: Arc<Mutex<WriterBox>> =
-            Arc::new(Mutex::new(Box::new(std::io::stdout())));
-        let sw = Self { handle: Arc::clone(&handle) };
+        let handle: Arc<Mutex<WriterBox>> = Arc::new(Mutex::new(Box::new(std::io::stdout())));
+        let sw = Self {
+            handle: Arc::clone(&handle),
+        };
         (sw, handle)
     }
 }
@@ -58,7 +59,9 @@ pub fn reattach_socket_from_ipc(ipc_socket: &str) -> String {
 }
 
 pub fn write_reattach_info(pid: u32, ipc_socket: &str) {
-    let Some(path) = reattach_info_path() else { return };
+    let Some(path) = reattach_info_path() else {
+        return;
+    };
     let info = serde_json::json!({
         "pid": pid,
         "socket": ipc_socket,
@@ -83,8 +86,8 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     };
 
     // ── Find the detached session ─────────────────────────────────────────
-    let info_path = reattach_info_path()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
+    let info_path =
+        reattach_info_path().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
 
     let info_bytes = std::fs::read(&info_path).map_err(|_| {
         anyhow::anyhow!(
@@ -152,9 +155,7 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if stdout.write_all(&buf[..n]).await.is_err()
-                        || stdout.flush().await.is_err()
-                    {
+                    if stdout.write_all(&buf[..n]).await.is_err() || stdout.flush().await.is_err() {
                         break;
                     }
                 }
@@ -209,18 +210,14 @@ fn encode_relay_event(event: &crossterm::event::Event) -> Vec<u8> {
     // crossterm 0.27 with feature "serde" provides Serialize on KeyEvent and
     // MouseEvent but not on the top-level Event enum, so we tag manually.
     let json = match event {
-        crossterm::event::Event::Key(k) => {
-            match serde_json::to_value(k) {
-                Ok(v) => serde_json::json!({"t":"k","e":v}),
-                Err(_) => return vec![],
-            }
-        }
-        crossterm::event::Event::Mouse(m) => {
-            match serde_json::to_value(m) {
-                Ok(v) => serde_json::json!({"t":"m","e":v}),
-                Err(_) => return vec![],
-            }
-        }
+        crossterm::event::Event::Key(k) => match serde_json::to_value(k) {
+            Ok(v) => serde_json::json!({"t":"k","e":v}),
+            Err(_) => return vec![],
+        },
+        crossterm::event::Event::Mouse(m) => match serde_json::to_value(m) {
+            Ok(v) => serde_json::json!({"t":"m","e":v}),
+            Err(_) => return vec![],
+        },
         crossterm::event::Event::Resize(cols, rows) => {
             serde_json::json!({"t":"r","cols":cols,"rows":rows})
         }
@@ -235,19 +232,15 @@ fn encode_relay_event(event: &crossterm::event::Event) -> Vec<u8> {
 }
 
 /// Decode a relay JSON line into an AppEvent. Returns None for unknown lines.
-pub fn decode_relay_line(
-    line: &str,
-) -> Option<crate::events::AppEvent> {
+pub fn decode_relay_line(line: &str) -> Option<crate::events::AppEvent> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     match v["t"].as_str()? {
         "k" => {
-            let key: crossterm::event::KeyEvent =
-                serde_json::from_value(v["e"].clone()).ok()?;
+            let key: crossterm::event::KeyEvent = serde_json::from_value(v["e"].clone()).ok()?;
             Some(crate::events::AppEvent::Key(key))
         }
         "m" => {
-            let m: crossterm::event::MouseEvent =
-                serde_json::from_value(v["e"].clone()).ok()?;
+            let m: crossterm::event::MouseEvent = serde_json::from_value(v["e"].clone()).ok()?;
             Some(crate::events::AppEvent::Mouse(m))
         }
         "r" => Some(crate::events::AppEvent::Resize),

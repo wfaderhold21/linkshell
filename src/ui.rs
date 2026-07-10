@@ -363,11 +363,8 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             height: 1,
         };
         f.render_widget(
-            Paragraph::new("[BROADCAST]").style(
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Paragraph::new("[BROADCAST]")
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             indicator,
         );
     }
@@ -1389,9 +1386,12 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
 
 fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let (query, cursor, matches, selected) = match &app.mode {
-        AppMode::Search { query, cursor, matches, selected } => {
-            (query.clone(), *cursor, matches.clone(), *selected)
-        }
+        AppMode::Search {
+            query,
+            cursor,
+            matches,
+            selected,
+        } => (query.clone(), *cursor, matches.clone(), *selected),
         _ => return Rect::default(),
     };
 
@@ -1469,7 +1469,8 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         vec![]
     };
 
-    let items: Vec<ListItem> = matches.iter()
+    let items: Vec<ListItem> = matches
+        .iter()
         .enumerate()
         .take(visible_matches)
         .map(|(i, &line_idx)| {
@@ -1495,11 +1496,19 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         let count_text = if query.is_empty() {
             "type to search".to_string()
         } else {
-            format!("{} match{}", matches.len(), if matches.len() == 1 { "" } else { "es" })
+            format!(
+                "{} match{}",
+                matches.len(),
+                if matches.len() == 1 { "" } else { "es" }
+            )
         };
         f.render_widget(
             Paragraph::new(count_text)
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+                .style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )
                 .alignment(Alignment::Center),
             footer_area,
         );
@@ -1532,32 +1541,37 @@ fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         height: list_height,
     };
 
-    let items: Vec<ListItem> = ss.fields.iter().enumerate().map(|(i, field)| {
-        let is_selected = i == ss.selected;
-        let value_str = if is_selected && ss.editing {
-            // Show edit buffer with cursor
-            let cursor = ss.edit_cursor.min(ss.edit_buf.len());
-            let before = &ss.edit_buf[..cursor];
-            let (cursor_ch, after) = if cursor < ss.edit_buf.len() {
-                let ch = ss.edit_buf[cursor..].chars().next().unwrap();
-                let end = cursor + ch.len_utf8();
-                (&ss.edit_buf[cursor..end], &ss.edit_buf[end..])
+    let items: Vec<ListItem> = ss
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let is_selected = i == ss.selected;
+            let value_str = if is_selected && ss.editing {
+                // Show edit buffer with cursor
+                let cursor = ss.edit_cursor.min(ss.edit_buf.len());
+                let before = &ss.edit_buf[..cursor];
+                let (cursor_ch, after) = if cursor < ss.edit_buf.len() {
+                    let ch = ss.edit_buf[cursor..].chars().next().unwrap();
+                    let end = cursor + ch.len_utf8();
+                    (&ss.edit_buf[cursor..end], &ss.edit_buf[end..])
+                } else {
+                    (" ", "")
+                };
+                format!("{}{}{}|", before, cursor_ch, after)
             } else {
-                (" ", "")
+                field.value.clone()
             };
-            format!("{}{}{}|", before, cursor_ch, after)
-        } else {
-            field.value.clone()
-        };
 
-        let row_style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let text = format!(" {:<28} │  {}", field.label, value_str);
-        ListItem::new(text).style(row_style)
-    }).collect();
+            let row_style = if is_selected {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let text = format!(" {:<28} │  {}", field.label, value_str);
+            ListItem::new(text).style(row_style)
+        })
+        .collect();
 
     f.render_widget(List::new(items), list_area);
 
@@ -1571,7 +1585,11 @@ fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         };
         f.render_widget(
             Paragraph::new("Changes are saved to ~/.config/linkshell/config.toml")
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+                .style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )
                 .alignment(Alignment::Center),
             footer_area,
         );

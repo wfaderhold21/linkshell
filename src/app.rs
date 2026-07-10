@@ -287,11 +287,19 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
     ("move <from> <to>", "Swap session positions", "move "),
     ("rename <session> <name>", "Rename a session", "rename "),
     ("log <session> <path>", "Log session output to file", "log "),
-    ("log stop <session>", "Stop logging session output", "log stop "),
+    (
+        "log stop <session>",
+        "Stop logging session output",
+        "log stop ",
+    ),
     ("broadcast toggle", "Toggle broadcast mode", "broadcast"),
     ("search <query>", "Search session output", "search "),
     ("settings", "Open settings menu", "settings"),
-    ("detach", "Detach from terminal (keep sessions running)", "detach"),
+    (
+        "detach",
+        "Detach from terminal (keep sessions running)",
+        "detach",
+    ),
     ("quit", "Exit linkshell", "quit"),
 ];
 
@@ -638,12 +646,16 @@ impl App {
             .and_then(|b| self.config.sessions.aliases.get(b))
             .cloned();
         let base = if kind.is_claude_based()
-            || crate::session::command_base_name(&cmd_str) == Some("claude")
+            || crate::session::command_base_name(&cmd_str)
+                .map(crate::session::is_claude_basename)
+                .unwrap_or(false)
             || alias.as_ref().map(|a| a.kind == "claude").unwrap_or(false)
         {
             crate::session::BaseKind::Claude
         } else if kind.is_codex_based()
-            || crate::session::command_base_name(&cmd_str) == Some("codex")
+            || crate::session::command_base_name(&cmd_str)
+                .map(crate::session::is_codex_basename)
+                .unwrap_or(false)
             || alias.as_ref().map(|a| a.kind == "codex").unwrap_or(false)
         {
             crate::session::BaseKind::Codex
@@ -700,7 +712,22 @@ impl App {
                     config_home,
                 );
             }
-            crate::session::BaseKind::LocalAgent | crate::session::BaseKind::Other => {}
+            crate::session::BaseKind::LocalAgent | crate::session::BaseKind::Other => {
+                // A custom command may still be a claude session behind a
+                // wrapper name the classifier can't see through. Watch the
+                // claude projects dir speculatively: if a new JSONL appears
+                // for this cwd, the watcher upgrades the session's base to
+                // Claude and tails it like a native claude session.
+                if matches!(kind, SessionKind::Custom(_)) {
+                    crate::claude_log::spawn_detecting_watcher(
+                        id,
+                        cwd.clone(),
+                        tx.clone(),
+                        Arc::clone(&cfg),
+                        None,
+                    );
+                }
+            }
         }
 
         let wrap_in_shell = !matches!(kind, SessionKind::Shell);
@@ -943,14 +970,18 @@ impl App {
 
     /// Called from the main loop after each draw when the output area changes size.
     pub fn handle_pane_resize(&mut self, sizes: [(u16, u16); 2]) {
+        let mut changed = false;
+        let mut visible: [Option<usize>; 2] = [None, None];
         for (pane_idx, size) in sizes.iter().copied().enumerate() {
             if self.layout == LayoutMode::Single && pane_idx == 1 {
                 continue;
             }
+            visible[pane_idx] = self.panes[pane_idx];
             if self.pane_sizes[pane_idx] == sizes[pane_idx] {
                 continue;
             }
             self.pane_sizes[pane_idx] = size;
+            changed = true;
             if let Some(session_idx) = self.panes[pane_idx] {
                 if let Some(session) = self.sessions.get_mut(session_idx) {
                     let (rows, cols) = size;
@@ -959,6 +990,25 @@ impl App {
                         let _ = tx.try_send((rows, cols));
                     }
                 }
+            }
+        }
+        if !changed {
+            return;
+        }
+        // Hidden sessions must track window resizes too, not just get one
+        // deferred resize on switch_to: full-screen TUIs (claude, codex)
+        // repaint on that late SIGWINCH so the deferral is invisible, but
+        // line-oriented custom commands don't, and would surface cropped or
+        // stale content laid out for the old size. Size them for the pane
+        // they'd appear in when switched to — the focused one.
+        let (rows, cols) = self.pane_sizes[self.focused_pane];
+        for (idx, session) in self.sessions.iter_mut().enumerate() {
+            if visible.contains(&Some(idx)) {
+                continue;
+            }
+            session.resize_screen(rows, cols);
+            if let Some(tx) = &session.pty_resizer {
+                let _ = tx.try_send((rows, cols));
             }
         }
     }
@@ -1017,10 +1067,12 @@ impl App {
             // Claude and Codex stats come from their JSONL watchers; skip terminal scraping.
             // Uses the resolved base identity so aliased/env-prefixed CLIs are
             // treated the same as plain `claude` / `codex`.
-            if matches!(
-                session.base,
-                crate::session::BaseKind::Other | crate::session::BaseKind::LocalAgent
-            ) {
+            // Only recognized local agents get line-scraped stats: the token
+            // regexes are loose enough that arbitrary shell/command output
+            // ("3 input files", "500 tokens") would fabricate usage for
+            // sessions that never call an API. Other sessions can still
+            // report real usage via the IPC tokens message.
+            if session.base == crate::session::BaseKind::LocalAgent {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
                 }
@@ -2786,7 +2838,9 @@ impl App {
         // Typing returns the view to the live tail.
         self.clear_scroll();
         if self.broadcast_mode {
-            let ids: Vec<usize> = self.sessions.iter()
+            let ids: Vec<usize> = self
+                .sessions
+                .iter()
                 .filter(|s| s.state != SessionState::Dead)
                 .map(|s| s.id)
                 .collect();
@@ -3390,7 +3444,9 @@ impl App {
 
     fn execute_log_command(&mut self, args: &[&str]) {
         if args.first() == Some(&"stop") {
-            let id = args.get(1).and_then(|r| self.resolve_session_ref(r))
+            let id = args
+                .get(1)
+                .and_then(|r| self.resolve_session_ref(r))
                 .or_else(|| self.active_session().map(|s| s.id));
             match id {
                 None => {
@@ -3436,7 +3492,8 @@ impl App {
         }
         let query_lower = query.to_lowercase();
         if let Some(session) = self.active_session() {
-            session.output_lines
+            session
+                .output_lines
                 .iter()
                 .enumerate()
                 .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
@@ -3453,7 +3510,13 @@ impl App {
             _ => return,
         };
         let matches = self.search_compute_matches(&query);
-        if let AppMode::Search { query: q, cursor, selected, .. } = &self.mode {
+        if let AppMode::Search {
+            query: q,
+            cursor,
+            selected,
+            ..
+        } = &self.mode
+        {
             let q = q.clone();
             let c = *cursor;
             let s = (*selected).min(matches.len().saturating_sub(1));
@@ -3529,16 +3592,24 @@ impl App {
         for field in &self.settings_state.fields {
             match field.label {
                 "Tick interval (ms)" => {
-                    cfg.general.tick_interval_ms = field.value.parse().unwrap_or(cfg.general.tick_interval_ms);
+                    cfg.general.tick_interval_ms =
+                        field.value.parse().unwrap_or(cfg.general.tick_interval_ms);
                 }
                 "Scroll buffer (lines)" => {
-                    cfg.general.scroll_buffer_lines = field.value.parse().unwrap_or(cfg.general.scroll_buffer_lines);
+                    cfg.general.scroll_buffer_lines = field
+                        .value
+                        .parse()
+                        .unwrap_or(cfg.general.scroll_buffer_lines);
                 }
                 "Notifications enabled" => {
-                    cfg.notifications.enabled = field.value.parse().unwrap_or(cfg.notifications.enabled);
+                    cfg.notifications.enabled =
+                        field.value.parse().unwrap_or(cfg.notifications.enabled);
                 }
                 "Notification debounce (s)" => {
-                    cfg.notifications.debounce_secs = field.value.parse().unwrap_or(cfg.notifications.debounce_secs);
+                    cfg.notifications.debounce_secs = field
+                        .value
+                        .parse()
+                        .unwrap_or(cfg.notifications.debounce_secs);
                 }
                 "Default CWD" => {
                     cfg.sessions.default_cwd = field.value.clone();
@@ -4405,11 +4476,12 @@ mod tests {
     }
 
     #[test]
-    fn session_output_strips_ansi_updates_state_and_accumulates_shell_stats() {
+    fn session_output_strips_ansi_and_updates_state_without_scraping_shell_stats() {
         let mut app = make_app();
         let id = app.spawn_headless_session("shell".into(), None).unwrap();
         app.sessions[0].kind = SessionKind::Shell;
 
+        // Token-shaped text in ordinary shell output must not fabricate usage.
         app.handle_session_output(id, "\x1b[31m100 input 200 output $0.01\x1b[0m".into());
 
         assert_eq!(
@@ -4417,6 +4489,19 @@ mod tests {
             "100 input 200 output $0.01"
         );
         assert_eq!(app.sessions[0].state, SessionState::Running);
+        assert_eq!(app.sessions[0].stats.input_tokens, 0);
+        assert_eq!(app.sessions[0].stats.output_tokens, 0);
+        assert_eq!(app.sessions[0].stats.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn session_output_scrapes_stats_only_for_local_agent_sessions() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+        app.sessions[0].base = crate::session::BaseKind::LocalAgent;
+
+        app.handle_session_output(id, "100 input 200 output $0.01".into());
+
         assert_eq!(app.sessions[0].stats.input_tokens, 100);
         assert_eq!(app.sessions[0].stats.output_tokens, 200);
         assert_eq!(app.sessions[0].stats.total_cost_usd, 0.01);
@@ -4511,7 +4596,7 @@ mod tests {
     }
 
     #[test]
-    fn split_resize_updates_only_visible_sessions_with_each_pane_size() {
+    fn split_resize_updates_visible_sessions_per_pane_and_hidden_to_focused_size() {
         let mut app = make_app();
         let first = app.spawn_headless_session("one".into(), None).unwrap();
         let second = app.spawn_headless_session("two".into(), None).unwrap();
@@ -4531,7 +4616,24 @@ mod tests {
         assert_eq!(app.sessions[1].screen.screen().size(), (12, 39));
         assert_eq!(first_rx.try_recv().unwrap(), (12, 40));
         assert_eq!(second_rx.try_recv().unwrap(), (12, 39));
-        assert!(hidden_rx.try_recv().is_err());
+        // Hidden sessions track the focused pane's size so their programs
+        // see the SIGWINCH immediately instead of on switch_to.
+        assert_eq!(app.sessions[2].screen.screen().size(), (12, 40));
+        assert_eq!(hidden_rx.try_recv().unwrap(), (12, 40));
+    }
+
+    #[test]
+    fn window_resize_reaches_hidden_sessions_in_single_layout() {
+        let mut app = make_app();
+        app.spawn_headless_session("visible".into(), None).unwrap();
+        let hidden = app.spawn_headless_session("hidden".into(), None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        app.handle_session_resizer(hidden, tx);
+
+        app.handle_resize(20, 100);
+
+        assert_eq!(app.sessions[1].screen.screen().size(), (20, 100));
+        assert_eq!(rx.try_recv().unwrap(), (20, 100));
     }
 
     #[test]
