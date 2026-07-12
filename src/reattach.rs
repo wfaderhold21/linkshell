@@ -112,7 +112,9 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     let token = info["token"]
         .as_str()
         .ok_or_else(|| {
-            anyhow::anyhow!("invalid reattach file: missing token (session started by an older linkshell?)")
+            anyhow::anyhow!(
+                "invalid reattach file: missing token (session started by an older linkshell?)"
+            )
         })?
         .to_string();
 

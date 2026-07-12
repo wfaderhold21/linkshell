@@ -426,6 +426,9 @@ pub struct App {
     /// When true, key input is forwarded to all non-dead sessions
     pub broadcast_mode: bool,
     pub settings_state: SettingsState,
+    /// Kept alive for the app's lifetime: on X11/Wayland the clipboard
+    /// contents are owned by this process and are lost if the handle drops.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -498,6 +501,7 @@ impl App {
             chat: ChatState::default(),
             broadcast_mode: false,
             settings_state: SettingsState::new_empty(),
+            clipboard: None,
         }
     }
 
@@ -723,6 +727,17 @@ impl App {
                 );
             }
             crate::session::BaseKind::LocalAgent | crate::session::BaseKind::Other => {
+                // OpenCode persists token/cost stats to its SQLite db; watch
+                // it whether the session was created as the OpenCode kind or
+                // as a custom command invoking the opencode binary.
+                if matches!(kind, SessionKind::OpenCode)
+                    || crate::session::command_base_name(&cmd_str) == Some("opencode")
+                {
+                    crate::opencode_log::spawn_watcher(id, cwd.clone(), tx.clone());
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                        s.stats_from_watcher = true;
+                    }
+                }
                 // A custom command may still be a claude session behind a
                 // wrapper name the classifier can't see through. Watch the
                 // claude projects dir speculatively: if a new JSONL appears
@@ -1081,8 +1096,9 @@ impl App {
             // regexes are loose enough that arbitrary shell/command output
             // ("3 input files", "500 tokens") would fabricate usage for
             // sessions that never call an API. Other sessions can still
-            // report real usage via the IPC tokens message.
-            if session.base == crate::session::BaseKind::LocalAgent {
+            // report real usage via the IPC tokens message. Local agents with
+            // a dedicated watcher (opencode → sqlite db) skip scraping too.
+            if session.base == crate::session::BaseKind::LocalAgent && !session.stats_from_watcher {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
                 }
@@ -2162,13 +2178,24 @@ impl App {
         Some(text)
     }
 
-    fn copy_selection(&self) {
-        if let Some(text) = self.selected_text() {
-            if !text.is_empty() {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_text(text);
-                }
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text().filter(|t| !t.is_empty()) else {
+            return;
+        };
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            // PRIMARY selection first, so middle-click paste works on Linux.
+            #[cfg(target_os = "linux")]
+            {
+                use arboard::{LinuxClipboardKind, SetExtLinux};
+                let _ = cb
+                    .set()
+                    .clipboard(LinuxClipboardKind::Primary)
+                    .text(text.clone());
             }
+            let _ = cb.set_text(text);
         }
     }
 
@@ -3972,7 +3999,6 @@ fn inset_rect(r: Rect, amount: u16) -> Rect {
         height: r.height.saturating_sub(amount.saturating_mul(2)),
     }
 }
-
 
 fn input_col(area: Rect, col: u16) -> usize {
     col.saturating_sub(area.x + 1) as usize
