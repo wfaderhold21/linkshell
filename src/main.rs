@@ -186,12 +186,15 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Write the reattach info file so `linkshell -r` can find this session.
+    // The minted token authenticates relay clients; it lives only in the
+    // 0600 info file, so only the owning user can reattach.
     let ipc_socket_path = ipc::socket_path(&config);
-    reattach::write_reattach_info(std::process::id(), &ipc_socket_path);
+    let reattach_token = auth::mint_token();
+    reattach::write_reattach_info(std::process::id(), &ipc_socket_path, &reattach_token);
 
     // Reattach socket — accepts a single relay client (`linkshell -r`).
     let reattach_socket_path = reattach::reattach_socket_from_ipc(&ipc_socket_path);
-    spawn_reattach_listener(tx.clone(), reattach_socket_path.clone());
+    spawn_reattach_listener(tx.clone(), reattach_socket_path.clone(), reattach_token);
 
     // IPC listener — external orchestrators connect to the per-instance socket.
     ipc::spawn_listener(tx.clone(), Arc::clone(&config));
@@ -1025,22 +1028,38 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
 
 // ── Reattach socket listener ───────────────────────────────────────────────
 
-fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String) {
+fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String, token: String) {
     tokio::spawn(async move {
         let _ = std::fs::remove_file(&path);
         let Ok(listener) = tokio::net::UnixListener::bind(&path) else {
             return;
         };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         // Accept connections in a loop so a failed attempt doesn't kill
         // the listener. Only one relay client is active at a time, enforced
         // by the server-side headless flag.
         while let Ok((stream, _)) = listener.accept().await {
+            #[cfg(target_os = "linux")]
+            if ipc::peer_uid(&stream).ok() != Some(unsafe { libc::getuid() }) {
+                continue;
+            }
             let tx = tx.clone();
+            let token = token.clone();
             tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
                 let mut reader = tokio::io::BufReader::new(stream);
                 let mut line = String::new();
-                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                // A client that never completes the handshake must not hold
+                // the connection open indefinitely.
+                let read = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    reader.read_line(&mut line),
+                )
+                .await;
+                if !matches!(read, Ok(Ok(n)) if n > 0) {
                     return;
                 }
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -1049,9 +1068,19 @@ fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String) {
                 if v["type"].as_str() != Some("reattach") {
                     return;
                 }
+                if v["token"].as_str() != Some(token.as_str()) {
+                    let mut stream = reader.into_inner();
+                    let _ = stream
+                        .write_all(b"{\"ok\":false,\"error\":\"invalid reattach token\"}\n")
+                        .await;
+                    return;
+                }
                 let rows = v["rows"].as_u64().unwrap_or(40) as u16;
                 let cols = v["cols"].as_u64().unwrap_or(200) as u16;
-                let stream = reader.into_inner();
+                let mut stream = reader.into_inner();
+                if stream.write_all(b"{\"ok\":true}\n").await.is_err() {
+                    return;
+                }
                 let _ = tx.send(AppEvent::Reattach { stream, rows, cols }).await;
             });
         }

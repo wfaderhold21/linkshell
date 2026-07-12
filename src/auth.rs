@@ -4,6 +4,7 @@ use std::collections::HashSet;
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     SignalState,   // state / tokens / output for own session
+    SignalAny,     // state / tokens / output for arbitrary sessions (privileged)
     Query,         // query sessions, pipes
     AgentSend,     // direct message another agent
     FirePipe,      // fire a manual pipe
@@ -20,6 +21,7 @@ pub fn operator_caps() -> CapSet {
     use Capability::*;
     [
         SignalState,
+        SignalAny,
         Query,
         AgentSend,
         FirePipe,
