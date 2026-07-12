@@ -2779,14 +2779,12 @@ impl App {
                 .sessions
                 .iter()
                 .map(|session| {
-                    let (kind, command) = match &session.kind {
-                        SessionKind::Claude => ("claude".into(), String::new()),
-                        SessionKind::Codex => ("codex".into(), String::new()),
-                        SessionKind::Shell => ("shell".into(), String::new()),
-                        SessionKind::Custom(command) => ("custom".into(), command.clone()),
+                    let command = match &session.kind {
+                        SessionKind::Custom(command) => command.clone(),
+                        _ => String::new(),
                     };
                     config::ProfileSession {
-                        kind,
+                        kind: session.kind.label().into(),
                         command,
                         name: session.name.clone(),
                         cwd: session.cwd.clone(),
