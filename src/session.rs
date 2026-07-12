@@ -210,7 +210,7 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -264,6 +264,9 @@ pub struct Session {
     pub base: BaseKind,
     /// Last time we received output from this session; used for idle timeout detection.
     pub last_output_at: Option<Instant>,
+    /// A dedicated log/db watcher reports authoritative cumulative stats for
+    /// this session, so terminal line-scraping must not touch `stats`.
+    pub stats_from_watcher: bool,
     /// Optional path to log session output lines to disk.
     pub log_path: Option<std::path::PathBuf>,
 }
@@ -318,6 +321,7 @@ impl Session {
             history_scroll: 0,
             base,
             log_path: None,
+            stats_from_watcher: false,
         }
     }
 
@@ -401,10 +405,15 @@ impl Session {
     }
 
     /// Replace stats with an externally reported cumulative total, but only if
-    /// the reported cost is higher than what we already have — protects against
-    /// stale or restarted watchers regressing the counters.
+    /// it advances what we already have — protects against stale or restarted
+    /// watchers regressing the counters. Cost is the primary signal; tokens
+    /// break the tie for zero-cost sessions (local models report $0 forever).
     pub fn apply_reported_total(&mut self, new: TokenStats) {
-        if new.total_cost_usd > self.stats.total_cost_usd {
+        let cur = &self.stats;
+        let advances = new.total_cost_usd > cur.total_cost_usd
+            || (new.total_cost_usd == cur.total_cost_usd
+                && new.input_tokens + new.output_tokens >= cur.input_tokens + cur.output_tokens);
+        if advances {
             self.stats = new;
         }
     }

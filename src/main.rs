@@ -10,6 +10,7 @@ mod events;
 mod ipc;
 mod keybindings;
 mod notify;
+mod opencode_log;
 mod patterns;
 mod pipe;
 mod protocol;
@@ -1054,11 +1055,8 @@ fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String, token: Stri
                 let mut line = String::new();
                 // A client that never completes the handshake must not hold
                 // the connection open indefinitely.
-                let read = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    reader.read_line(&mut line),
-                )
-                .await;
+                let read =
+                    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
                 if !matches!(read, Ok(Ok(n)) if n > 0) {
                     return;
                 }

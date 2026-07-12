@@ -679,7 +679,9 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     // it overlays the fields below).
     let kind_active = ns.active_field == NewSessionField::Kind;
     let kind_style = if kind_active {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -703,10 +705,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
             format!(" {}", kind_label),
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled(
-            format!("  {}", arrow),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  {}", arrow), Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(kind_text).block(kind_block), kind_field);
 
