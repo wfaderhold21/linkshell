@@ -13,7 +13,7 @@ max_rounds = 4                  # stop after this many completed all-join rounds
 done_signal = "LGTM"            # optional marker an agent can emit to finish early
 
 # Up to 8 agents total (shared with any sessions already open).
-# kind: claude | codex | shell | any custom command line
+# kind: claude | codex | opencode | oh-my-pi | aider | shell | any custom command line
 [[agent]]
 name = "author"
 kind = "claude"

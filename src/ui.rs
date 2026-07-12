@@ -101,11 +101,17 @@ const CLAUDE_COLOR: Color = Color::Rgb(255, 140, 0); // orange
 const CODEX_COLOR: Color = Color::Rgb(64, 128, 255); // blue
 const SHELL_COLOR: Color = Color::White;
 const CUSTOM_COLOR: Color = Color::Cyan;
+const OPENCODE_COLOR: Color = Color::Rgb(80, 200, 120); // green
+const OHMYPI_COLOR: Color = Color::Rgb(200, 120, 255); // purple
+const AIDER_COLOR: Color = Color::Rgb(0, 180, 180); // teal
 
 fn kind_color(kind: &SessionKind) -> Color {
     match kind {
         SessionKind::Claude => CLAUDE_COLOR,
         SessionKind::Codex => CODEX_COLOR,
+        SessionKind::OpenCode => OPENCODE_COLOR,
+        SessionKind::OhMyPi => OHMYPI_COLOR,
+        SessionKind::Aider => AIDER_COLOR,
         SessionKind::Shell => SHELL_COLOR,
         SessionKind::Custom(_) => CUSTOM_COLOR,
     }
@@ -485,7 +491,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         let header_spans = vec![
             Span::styled("  # ", hdr_style),
             Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:<6} ", "Kind"), hdr_style),
+            Span::styled(format!("{:<8} ", "Kind"), hdr_style),
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:<12} ", "Model"), hdr_style),
             Span::styled("│ ", hdr_style),
@@ -570,7 +576,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         let spans = vec![
             Span::styled(format!("  {:1} ", i + 1), num_style),
             Span::raw("│ "),
-            Span::styled(format!("{:<6} ", session.kind.label()), kind_style),
+            Span::styled(format!("{:<8} ", session.kind.label()), kind_style),
             Span::raw("│ "),
             Span::styled(
                 format!("{:<12} ", model_display(session.model.as_deref())),
@@ -660,7 +666,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 /// Returns (popup_rect, browse_button_rect).
 pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rect, Rect) {
     let ns = &app.new_session_state;
-    let height = if ns.selected_kind == 3 { 16 } else { 13 };
+    let height = if ns.is_custom() { 16 } else { 13 };
     let popup = centered_rect(50, height, area);
     f.render_widget(Clear, popup);
     let block = Block::default()
@@ -669,40 +675,40 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    // Type selector row
-    let types = ["Claude", "Codex", "Shell", "Custom"];
-    let type_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 3,
-        });
-
-    for (i, label) in types.iter().enumerate() {
-        let selected = ns.selected_kind == i;
-        let is_active_field = ns.active_field == NewSessionField::Kind;
-        let style = if selected && is_active_field {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else if selected {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let b = Block::default().borders(Borders::ALL).border_style(style);
-        let p = Paragraph::new(*label).block(b).alignment(Alignment::Center);
-        f.render_widget(p, type_chunks[i]);
-    }
+    // Kind dropdown field (closed state; the expanded list is drawn last so
+    // it overlays the fields below).
+    let kind_active = ns.active_field == NewSessionField::Kind;
+    let kind_style = if kind_active {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let kind_label = crate::session::KIND_LABELS
+        .get(ns.selected_kind)
+        .copied()
+        .unwrap_or("?");
+    let arrow = if ns.kind_dropdown_open { "▴" } else { "▾" };
+    let kind_field = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 3,
+    };
+    let kind_block = Block::default()
+        .title(" Kind ")
+        .borders(Borders::ALL)
+        .border_style(kind_style);
+    let kind_text = Line::from(vec![
+        Span::styled(
+            format!(" {}", kind_label),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("  {}", arrow),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(kind_text).block(kind_block), kind_field);
 
     let fields_y = inner.y + 3;
 
@@ -755,7 +761,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     f.render_widget(browse_btn, browse_area);
 
     // Custom cmd field (only when Custom selected)
-    if ns.selected_kind == 3 {
+    if ns.is_custom() {
         draw_input_field(
             f,
             "Command",
@@ -772,7 +778,12 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     }
 
     // Footer hint
-    let hint = Paragraph::new(" Tab: next field  Alt+B: browse  Enter: create  Esc: cancel ")
+    let hint_text = if ns.kind_dropdown_open {
+        " ↑/↓: choose kind  Enter: select  Esc: close "
+    } else {
+        " Tab: next field  Alt+B: browse  Enter: create  Esc: cancel "
+    };
+    let hint = Paragraph::new(hint_text)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     f.render_widget(
@@ -785,7 +796,54 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
         },
     );
 
+    // Expanded dropdown list, drawn last so it overlays the fields below.
+    if ns.kind_dropdown_open {
+        let list = kind_dropdown_list_rect(popup).intersection(area);
+        f.render_widget(Clear, list);
+        let list_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White));
+        let list_inner = list_block.inner(list);
+        f.render_widget(list_block, list);
+        for (i, label) in crate::session::KIND_LABELS.iter().enumerate() {
+            let y = list_inner.y + i as u16;
+            if y >= list_inner.y + list_inner.height {
+                break;
+            }
+            let style = if i == ns.selected_kind {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let row = Rect {
+                x: list_inner.x,
+                y,
+                width: list_inner.width,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(format!(" {}", label)).style(style), row);
+        }
+    }
+
     (popup, browse_area)
+}
+
+/// Screen rect of the expanded Kind dropdown list, anchored below the Kind
+/// field. Shared with the mouse handler in `app.rs` so hit-testing and
+/// rendering can never drift apart.
+pub fn kind_dropdown_list_rect(popup: Rect) -> Rect {
+    let inner_x = popup.x + 1;
+    let inner_y = popup.y + 1;
+    let inner_w = popup.width.saturating_sub(2);
+    Rect {
+        x: inner_x,
+        y: inner_y + 2, // overlap the Kind field's bottom border
+        width: inner_w,
+        height: crate::session::SessionKind::COUNT as u16 + 2,
+    }
 }
 
 // ── File browser overlay ───────────────────────────────────────────────────
@@ -1810,6 +1868,9 @@ mod tests {
     fn kind_color_assigns_distinct_brand_colors() {
         assert_eq!(kind_color(&SessionKind::Claude), CLAUDE_COLOR);
         assert_eq!(kind_color(&SessionKind::Codex), CODEX_COLOR);
+        assert_eq!(kind_color(&SessionKind::OpenCode), OPENCODE_COLOR);
+        assert_eq!(kind_color(&SessionKind::OhMyPi), OHMYPI_COLOR);
+        assert_eq!(kind_color(&SessionKind::Aider), AIDER_COLOR);
         assert_eq!(kind_color(&SessionKind::Shell), SHELL_COLOR);
         assert_eq!(kind_color(&SessionKind::Custom("x".into())), CUSTOM_COLOR);
     }
