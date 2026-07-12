@@ -16,7 +16,8 @@ use these defaults.
 ## `[sessions]`
 
 `default_cwd` defaults to the process directory. `[sessions.commands]` uses
-`claude = "claude"`, `codex = "codex"`, and an empty `shell` for `$SHELL`.
+`claude = "claude"`, `codex = "codex"`, `opencode = "opencode"`,
+`ohmypi = "omp"`, `aider = "aider"`, and an empty `shell` for `$SHELL`.
 `[sessions.aliases.<name>]` accepts `kind` and optional `config_dir`.
 
 ## `[pipe.summarize]`

@@ -172,6 +172,10 @@ pub struct SessionAlias {
 pub struct SessionCommandsConfig {
     pub claude: String,
     pub codex: String,
+    pub opencode: String,
+    /// Oh My Pi ships its CLI as `omp`.
+    pub ohmypi: String,
+    pub aider: String,
     /// Empty string means use $SHELL.
     pub shell: String,
 }
@@ -181,6 +185,9 @@ impl Default for SessionCommandsConfig {
         Self {
             claude: "claude".to_string(),
             codex: "codex".to_string(),
+            opencode: "opencode".to_string(),
+            ohmypi: "omp".to_string(),
+            aider: "aider".to_string(),
             shell: String::new(),
         }
     }

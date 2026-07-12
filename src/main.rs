@@ -554,6 +554,29 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
+        // Expanded Kind dropdown captures navigation keys until closed.
+        AppMode::NewSession if app.new_session_state.kind_dropdown_open => match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+                app.new_session_state.kind_dropdown_open = false;
+            }
+            KeyCode::Up => {
+                app.new_session_select_kind(-1);
+            }
+            KeyCode::Down => {
+                app.new_session_select_kind(1);
+            }
+            KeyCode::Char(c) => {
+                if let Some(d) = c.to_digit(10) {
+                    let idx = d as usize;
+                    if (1..=session::SessionKind::COUNT).contains(&idx) {
+                        app.new_session_state.selected_kind = idx - 1;
+                        app.new_session_state.kind_dropdown_open = false;
+                    }
+                }
+            }
+            _ => {}
+        },
+
         AppMode::NewSession => match key.code {
             KeyCode::Esc => {
                 app.mode = AppMode::Normal;
@@ -566,6 +589,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     && app.new_session_state.active_field == NewSessionField::Cwd =>
             {
                 app.open_file_browser();
+            }
+            KeyCode::Enter | KeyCode::Char(' ')
+                if app.new_session_state.active_field == NewSessionField::Kind =>
+            {
+                app.new_session_state.kind_dropdown_open = true;
             }
             KeyCode::Enter => {
                 let _ = app.confirm_new_session();
@@ -591,17 +619,13 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Delete => {
                 app.new_session_delete();
             }
-            KeyCode::Char('1') if app.new_session_state.active_field == NewSessionField::Kind => {
-                app.new_session_state.selected_kind = 0;
-            }
-            KeyCode::Char('2') if app.new_session_state.active_field == NewSessionField::Kind => {
-                app.new_session_state.selected_kind = 1;
-            }
-            KeyCode::Char('3') if app.new_session_state.active_field == NewSessionField::Kind => {
-                app.new_session_state.selected_kind = 2;
-            }
-            KeyCode::Char('4') if app.new_session_state.active_field == NewSessionField::Kind => {
-                app.new_session_state.selected_kind = 3;
+            KeyCode::Char(c @ '1'..='9')
+                if app.new_session_state.active_field == NewSessionField::Kind =>
+            {
+                let idx = c.to_digit(10).unwrap() as usize;
+                if idx <= session::SessionKind::COUNT {
+                    app.new_session_state.selected_kind = idx - 1;
+                }
             }
             KeyCode::Backspace => {
                 app.new_session_backspace();

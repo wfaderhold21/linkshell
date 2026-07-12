@@ -10,18 +10,70 @@ pub const PTY_COLS: u16 = 200;
 pub enum SessionKind {
     Claude,
     Codex,
+    OpenCode,
+    OhMyPi,
+    Aider,
     Shell,
     Custom(String),
 }
 
+/// Display order for the new-session Kind dropdown. `Custom` must stay last —
+/// the dialog treats the final index as "show the Command field".
+pub const KIND_LABELS: &[&str] = &[
+    "Claude", "Codex", "OpenCode", "Oh My Pi", "Aider", "Shell", "Custom",
+];
+
 impl SessionKind {
+    /// Number of selectable kinds in the new-session dialog.
+    pub const COUNT: usize = KIND_LABELS.len();
+
+    /// Build a kind from its dropdown index. `Custom` carries the command
+    /// entered in the dialog.
+    pub fn from_index(index: usize, custom_cmd: &str) -> SessionKind {
+        match index {
+            0 => SessionKind::Claude,
+            1 => SessionKind::Codex,
+            2 => SessionKind::OpenCode,
+            3 => SessionKind::OhMyPi,
+            4 => SessionKind::Aider,
+            5 => SessionKind::Shell,
+            _ => SessionKind::Custom(custom_cmd.to_string()),
+        }
+    }
+
+    /// Parse a kind name as used in profiles and `linkshell-ctl` (`custom`
+    /// is handled separately by callers because it carries a command).
+    pub fn from_name(name: &str) -> Option<SessionKind> {
+        match name {
+            "claude" => Some(SessionKind::Claude),
+            "codex" => Some(SessionKind::Codex),
+            "opencode" => Some(SessionKind::OpenCode),
+            "oh-my-pi" | "ohmypi" | "omp" => Some(SessionKind::OhMyPi),
+            "aider" => Some(SessionKind::Aider),
+            "shell" => Some(SessionKind::Shell),
+            _ => None,
+        }
+    }
+
     pub fn label(&self) -> &str {
         match self {
             SessionKind::Claude => "claude",
             SessionKind::Codex => "codex",
+            SessionKind::OpenCode => "opencode",
+            SessionKind::OhMyPi => "oh-my-pi",
+            SessionKind::Aider => "aider",
             SessionKind::Shell => "shell",
             SessionKind::Custom(_) => "custom",
         }
+    }
+
+    /// True for first-class local/open coding agent kinds (state inference
+    /// via BaseKind::LocalAgent, no JSONL watcher).
+    pub fn is_local_agent_kind(&self) -> bool {
+        matches!(
+            self,
+            SessionKind::OpenCode | SessionKind::OhMyPi | SessionKind::Aider
+        )
     }
 
     pub fn is_claude_based(&self) -> bool {
@@ -230,10 +282,11 @@ impl Session {
             BaseKind::Claude
         } else if kind.is_codex_based() {
             BaseKind::Codex
-        } else if kind
-            .custom_base_name_pub()
-            .map(is_local_agent_basename)
-            .unwrap_or(false)
+        } else if kind.is_local_agent_kind()
+            || kind
+                .custom_base_name_pub()
+                .map(is_local_agent_basename)
+                .unwrap_or(false)
         {
             BaseKind::LocalAgent
         } else {
@@ -610,6 +663,9 @@ mod tests {
         assert_eq!(mk(SessionKind::Claude), BaseKind::Claude);
         assert_eq!(mk(SessionKind::Codex), BaseKind::Codex);
         assert_eq!(mk(SessionKind::Shell), BaseKind::Other);
+        assert_eq!(mk(SessionKind::OpenCode), BaseKind::LocalAgent);
+        assert_eq!(mk(SessionKind::OhMyPi), BaseKind::LocalAgent);
+        assert_eq!(mk(SessionKind::Aider), BaseKind::LocalAgent);
         assert_eq!(
             mk(SessionKind::Custom("CLAUDE_CONFIG_DIR=/x claude".into())),
             BaseKind::Claude
@@ -618,5 +674,55 @@ mod tests {
             mk(SessionKind::Custom("my-wrapper".into())),
             BaseKind::Other
         );
+    }
+
+    #[test]
+    fn kind_from_index_covers_every_dropdown_entry_with_custom_last() {
+        assert_eq!(SessionKind::COUNT, KIND_LABELS.len());
+        assert_eq!(SessionKind::from_index(0, ""), SessionKind::Claude);
+        assert_eq!(SessionKind::from_index(1, ""), SessionKind::Codex);
+        assert_eq!(SessionKind::from_index(2, ""), SessionKind::OpenCode);
+        assert_eq!(SessionKind::from_index(3, ""), SessionKind::OhMyPi);
+        assert_eq!(SessionKind::from_index(4, ""), SessionKind::Aider);
+        assert_eq!(SessionKind::from_index(5, ""), SessionKind::Shell);
+        assert_eq!(
+            SessionKind::from_index(SessionKind::COUNT - 1, "run me"),
+            SessionKind::Custom("run me".into())
+        );
+    }
+
+    #[test]
+    fn kind_from_name_parses_profile_and_ctl_spellings() {
+        assert_eq!(SessionKind::from_name("claude"), Some(SessionKind::Claude));
+        assert_eq!(SessionKind::from_name("codex"), Some(SessionKind::Codex));
+        assert_eq!(
+            SessionKind::from_name("opencode"),
+            Some(SessionKind::OpenCode)
+        );
+        for spelling in ["oh-my-pi", "ohmypi", "omp"] {
+            assert_eq!(SessionKind::from_name(spelling), Some(SessionKind::OhMyPi));
+        }
+        assert_eq!(SessionKind::from_name("aider"), Some(SessionKind::Aider));
+        assert_eq!(SessionKind::from_name("shell"), Some(SessionKind::Shell));
+        assert_eq!(SessionKind::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn kind_labels_fit_the_status_panel_column() {
+        for kind in [
+            SessionKind::Claude,
+            SessionKind::Codex,
+            SessionKind::OpenCode,
+            SessionKind::OhMyPi,
+            SessionKind::Aider,
+            SessionKind::Shell,
+            SessionKind::Custom(String::new()),
+        ] {
+            assert!(
+                kind.label().len() <= 8,
+                "label '{}' overflows the 8-char Kind column",
+                kind.label()
+            );
+        }
     }
 }

@@ -95,6 +95,8 @@ pub enum NewSessionField {
 #[derive(Debug, Clone)]
 pub struct NewSessionState {
     pub selected_kind: usize,
+    /// Whether the Kind dropdown list is expanded.
+    pub kind_dropdown_open: bool,
     pub name: String,
     pub cwd: String,
     pub custom_cmd: String,
@@ -105,6 +107,11 @@ pub struct NewSessionState {
 }
 
 impl NewSessionState {
+    /// True when the selected kind is Custom (always the last dropdown entry).
+    pub fn is_custom(&self) -> bool {
+        self.selected_kind == crate::session::SessionKind::COUNT - 1
+    }
+
     #[allow(dead_code)] // used only in #[cfg(test)] module
     /// Returns the cursor position for the currently active text field.
     /// Returns 0 for the Kind field (which has no text cursor).
@@ -137,6 +144,7 @@ impl Default for NewSessionState {
         let cwd_cursor = cwd.len();
         Self {
             selected_kind: 0,
+            kind_dropdown_open: false,
             name: String::new(),
             cwd,
             custom_cmd: String::new(),
@@ -509,11 +517,10 @@ impl App {
         let mut ids = HashMap::new();
         for profile_session in &profile.sessions {
             let kind = match profile_session.kind.as_str() {
-                "claude" => SessionKind::Claude,
-                "codex" => SessionKind::Codex,
-                "shell" => SessionKind::Shell,
                 "custom" => SessionKind::Custom(profile_session.command.clone()),
-                other => anyhow::bail!("profile '{}': unknown kind '{}'", profile.name, other),
+                other => SessionKind::from_name(other).ok_or_else(|| {
+                    anyhow::anyhow!("profile '{}': unknown kind '{}'", profile.name, other)
+                })?,
             };
             let cwd = expand_home(&profile_session.cwd);
             self.spawn_session(kind, profile_session.name.clone(), cwd)?;
@@ -589,6 +596,9 @@ impl App {
         let cmd_str = match &kind {
             SessionKind::Claude => self.config.sessions.commands.claude.clone(),
             SessionKind::Codex => self.config.sessions.commands.codex.clone(),
+            SessionKind::OpenCode => self.config.sessions.commands.opencode.clone(),
+            SessionKind::OhMyPi => self.config.sessions.commands.ohmypi.clone(),
+            SessionKind::Aider => self.config.sessions.commands.aider.clone(),
             SessionKind::Shell => {
                 let c = &self.config.sessions.commands.shell;
                 if c.is_empty() {
@@ -1648,13 +1658,11 @@ impl App {
                 name,
                 cwd,
             } => {
-                let kind = match kind_str.as_str() {
-                    "claude" => crate::session::SessionKind::Claude,
-                    "codex" => crate::session::SessionKind::Codex,
-                    "shell" => crate::session::SessionKind::Shell,
-                    other => {
+                let kind = match crate::session::SessionKind::from_name(kind_str.as_str()) {
+                    Some(kind) => kind,
+                    None => {
                         let _ = response_tx.send(serde_json::json!({
-                            "error": format!("unknown session kind: {}", other)
+                            "error": format!("unknown session kind: {}", kind_str)
                         }));
                         return;
                     }
@@ -2003,19 +2011,38 @@ impl App {
     }
 
     fn handle_new_session_mouse(&mut self, col: u16, row: u16) {
+        let inner = inset_rect(self.new_session_area, 1);
+
+        // The expanded dropdown list overlays the fields below the Kind row
+        // (and can extend past the dialog border), so hit-test it first.
+        if self.new_session_state.kind_dropdown_open {
+            let list = crate::ui::kind_dropdown_list_rect(self.new_session_area);
+            if rect_hit(list, col, row) {
+                let idx = row.saturating_sub(list.y + 1) as usize; // skip top border
+                if row > list.y && idx < crate::session::SessionKind::COUNT {
+                    self.new_session_state.selected_kind = idx;
+                }
+            }
+            self.new_session_state.kind_dropdown_open = false;
+            return;
+        }
+
         if !rect_hit(self.new_session_area, col, row) {
             self.mode = AppMode::Normal;
             return;
         }
 
-        let inner = inset_rect(self.new_session_area, 1);
-        let types = split_horizontal(inner.x, inner.y, inner.width, 3, 4);
-        for (idx, area) in types.iter().enumerate() {
-            if rect_hit(*area, col, row) {
-                self.new_session_state.selected_kind = idx;
-                self.new_session_state.active_field = NewSessionField::Kind;
-                return;
-            }
+        // Kind dropdown field (full-width, top row of the dialog)
+        let kind_field = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 3,
+        };
+        if rect_hit(kind_field, col, row) {
+            self.new_session_state.active_field = NewSessionField::Kind;
+            self.new_session_state.kind_dropdown_open = true;
+            return;
         }
 
         let fields_y = inner.y + 3;
@@ -2048,7 +2075,7 @@ impl App {
             self.new_session_state.active_field = NewSessionField::Cwd;
             self.new_session_state.cwd_cursor =
                 byte_index_for_col(&self.new_session_state.cwd, input_col(cwd, col));
-        } else if self.new_session_state.selected_kind == 3 && rect_hit(custom, col, row) {
+        } else if self.new_session_state.is_custom() && rect_hit(custom, col, row) {
             self.new_session_state.active_field = NewSessionField::CustomCmd;
             self.new_session_state.custom_cmd_cursor =
                 byte_index_for_col(&self.new_session_state.custom_cmd, input_col(custom, col));
@@ -2154,7 +2181,7 @@ impl App {
 
     pub fn new_session_tab(&mut self) {
         use NewSessionField::*;
-        let is_custom = self.new_session_state.selected_kind == 3;
+        let is_custom = self.new_session_state.is_custom();
         self.new_session_state.active_field = match self.new_session_state.active_field {
             Kind => Name,
             Name => Cwd,
@@ -2233,18 +2260,14 @@ impl App {
 
     pub fn new_session_select_kind(&mut self, delta: i32) {
         let cur = self.new_session_state.selected_kind as i32;
-        self.new_session_state.selected_kind = ((cur + delta).rem_euclid(4)) as usize;
+        let count = crate::session::SessionKind::COUNT as i32;
+        self.new_session_state.selected_kind = ((cur + delta).rem_euclid(count)) as usize;
         self.new_session_state.active_field = NewSessionField::Kind;
     }
 
     pub fn confirm_new_session(&mut self) -> anyhow::Result<()> {
         let ns = self.new_session_state.clone();
-        let kind = match ns.selected_kind {
-            0 => SessionKind::Claude,
-            1 => SessionKind::Codex,
-            2 => SessionKind::Shell,
-            _ => SessionKind::Custom(ns.custom_cmd.clone()),
-        };
+        let kind = SessionKind::from_index(ns.selected_kind, &ns.custom_cmd);
         let cwd = if ns.cwd.is_empty() {
             std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -3952,27 +3975,6 @@ fn inset_rect(r: Rect, amount: u16) -> Rect {
     }
 }
 
-fn split_horizontal(x: u16, y: u16, width: u16, height: u16, count: usize) -> Vec<Rect> {
-    let count_u16 = count.max(1) as u16;
-    let base = width / count_u16;
-    let mut areas = Vec::with_capacity(count);
-    for i in 0..count {
-        let ix = i as u16;
-        let item_x = x + ix * base;
-        let item_width = if i + 1 == count {
-            width.saturating_sub(base * ix)
-        } else {
-            base
-        };
-        areas.push(Rect {
-            x: item_x,
-            y,
-            width: item_width,
-            height,
-        });
-    }
-    areas
-}
 
 fn input_col(area: Rect, col: u16) -> usize {
     col.saturating_sub(area.x + 1) as usize
@@ -4244,6 +4246,39 @@ mod tests {
 
         let session = app.sessions.iter().find(|s| s.id == id).unwrap();
         assert_eq!(session.cwd, "/work");
+    }
+
+    #[test]
+    fn new_session_kind_selection_wraps_and_flags_custom_only_at_last_index() {
+        let mut app = make_app();
+        app.open_new_session();
+
+        assert_eq!(app.new_session_state.selected_kind, 0);
+        assert!(!app.new_session_state.is_custom());
+
+        // Wrap backwards to the last entry (Custom).
+        app.new_session_select_kind(-1);
+        assert_eq!(
+            app.new_session_state.selected_kind,
+            crate::session::SessionKind::COUNT - 1
+        );
+        assert!(app.new_session_state.is_custom());
+
+        // And forwards back to the first.
+        app.new_session_select_kind(1);
+        assert_eq!(app.new_session_state.selected_kind, 0);
+    }
+
+    #[test]
+    fn new_session_dialog_resets_dropdown_state_on_open() {
+        let mut app = make_app();
+        app.new_session_state.kind_dropdown_open = true;
+        app.new_session_state.selected_kind = 3;
+
+        app.open_new_session();
+
+        assert!(!app.new_session_state.kind_dropdown_open);
+        assert_eq!(app.new_session_state.selected_kind, 0);
     }
 
     #[test]
