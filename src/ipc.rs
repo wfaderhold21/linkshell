@@ -85,7 +85,7 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
     use std::os::unix::io::AsRawFd;
     let mut cred = libc::ucred {
         pid: 0,
@@ -367,7 +367,7 @@ async fn handle_stream(
                         continue;
                     }
                 }
-                dispatch_msg(env, &tx, registered_id, &agent_tx).await;
+                dispatch_msg(env, &tx, registered_id, &caps, &agent_tx).await;
             }
             Err(_) => break,
         }
@@ -392,12 +392,47 @@ async fn write_loop(
     }
 }
 
+/// Which session a state/tokens/output message may act on. Explicit
+/// `session_id`/`session_name` targeting requires `SignalAny` unless the id
+/// is the connection's own registered session; without it a connection is
+/// pinned to `registered_id`.
+enum SignalTarget {
+    Id(usize),
+    Name(String),
+}
+
+fn resolve_signal_target(
+    msg_sid: Option<usize>,
+    session_name: Option<String>,
+    registered_id: Option<usize>,
+    caps: &CapSet,
+) -> Result<Option<SignalTarget>, ()> {
+    let any = caps.contains(&Capability::SignalAny);
+    if let Some(sid) = msg_sid {
+        return if any || registered_id == Some(sid) {
+            Ok(Some(SignalTarget::Id(sid)))
+        } else {
+            Err(())
+        };
+    }
+    if let Some(name) = session_name {
+        return if any {
+            Ok(Some(SignalTarget::Name(name)))
+        } else {
+            Err(())
+        };
+    }
+    Ok(registered_id.map(SignalTarget::Id))
+}
+
 async fn dispatch_msg(
     env: Envelope,
     tx: &mpsc::Sender<AppEvent>,
     registered_id: Option<usize>,
+    caps: &CapSet,
     writer: &mpsc::Sender<String>,
 ) {
+    let env_id = env.id;
     match env.msg {
         Message::State {
             state,
@@ -405,8 +440,16 @@ async fn dispatch_msg(
             session_id: msg_sid,
             session_name,
         } => {
-            if msg_sid.is_none() {
-                if let Some(name) = session_name {
+            let target = match resolve_signal_target(msg_sid, session_name, registered_id, caps) {
+                Ok(Some(t)) => t,
+                Ok(None) => return,
+                Err(()) => {
+                    reply_err(writer, env_id, ErrorCode::Forbidden, "not your session").await;
+                    return;
+                }
+            };
+            match target {
+                SignalTarget::Name(name) => {
                     let raw = build_state_legacy_json(&state, detail.as_deref(), None, Some(&name));
                     let _ = tx
                         .send(AppEvent::IpcNamedAction {
@@ -414,24 +457,23 @@ async fn dispatch_msg(
                             msg: raw,
                         })
                         .await;
-                    return;
                 }
-            }
-            let target = msg_sid.or(registered_id);
-            let Some(sid) = target else { return };
-            let _ = tx
-                .send(AppEvent::IpcStateOverride {
-                    session_id: sid,
-                    state: state.clone(),
-                })
-                .await;
-            if let Some(d) = detail {
-                let _ = tx
-                    .send(AppEvent::SessionOutput {
-                        session_id: sid,
-                        line: format!("[{}]", d),
-                    })
-                    .await;
+                SignalTarget::Id(sid) => {
+                    let _ = tx
+                        .send(AppEvent::IpcStateOverride {
+                            session_id: sid,
+                            state: state.clone(),
+                        })
+                        .await;
+                    if let Some(d) = detail {
+                        let _ = tx
+                            .send(AppEvent::SessionOutput {
+                                session_id: sid,
+                                line: format!("[{}]", d),
+                            })
+                            .await;
+                    }
+                }
             }
         }
         Message::Tokens {
@@ -441,8 +483,16 @@ async fn dispatch_msg(
             session_id: msg_sid,
             session_name,
         } => {
-            if msg_sid.is_none() {
-                if let Some(name) = session_name {
+            let target = match resolve_signal_target(msg_sid, session_name, registered_id, caps) {
+                Ok(Some(t)) => t,
+                Ok(None) => return,
+                Err(()) => {
+                    reply_err(writer, env_id, ErrorCode::Forbidden, "not your session").await;
+                    return;
+                }
+            };
+            match target {
+                SignalTarget::Name(name) => {
                     let raw = serde_json::json!({"type":"tokens","input":input,"output":output,"cost":cost});
                     let _ = tx
                         .send(AppEvent::IpcNamedAction {
@@ -450,30 +500,37 @@ async fn dispatch_msg(
                             msg: raw,
                         })
                         .await;
-                    return;
+                }
+                SignalTarget::Id(sid) => {
+                    let _ = tx
+                        .send(AppEvent::IpcTokenUpdate {
+                            session_id: sid,
+                            stats: TokenStats {
+                                input_tokens: input,
+                                output_tokens: output,
+                                total_cost_usd: cost,
+                                context_tokens: 0,
+                            },
+                        })
+                        .await;
                 }
             }
-            let target = msg_sid.or(registered_id);
-            let Some(sid) = target else { return };
-            let _ = tx
-                .send(AppEvent::IpcTokenUpdate {
-                    session_id: sid,
-                    stats: TokenStats {
-                        input_tokens: input,
-                        output_tokens: output,
-                        total_cost_usd: cost,
-                        context_tokens: 0,
-                    },
-                })
-                .await;
         }
         Message::Output {
             line,
             session_id: msg_sid,
             session_name,
         } => {
-            if msg_sid.is_none() {
-                if let Some(name) = session_name {
+            let target = match resolve_signal_target(msg_sid, session_name, registered_id, caps) {
+                Ok(Some(t)) => t,
+                Ok(None) => return,
+                Err(()) => {
+                    reply_err(writer, env_id, ErrorCode::Forbidden, "not your session").await;
+                    return;
+                }
+            };
+            match target {
+                SignalTarget::Name(name) => {
                     let raw = serde_json::json!({"type":"output","line":line});
                     let _ = tx
                         .send(AppEvent::IpcNamedAction {
@@ -481,17 +538,16 @@ async fn dispatch_msg(
                             msg: raw,
                         })
                         .await;
-                    return;
+                }
+                SignalTarget::Id(sid) => {
+                    let _ = tx
+                        .send(AppEvent::SessionOutput {
+                            session_id: sid,
+                            line,
+                        })
+                        .await;
                 }
             }
-            let target = msg_sid.or(registered_id);
-            let Some(sid) = target else { return };
-            let _ = tx
-                .send(AppEvent::SessionOutput {
-                    session_id: sid,
-                    line,
-                })
-                .await;
         }
         Message::AgentSend {
             dest,
@@ -765,7 +821,7 @@ mod tests {
                 session_name: Some("reviewer".to_string()),
             },
         };
-        dispatch_msg(env, &tx, None, &writer).await;
+        dispatch_msg(env, &tx, None, &crate::auth::operator_caps(), &writer).await;
         match rx.recv().await.unwrap() {
             AppEvent::IpcNamedAction { session_name, msg } => {
                 assert_eq!(session_name, "reviewer");
@@ -791,6 +847,7 @@ mod tests {
             },
             &tx,
             Some(9),
+            &crate::auth::worker_caps(),
             &writer,
         )
         .await;
@@ -807,6 +864,7 @@ mod tests {
             },
             &tx,
             Some(9),
+            &crate::auth::worker_caps(),
             &writer,
         )
         .await;
@@ -836,6 +894,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_msg_rejects_cross_session_targeting_without_signal_any() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (writer, mut writer_rx) = mpsc::channel(4);
+        let worker = crate::auth::worker_caps();
+
+        // Worker registered as session 3 targeting session 7 → Forbidden.
+        dispatch_msg(
+            Envelope {
+                id: Some(1),
+                msg: Message::State {
+                    state: SessionState::Ready,
+                    detail: None,
+                    session_id: Some(7),
+                    session_name: None,
+                },
+            },
+            &tx,
+            Some(3),
+            &worker,
+            &writer,
+        )
+        .await;
+        let err = writer_rx.recv().await.unwrap();
+        assert!(err.contains("forbidden"), "expected forbidden, got: {err}");
+        assert!(rx.try_recv().is_err(), "no app event should be emitted");
+
+        // Named targeting is also privileged.
+        dispatch_msg(
+            Envelope {
+                id: Some(2),
+                msg: Message::Output {
+                    line: "spoofed".into(),
+                    session_id: None,
+                    session_name: Some("reviewer".into()),
+                },
+            },
+            &tx,
+            Some(3),
+            &worker,
+            &writer,
+        )
+        .await;
+        let err = writer_rx.recv().await.unwrap();
+        assert!(err.contains("forbidden"), "expected forbidden, got: {err}");
+        assert!(rx.try_recv().is_err(), "no app event should be emitted");
+
+        // Explicitly targeting your own registered session is allowed.
+        dispatch_msg(
+            Envelope {
+                id: None,
+                msg: Message::State {
+                    state: SessionState::Ready,
+                    detail: None,
+                    session_id: Some(3),
+                    session_name: None,
+                },
+            },
+            &tx,
+            Some(3),
+            &worker,
+            &writer,
+        )
+        .await;
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::IpcStateOverride { session_id: 3, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_msg_allows_cross_session_targeting_with_signal_any() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (writer, _writer_rx) = mpsc::channel(1);
+        dispatch_msg(
+            Envelope {
+                id: None,
+                msg: Message::Tokens {
+                    input: 1,
+                    output: 2,
+                    cost: 0.1,
+                    session_id: Some(7),
+                    session_name: None,
+                },
+            },
+            &tx,
+            Some(3),
+            &crate::auth::operator_caps(),
+            &writer,
+        )
+        .await;
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::IpcTokenUpdate { session_id: 7, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn dispatch_msg_routes_pipe_broadcast_and_group_fire_messages() {
         let (tx, mut rx) = mpsc::channel(4);
         let (writer, _writer_rx) = mpsc::channel(1);
@@ -850,6 +1005,7 @@ mod tests {
             },
             &tx,
             None,
+            &crate::auth::operator_caps(),
             &writer,
         )
         .await;
@@ -864,6 +1020,7 @@ mod tests {
             },
             &tx,
             None,
+            &crate::auth::operator_caps(),
             &writer,
         )
         .await;
@@ -877,6 +1034,7 @@ mod tests {
             },
             &tx,
             None,
+            &crate::auth::operator_caps(),
             &writer,
         )
         .await;
@@ -893,6 +1051,7 @@ mod tests {
             },
             &tx,
             None,
+            &crate::auth::operator_caps(),
             &writer,
         )
         .await;

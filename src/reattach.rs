@@ -58,7 +58,7 @@ pub fn reattach_socket_from_ipc(ipc_socket: &str) -> String {
     }
 }
 
-pub fn write_reattach_info(pid: u32, ipc_socket: &str) {
+pub fn write_reattach_info(pid: u32, ipc_socket: &str, token: &str) {
     let Some(path) = reattach_info_path() else {
         return;
     };
@@ -66,8 +66,13 @@ pub fn write_reattach_info(pid: u32, ipc_socket: &str) {
         "pid": pid,
         "socket": ipc_socket,
         "reattach": reattach_socket_from_ipc(ipc_socket),
+        "token": token,
     });
-    let _ = std::fs::write(path, info.to_string());
+    // The file carries the reattach token; keep it readable by the owner only.
+    if std::fs::write(&path, info.to_string()).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 pub fn clear_reattach_info() {
@@ -104,6 +109,12 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("invalid reattach file: missing socket"))?
         .to_string();
+    let token = info["token"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!("invalid reattach file: missing token (session started by an older linkshell?)")
+        })?
+        .to_string();
 
     // ── Check the process is alive ────────────────────────────────────────
     let alive = unsafe { libc::kill(pid, 0) == 0 };
@@ -126,9 +137,26 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     // Handshake: tell the server our terminal dimensions.
     let handshake = format!(
         "{}\n",
-        serde_json::json!({"type":"reattach","rows":rows,"cols":cols})
+        serde_json::json!({"type":"reattach","token":token,"rows":rows,"cols":cols})
     );
     write_half.write_all(handshake.as_bytes()).await?;
+
+    // Wait for the server's verdict before taking over the terminal.
+    let (read_half, ack) = {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).await?;
+        (reader, ack)
+    };
+    let ack: serde_json::Value = serde_json::from_str(ack.trim())
+        .map_err(|_| anyhow::anyhow!("unexpected reattach handshake response"))?;
+    if ack["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "reattach rejected: {}",
+            ack["error"].as_str().unwrap_or("unknown error")
+        );
+    }
 
     // ── Set up our terminal ───────────────────────────────────────────────
     enable_raw_mode()?;
@@ -148,7 +176,7 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
     let done_tx2 = done_tx.clone();
     tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut reader = read_half;
         let mut buf = vec![0u8; 4096];
         let mut stdout = tokio::io::stdout();
         loop {
