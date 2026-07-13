@@ -1202,7 +1202,7 @@ impl App {
 
         if let Some(h) = &self.orchestrator {
             // try_send: a wedged orchestrator must never block the main loop.
-            let _ =
+            let dead = matches!(
                 h.tx.try_send(crate::orchestrator::OrchestratorMsg::SessionEvent {
                     session_id,
                     name,
@@ -1210,7 +1210,12 @@ impl App {
                     state: new_state.label().to_string(),
                     waiting_prompt,
                     tail,
-                });
+                }),
+                Err(mpsc::error::TrySendError::Closed(_))
+            );
+            if dead {
+                self.orchestrator_gone();
+            }
         } else if let Some(orch_id) = self.orchestrator_session_id {
             let prompt = waiting_prompt
                 .map(|p| format!(" prompt: {}", p))
@@ -1704,7 +1709,7 @@ impl App {
         self.notify_orchestrator(session_id, &SessionState::Dead);
         if self.orchestrator_session_id == Some(session_id) {
             self.orchestrator_session_id = None;
-            self.chat_system("orchestrator session died — :orchestrator start to relaunch");
+            self.chat_system("orchestrator session died — /orchestrator restart to reconnect");
         }
         if let Some((resp_tx, _)) = self.pending_ipc_replies.remove(&session_id) {
             let _ = resp_tx.send(serde_json::json!({
@@ -2136,6 +2141,7 @@ impl App {
     }
 
     pub fn handle_tick(&mut self) {
+        self.check_orchestrator_alive();
         let mut tick_ready: Vec<usize> = Vec::new();
 
         for session in self.sessions.iter_mut() {
@@ -2965,6 +2971,19 @@ impl App {
                     Err(e) => format!("orchestrator: {}", e),
                 };
             }
+            ["orchestrator", "restart"] => {
+                // Tear down whichever flavor is running, then start fresh.
+                self.orchestrator = None;
+                if let Some(orch_id) = self.orchestrator_session_id.take() {
+                    if let Some(idx) = self.sessions.iter().position(|s| s.id == orch_id) {
+                        self.remove_session(idx);
+                    }
+                }
+                self.command_result = match self.start_orchestrator() {
+                    Ok(()) => "orchestrator restarted".to_string(),
+                    Err(e) => format!("orchestrator: {}", e),
+                };
+            }
             ["orchestrator", "stop"] => {
                 self.command_result = if self.orchestrator.take().is_some() {
                     // Dropping the handle closes the channel; the task exits.
@@ -3053,11 +3072,36 @@ impl App {
     /// Deliver a system note to whichever orchestrator flavor is running.
     fn notify_orchestrator_note(&mut self, note: String) {
         if let Some(handle) = &self.orchestrator {
-            let _ = handle
-                .tx
-                .try_send(crate::orchestrator::OrchestratorMsg::SystemNote(note));
+            let dead = matches!(
+                handle
+                    .tx
+                    .try_send(crate::orchestrator::OrchestratorMsg::SystemNote(note)),
+                Err(mpsc::error::TrySendError::Closed(_))
+            );
+            if dead {
+                self.orchestrator_gone();
+            }
         } else if let Some(orch_id) = self.orchestrator_session_id {
             self.handle_pipe_relay(orch_id, format!("[linkshell] {}\r", note));
+        }
+    }
+
+    /// The API-class orchestrator task is gone (its channel closed): clear
+    /// the stale handle and tell the user how to get it back.
+    fn orchestrator_gone(&mut self) {
+        if self.orchestrator.take().is_some() {
+            self.chat_system(
+                "orchestrator agent is no longer running — /orchestrator restart to reconnect",
+            );
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Detect a silently-died orchestrator task even when nobody is talking
+    /// to it. Called every tick; cheap (one atomic load).
+    fn check_orchestrator_alive(&mut self) {
+        if self.orchestrator.as_ref().is_some_and(|h| h.tx.is_closed()) {
+            self.orchestrator_gone();
         }
     }
 
@@ -3608,13 +3652,22 @@ impl App {
         // The resident orchestrator agent (API class; the CLI class is a
         // session and resolves through the session-name path below).
         if let Some(handle) = self.orchestrator.as_ref().filter(|h| h.name == target) {
-            let _ = handle
+            let send = handle
                 .tx
                 .try_send(crate::orchestrator::OrchestratorMsg::UserChat(msg.clone()));
             self.chat.messages.push(ChatMsg {
                 from: format!("you → {}", target),
                 text: msg,
             });
+            match send {
+                Err(mpsc::error::TrySendError::Closed(_)) => self.orchestrator_gone(),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.chat_system(
+                        "orchestrator is backed up and dropped that message — try again, or /orchestrator restart if it stays stuck",
+                    );
+                }
+                Ok(()) => {}
+            }
             return;
         }
 
@@ -5640,6 +5693,43 @@ mod tests {
         let resp = orch_request(&mut app, crate::events::OrchestratorReq::ListSessions).unwrap();
         assert_eq!(resp[0]["id"], id);
         assert_eq!(resp[0]["display"], id + 1);
+    }
+
+    #[test]
+    fn dead_orchestrator_task_is_noticed_once_and_cleared() {
+        let mut app = make_app();
+        let (otx, orx) = mpsc::channel(1);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
+            tx: otx,
+            name: "agent".into(),
+        });
+        drop(orx); // the task is gone
+        app.handle_tick();
+        assert!(app.orchestrator.is_none());
+        assert!(app
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.text.contains("/orchestrator restart")));
+        // No duplicate notice on later ticks
+        let notices = app.chat.messages.len();
+        app.handle_tick();
+        assert_eq!(app.chat.messages.len(), notices);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_restart_replaces_a_dead_handle() {
+        let mut app = make_app();
+        let (otx, orx) = mpsc::channel(1);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
+            tx: otx,
+            name: "agent".into(),
+        });
+        drop(orx);
+        app.command_input = "orchestrator restart".into();
+        app.execute_command();
+        assert_eq!(app.command_result, "orchestrator restarted");
+        assert!(app.orchestrator.as_ref().is_some_and(|h| !h.tx.is_closed()));
     }
 
     #[test]

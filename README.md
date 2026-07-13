@@ -203,7 +203,9 @@ Two provider classes:
   occupies one of the 8 session slots and replies through `linkshell-ctl chat`.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
-`:orchestrator start|stop|status` manages it at runtime.
+`:orchestrator start|stop|restart|status` manages it at runtime (also usable
+from chat as `/orchestrator …`). If the agent dies — its task exits or the
+CLI session ends — a chat notice appears with the restart command.
 
 The orchestrator can never kill a session on its own: a kill request shows up
 in chat and only `/confirm-kill` executes it (`/deny-kill` refuses).
