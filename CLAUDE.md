@@ -34,6 +34,7 @@ Linkshell is a terminal multiplexer TUI built for AI coding agents. It manages u
 | `protocol.rs` | Typed wire protocol: `Envelope`/`Message`, error codes, per-message capability requirements |
 | `auth.rs` | Capability tiers (operator / worker / council) and token minting |
 | `council.rs` | council.toml parsing and the multi-agent routing engine (`CouncilRouter`) |
+| `orchestrator/` | Resident orchestrator agent: `mod.rs` task/tools/prompts, `anthropic.rs` + `openai.rs` tool-use loops. CLI-class providers instead run as a session with `orchestrator_caps()` driving `linkshell-ctl` |
 | `claude_log.rs` | Watch `$CLAUDE_CONFIG_DIR/projects` JSONL for cumulative token/cost stats |
 | `codex_log.rs` | Watch `$CODEX_HOME/sessions` rollout JSONL for token/context stats |
 | `config.rs` | linkshell.toml: commands, aliases, pricing, socket, keybindings |

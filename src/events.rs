@@ -142,6 +142,22 @@ pub enum AppEvent {
         rows: u16,
         cols: u16,
     },
+    /// Tool request from the in-process orchestrator agent (Class A) or a
+    /// privileged IPC client; the caller awaits the JSON reply on response_tx.
+    OrchestratorRequest {
+        req: OrchestratorReq,
+        response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+    },
+    /// Token usage from the orchestrator's own API calls
+    OrchestratorUsage {
+        input: u64,
+        output: u64,
+    },
+    /// A line posted into the chat pane via IPC `chat_post`
+    IpcChatPost {
+        from_session_id: Option<usize>,
+        text: String,
+    },
     /// IPC handshake: resolve a token (or Unix peer) to a session_id + CapSet.
     Authenticate {
         token: Option<String>,
@@ -163,8 +179,46 @@ pub enum IpcQueryPayload {
         session_id: usize,
         text: String,
     },
-    /// Synchronous snapshot query: "sessions" or "pipes"
+    /// Synchronous snapshot query: "sessions", "pipes", or "output:<id>[:<n>]"
     Query {
         what: String,
+    },
+}
+
+/// Requests the orchestrator agent's tools translate into. Executed
+/// synchronously by `App::handle_orchestrator_request` in the main loop.
+#[derive(Debug)]
+pub enum OrchestratorReq {
+    ListSessions,
+    ReadOutput {
+        session_id: usize,
+        lines: usize,
+    },
+    StartSession {
+        kind: String,
+        name: String,
+        cwd: String,
+        initial_prompt: Option<String>,
+    },
+    SendInput {
+        session_id: usize,
+        text: String,
+        wait_ready: bool,
+    },
+    PipeAdd {
+        source: usize,
+        dest: usize,
+        trigger: String,
+        extract: String,
+        prefix: Option<String>,
+    },
+    PipeRemove {
+        source: usize,
+        dest: Option<usize>,
+    },
+    /// Files a kill request; the reply is always pending-confirmation.
+    RequestKill {
+        session_id: usize,
+        reason: String,
     },
 }

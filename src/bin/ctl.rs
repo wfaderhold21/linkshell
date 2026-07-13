@@ -39,6 +39,120 @@ fn main() {
             println!("{}", resp);
         }
 
+        Some("new") => {
+            // new <kind> [name] [--cwd=PATH]
+            let kind = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("usage: linkshell-ctl new <kind> [name] [--cwd=PATH]");
+                std::process::exit(1);
+            });
+            let mut name: Option<String> = None;
+            let mut cwd: Option<String> = None;
+            for a in &args[3..] {
+                if let Some(v) = a.strip_prefix("--cwd=") {
+                    cwd = Some(v.to_string());
+                } else if name.is_none() {
+                    name = Some(a.clone());
+                }
+            }
+            let mut msg = serde_json::json!({"type": "session_create", "kind": kind});
+            if let Some(n) = name {
+                msg["name"] = n.into();
+            }
+            if let Some(c) = cwd {
+                msg["cwd"] = c.into();
+            }
+            let resp = send_and_recv(&sock, &msg, Duration::from_secs(15));
+            println!("{}", resp);
+        }
+
+        Some("input") => {
+            // input <id> <text...> [--wait] [--timeout=S]
+            let sid = args
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    eprintln!("usage: linkshell-ctl input <id> <text...> [--wait] [--timeout=S]");
+                    std::process::exit(1);
+                });
+            let mut wait = false;
+            let mut timeout_secs: u64 = 1200;
+            let mut words: Vec<String> = Vec::new();
+            for a in &args[3..] {
+                if a == "--wait" {
+                    wait = true;
+                } else if let Some(v) = a.strip_prefix("--timeout=") {
+                    timeout_secs = v.parse().unwrap_or(timeout_secs);
+                } else {
+                    words.push(a.clone());
+                }
+            }
+            if words.is_empty() {
+                eprintln!("usage: linkshell-ctl input <id> <text...> [--wait] [--timeout=S]");
+                std::process::exit(1);
+            }
+            let msg = serde_json::json!({
+                "type": "session_input_wait",
+                "session_id": sid,
+                "text": words.join(" "),
+            });
+            if wait {
+                let resp = send_and_recv(&sock, &msg, Duration::from_secs(timeout_secs + 5));
+                println!("{}", resp);
+            } else {
+                // Fire-and-forget: the input is injected immediately; we just
+                // don't stick around for the READY reply.
+                send_only(&sock, &msg);
+            }
+        }
+
+        Some("read") => {
+            // read <id> [n]
+            let sid = args
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    eprintln!("usage: linkshell-ctl read <id> [n]");
+                    std::process::exit(1);
+                });
+            let what = match args.get(3).and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) => format!("output:{}:{}", sid, n),
+                None => format!("output:{}", sid),
+            };
+            let msg = serde_json::json!({"type": "query", "what": what});
+            let resp = send_and_recv(&sock, &msg, Duration::from_secs(5));
+            println!("{}", resp);
+        }
+
+        Some("kill") => {
+            // kill <id> [reason...] — files a request; the user confirms in the TUI
+            let sid = args
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    eprintln!("usage: linkshell-ctl kill <id> [reason...]");
+                    std::process::exit(1);
+                });
+            let mut msg = serde_json::json!({"type": "session_kill_request", "session_id": sid});
+            let reason = args[3..].join(" ");
+            if !reason.is_empty() {
+                msg["reason"] = reason.into();
+            }
+            let resp = send_and_recv(&sock, &msg, Duration::from_secs(10));
+            println!("{}", resp);
+        }
+
+        Some("chat") => {
+            let text = args[2..].join(" ");
+            if text.is_empty() {
+                eprintln!("usage: linkshell-ctl chat <text...>");
+                std::process::exit(1);
+            }
+            send_only(
+                &sock,
+                &serde_json::json!({"type": "chat_post", "text": text}),
+            );
+        }
+
         // ── Pipe sub-commands ────────────────────────────────────────────────
         Some("pipe") => match args.get(2).map(|s| s.as_str()) {
             Some("list") => {
@@ -277,6 +391,11 @@ fn send_and_recv(sock: &str, msg: &serde_json::Value, timeout: Duration) -> Stri
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  linkshell-ctl list");
+    eprintln!("  linkshell-ctl new <kind> [name] [--cwd=PATH]");
+    eprintln!("  linkshell-ctl input <id> <text...> [--wait] [--timeout=<secs>]");
+    eprintln!("  linkshell-ctl read <id> [n]");
+    eprintln!("  linkshell-ctl kill <id> [reason...]   (asks the user to confirm)");
+    eprintln!("  linkshell-ctl chat <text...>");
     eprintln!("  linkshell-ctl wait-ready <session_id> [--timeout=<secs>]");
     eprintln!("  linkshell-ctl state <READY|THINKING|RUNNING|WAITING|ERROR>");
     eprintln!("  linkshell-ctl output <text...>");

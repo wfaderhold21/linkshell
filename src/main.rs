@@ -11,6 +11,7 @@ mod ipc;
 mod keybindings;
 mod notify;
 mod opencode_log;
+mod orchestrator;
 mod patterns;
 mod pipe;
 mod protocol;
@@ -152,6 +153,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cfg) = council_cfg {
         if let Err(e) = app.launch_council(cfg) {
             app.command_result = format!("council: {}", e);
+            app.mode = AppMode::CommandResult;
+        }
+    }
+
+    // Resident orchestrator agent ([orchestrator] in linkshell.toml).
+    if config.orchestrator.enabled {
+        if let Err(e) = app.start_orchestrator() {
+            app.command_result = format!("orchestrator: {}", e);
             app.mode = AppMode::CommandResult;
         }
     }
@@ -401,6 +410,18 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::PipeRelay { dest_id, message } => {
             app.handle_pipe_relay(dest_id, message);
+        }
+        AppEvent::OrchestratorRequest { req, response_tx } => {
+            app.handle_orchestrator_request(req, response_tx);
+        }
+        AppEvent::OrchestratorUsage { input, output } => {
+            app.handle_orchestrator_usage(input, output);
+        }
+        AppEvent::IpcChatPost {
+            from_session_id,
+            text,
+        } => {
+            app.handle_ipc_chat_post(from_session_id, text);
         }
         AppEvent::AgentDirectMessage {
             from_session_id,

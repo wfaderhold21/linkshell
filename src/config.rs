@@ -19,7 +19,128 @@ pub struct Config {
     pub pricing: PricingConfig,
     pub keybindings: KeybindingsConfig,
     pub notifications: NotificationsConfig,
+    pub orchestrator: OrchestratorConfig,
     pub profiles: Vec<Profile>,
+}
+
+// ── [orchestrator] ────────────────────────────────────────────────────────
+
+/// The resident orchestrator agent: monitors sessions, chats via the chat
+/// pane, starts sessions and routes work on the user's behalf.
+///
+///   [orchestrator]
+///   enabled = true
+///   provider = "anthropic"     # anthropic | openai | lmstudio (API class)
+///                              # claude | codex | opencode | omp (CLI class)
+///   model = "claude-opus-4-8"  # API class only
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(default)]
+pub struct OrchestratorConfig {
+    pub enabled: bool,
+    pub provider: String,
+    /// Chat target name (`@agent ...`) and CLI-class session name.
+    pub name: String,
+    /// API class: model id.
+    pub model: String,
+    /// openai/lmstudio base URL; also overrides the anthropic base URL (tests).
+    pub endpoint: String,
+    /// Falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY env vars when empty.
+    pub api_key: String,
+    /// Appended to the built-in system prompt / CLI briefing.
+    pub system: String,
+    /// CLI class: working directory for the orchestrator session.
+    pub cwd: String,
+    /// Session states that proactively wake the orchestrator.
+    pub events: Vec<String>,
+    /// Minimum seconds between events for the same (session, state).
+    pub event_cooldown_secs: u64,
+    pub max_history_turns: usize,
+    pub max_tokens: u32,
+    pub max_tool_iterations: usize,
+    pub input_wait_timeout_secs: u64,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "anthropic".to_string(),
+            name: "agent".to_string(),
+            model: String::new(),
+            endpoint: String::new(),
+            api_key: String::new(),
+            system: String::new(),
+            cwd: String::new(),
+            events: vec!["waiting".into(), "error".into(), "dead".into()],
+            event_cooldown_secs: 30,
+            max_history_turns: 40,
+            max_tokens: 4096,
+            max_tool_iterations: 12,
+            input_wait_timeout_secs: 180,
+        }
+    }
+}
+
+pub enum ApiProvider {
+    Anthropic,
+    OpenAi, // also serves LM Studio
+}
+
+pub enum OrchestratorClass {
+    Api(ApiProvider),
+    /// Session-kind name for `SessionKind::from_name`.
+    Cli(&'static str),
+}
+
+impl OrchestratorConfig {
+    pub fn class(&self) -> anyhow::Result<OrchestratorClass> {
+        use OrchestratorClass::*;
+        Ok(match self.provider.as_str() {
+            "anthropic" => Api(ApiProvider::Anthropic),
+            "openai" | "lmstudio" => Api(ApiProvider::OpenAi),
+            "claude" => Cli("claude"),
+            "codex" => Cli("codex"),
+            "opencode" => Cli("opencode"),
+            "omp" | "oh-my-pi" | "ohmypi" => Cli("oh-my-pi"),
+            other => anyhow::bail!("unknown orchestrator provider: {}", other),
+        })
+    }
+
+    /// Effective model id (API class).
+    pub fn model_id(&self) -> String {
+        if !self.model.is_empty() {
+            return self.model.clone();
+        }
+        match self.provider.as_str() {
+            "anthropic" => "claude-opus-4-8".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Effective endpoint (API class).
+    pub fn endpoint_url(&self) -> String {
+        if !self.endpoint.is_empty() {
+            return self.endpoint.clone();
+        }
+        match self.provider.as_str() {
+            "anthropic" => "https://api.anthropic.com".to_string(),
+            "lmstudio" => "http://localhost:1234/v1".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Effective API key (API class): config value or provider env var.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if !self.api_key.is_empty() {
+            return Some(self.api_key.clone());
+        }
+        let var = match self.provider.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            _ => return None,
+        };
+        std::env::var(var).ok().filter(|k| !k.is_empty())
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -594,6 +715,48 @@ pub fn validate_command(cmd: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orchestrator_provider_classes_resolve_with_sane_defaults() {
+        let mut cfg = OrchestratorConfig::default();
+        assert!(!cfg.enabled);
+        assert!(matches!(
+            cfg.class(),
+            Ok(OrchestratorClass::Api(ApiProvider::Anthropic))
+        ));
+        assert_eq!(cfg.model_id(), "claude-opus-4-8");
+        assert_eq!(cfg.endpoint_url(), "https://api.anthropic.com");
+
+        cfg.provider = "lmstudio".into();
+        assert!(matches!(
+            cfg.class(),
+            Ok(OrchestratorClass::Api(ApiProvider::OpenAi))
+        ));
+        assert_eq!(cfg.endpoint_url(), "http://localhost:1234/v1");
+
+        for (provider, kind) in [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("opencode", "opencode"),
+            ("omp", "oh-my-pi"),
+        ] {
+            cfg.provider = provider.into();
+            match cfg.class() {
+                Ok(OrchestratorClass::Cli(k)) => assert_eq!(k, kind),
+                _ => panic!("{} should be CLI class", provider),
+            }
+        }
+
+        cfg.provider = "gpt5".into();
+        assert!(cfg.class().is_err());
+
+        // Explicit values win over defaults
+        cfg.provider = "anthropic".into();
+        cfg.model = "claude-haiku-4-5-20251001".into();
+        cfg.endpoint = "http://localhost:9999".into();
+        assert_eq!(cfg.model_id(), "claude-haiku-4-5-20251001");
+        assert_eq!(cfg.endpoint_url(), "http://localhost:9999");
+    }
 
     #[test]
     fn profile_toml_round_trips_all_fields_and_defaults() {
