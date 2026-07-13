@@ -1179,9 +1179,38 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    // Bottom row: input; the rest: transcript
-    let transcript_h = inner.height.saturating_sub(2) as usize;
     let width = inner.width as usize;
+
+    // The input grows with its content: wrap "❯ " + text into rows, capped at
+    // half the pane (max 8 rows); the transcript yields the space. Long input
+    // scrolls so the cursor row stays visible.
+    let mut pos = app.chat.cursor.min(app.chat.input.len());
+    while pos > 0 && !app.chat.input.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let (before, after) = app.chat.input.split_at(pos);
+    let (cursor_ch, after) = match after.chars().next() {
+        Some(ch) => (&after[..ch.len_utf8()], &after[ch.len_utf8()..]),
+        None => (" ", ""),
+    };
+    let prompt_style = Style::default().fg(Color::Cyan);
+    let cursor_style = Style::default().fg(Color::Black).bg(Color::White);
+    let mut input_chars: Vec<(char, Style)> = Vec::new();
+    input_chars.extend("❯ ".chars().map(|c| (c, prompt_style)));
+    input_chars.extend(before.chars().map(|c| (c, Style::default())));
+    input_chars.extend(cursor_ch.chars().map(|c| (c, cursor_style)));
+    input_chars.extend(after.chars().map(|c| (c, Style::default())));
+
+    let cols = width.max(1);
+    let total_rows = input_chars.len().div_ceil(cols).max(1);
+    let max_input_rows = ((inner.height as usize) / 2).clamp(1, 8);
+    let input_rows = total_rows.min(max_input_rows);
+    let cursor_row = (2 + before.chars().count()) / cols;
+    let first_row = cursor_row
+        .saturating_sub(input_rows - 1)
+        .min(total_rows - input_rows);
+
+    let transcript_h = inner.height.saturating_sub(1 + input_rows as u16) as usize;
 
     // Flatten messages into wrapped, styled lines
     let mut lines: Vec<Line> = Vec::new();
@@ -1221,14 +1250,14 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         x: inner.x,
         y: inner.y,
         width: inner.width,
-        height: inner.height.saturating_sub(2),
+        height: transcript_h as u16,
     };
     f.render_widget(List::new(items), transcript);
 
-    // Separator + input line with cursor overlay
+    // Separator + growable input with cursor overlay
     let sep = Rect {
         x: inner.x,
-        y: inner.y + inner.height.saturating_sub(2),
+        y: inner.y + inner.height.saturating_sub(1 + input_rows as u16),
         width: inner.width,
         height: 1,
     };
@@ -1242,29 +1271,26 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
 
     let input_area = Rect {
         x: inner.x,
-        y: inner.y + inner.height.saturating_sub(1),
+        y: inner.y + inner.height.saturating_sub(input_rows as u16),
         width: inner.width,
-        height: 1,
+        height: input_rows as u16,
     };
-    let mut pos = app.chat.cursor.min(app.chat.input.len());
-    while pos > 0 && !app.chat.input.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    let (before, after) = app.chat.input.split_at(pos);
-    let (cursor_ch, after) = match after.chars().next() {
-        Some(ch) => (&after[..ch.len_utf8()], &after[ch.len_utf8()..]),
-        None => (" ", ""),
-    };
-    let input_line = Line::from(vec![
-        Span::styled("❯ ", Style::default().fg(Color::Cyan)),
-        Span::raw(before.to_string()),
-        Span::styled(
-            cursor_ch.to_string(),
-            Style::default().fg(Color::Black).bg(Color::White),
-        ),
-        Span::raw(after.to_string()),
-    ]);
-    f.render_widget(Paragraph::new(input_line), input_area);
+    let input_lines: Vec<Line> = (first_row..first_row + input_rows)
+        .map(|row| {
+            let start = row * cols;
+            let end = (start + cols).min(input_chars.len());
+            let mut spans: Vec<Span> = Vec::new();
+            // Group consecutive same-styled chars into one span per run.
+            for &(c, style) in input_chars.get(start..end).unwrap_or(&[]) {
+                match spans.last_mut() {
+                    Some(last) if last.style == style => last.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(input_lines), input_area);
 
     popup
 }
