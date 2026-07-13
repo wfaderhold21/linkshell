@@ -228,6 +228,9 @@ pub struct Session {
     pub last_notified: Option<Instant>,
     /// No PTY — managed entirely via IPC socket.
     pub headless: bool,
+    /// True for the resident CLI-class orchestrator session: excluded from
+    /// @all broadcasts and from proactive orchestrator events about itself.
+    pub is_orchestrator: bool,
     /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
     /// Cleared when pattern matching updates the state from PTY output.
     pub ipc_state: bool,
@@ -303,6 +306,7 @@ impl Session {
             waiting_prompt: None,
             last_notified: None,
             headless: false,
+            is_orchestrator: false,
             ipc_state: false,
             ipc_state_set_at: None,
             group: None,

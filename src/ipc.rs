@@ -666,6 +666,39 @@ async fn dispatch_msg(
                 }
             }
         }
+        Message::ChatPost { text } => {
+            let _ = tx
+                .send(AppEvent::IpcChatPost {
+                    from_session_id: registered_id,
+                    text,
+                })
+                .await;
+        }
+        Message::SessionKillRequest { session_id, reason } => {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            let _ = tx
+                .send(AppEvent::OrchestratorRequest {
+                    req: crate::events::OrchestratorReq::RequestKill {
+                        session_id,
+                        reason: reason.unwrap_or_default(),
+                    },
+                    response_tx: resp_tx,
+                })
+                .await;
+            match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+                Ok(Ok(response)) => {
+                    let _ = writer
+                        .send(serde_json::to_string(&response).unwrap_or_default() + "\n")
+                        .await;
+                }
+                _ => {
+                    let err = serde_json::json!({"error": "kill_request timeout"});
+                    let _ = writer
+                        .send(serde_json::to_string(&err).unwrap_or_default() + "\n")
+                        .await;
+                }
+            }
+        }
         Message::Query { what } => {
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             let _ = tx

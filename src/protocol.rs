@@ -109,6 +109,17 @@ pub enum Message {
     Query {
         what: String,
     },
+    /// Post a line into the TUI chat pane (fire-and-forget).
+    ChatPost {
+        text: String,
+    },
+    /// Ask the user to kill a session. Never kills directly — the TUI shows a
+    /// confirmation prompt and only a human /confirm-kill executes it.
+    SessionKillRequest {
+        session_id: usize,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 
     // ── linkshell → agent ──
     Relay {
@@ -148,6 +159,8 @@ pub fn required_cap(m: &Message) -> Option<Capability> {
         Message::Broadcast { .. } => Broadcast,
         Message::SessionCreate { .. } => CreateSession,
         Message::SessionInputWait { .. } => InjectInput,
+        Message::ChatPost { .. } => PostChat,
+        Message::SessionKillRequest { .. } => RequestKill,
         // handshake + server-origin messages need no capability
         _ => return None,
     })
@@ -231,6 +244,19 @@ mod tests {
                     cwd: None,
                 },
                 Some(CreateSession),
+            ),
+            (
+                Message::ChatPost {
+                    text: String::new(),
+                },
+                Some(PostChat),
+            ),
+            (
+                Message::SessionKillRequest {
+                    session_id: 0,
+                    reason: None,
+                },
+                Some(RequestKill),
             ),
             (
                 Message::Hello {

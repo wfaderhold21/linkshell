@@ -12,6 +12,8 @@ pub enum Capability {
     Broadcast,     // broadcast to a group
     CreateSession, // session_create  (privileged)
     InjectInput,   // session_input_wait / write into a PTY (privileged)
+    RequestKill,   // session_kill_request — asks the user; never kills directly
+    PostChat,      // chat_post — write a line into the chat pane
 }
 
 pub type CapSet = HashSet<Capability>;
@@ -29,9 +31,18 @@ pub fn operator_caps() -> CapSet {
         Broadcast,
         CreateSession,
         InjectInput,
+        RequestKill,
+        PostChat,
     ]
     .into_iter()
     .collect()
+}
+
+/// The resident orchestrator agent: everything the operator can do. Actual
+/// session kills still require human confirmation in the TUI — RequestKill
+/// only files a request.
+pub fn orchestrator_caps() -> CapSet {
+    operator_caps()
 }
 
 /// Default for a spawned worker agent — can report and talk, cannot escalate.

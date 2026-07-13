@@ -230,6 +230,15 @@ pub struct PendingChat {
     pub name: String,
 }
 
+/// A kill request from the orchestrator awaiting human confirmation.
+#[derive(Debug, Clone)]
+pub struct PendingKill {
+    pub session_id: usize,
+    pub session_name: String,
+    pub reason: String,
+    pub requested_at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatState {
     pub input: String,
@@ -422,6 +431,16 @@ pub struct App {
     pub caps: HashMap<usize, CapSet>,
     /// Optional council router for multi-agent orchestration
     pub council: Option<CouncilRouter>,
+    /// Handle to the in-process orchestrator agent task (Class A providers)
+    pub orchestrator: Option<crate::orchestrator::OrchestratorHandle>,
+    /// Session id of the CLI-class orchestrator (Class B providers)
+    pub orchestrator_session_id: Option<usize>,
+    /// Kill request awaiting human /confirm-kill
+    pub pending_kill: Option<PendingKill>,
+    /// Token usage of the orchestrator's own API calls
+    pub orchestrator_stats: crate::session::TokenStats,
+    /// Per-(session_id, state label) cooldown for proactive orchestrator events
+    orch_event_cooldowns: HashMap<(usize, &'static str), std::time::Instant>,
     pub chat: ChatState,
     /// When true, key input is forwarded to all non-dead sessions
     pub broadcast_mode: bool,
@@ -498,6 +517,11 @@ impl App {
             tokens: HashMap::new(),
             caps: HashMap::new(),
             council: None,
+            orchestrator: None,
+            orchestrator_session_id: None,
+            pending_kill: None,
+            orchestrator_stats: crate::session::TokenStats::default(),
+            orch_event_cooldowns: HashMap::new(),
             chat: ChatState::default(),
             broadcast_mode: false,
             settings_state: SettingsState::new_empty(),
@@ -1109,6 +1133,7 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.maybe_notify(session_id, &before, &after);
+                self.notify_orchestrator(session_id, &after);
                 self.check_pipes(session_id, &after);
                 self.check_chat_pending(session_id, &after);
                 let council_relays = if let Some(router) = &mut self.council {
@@ -1124,6 +1149,86 @@ impl App {
                     self.flush_pending_relays(session_id);
                 }
             }
+        }
+    }
+
+    /// Wake the orchestrator agent on a notable session state change
+    /// (per [orchestrator].events, default waiting/error/dead).
+    fn notify_orchestrator(&mut self, session_id: usize, new_state: &SessionState) {
+        if self.orchestrator.is_none() && self.orchestrator_session_id.is_none() {
+            return;
+        }
+        if self.orchestrator_session_id == Some(session_id) {
+            return;
+        }
+        let state_key: &'static str = match new_state {
+            SessionState::Starting => "starting",
+            SessionState::Ready => "ready",
+            SessionState::Thinking => "thinking",
+            SessionState::Running => "running",
+            SessionState::Waiting => "waiting",
+            SessionState::Error => "error",
+            SessionState::Dead => "dead",
+        };
+        if !self
+            .config
+            .orchestrator
+            .events
+            .iter()
+            .any(|e| e == state_key)
+        {
+            return;
+        }
+        let cooldown = std::time::Duration::from_secs(self.config.orchestrator.event_cooldown_secs);
+        if let Some(last) = self.orch_event_cooldowns.get(&(session_id, state_key)) {
+            if last.elapsed() < cooldown {
+                return;
+            }
+        }
+        self.orch_event_cooldowns
+            .insert((session_id, state_key), std::time::Instant::now());
+
+        let Some(s) = self.sessions.iter().find(|s| s.id == session_id) else {
+            return;
+        };
+        if s.is_orchestrator {
+            return;
+        }
+        let name = s.name.clone();
+        let kind = s.kind.label().to_string();
+        let waiting_prompt = s.waiting_prompt.clone();
+        let tail = pipe::extract_from_session(&self.sessions, session_id, &ExtractMode::LastN(15))
+            .unwrap_or_default();
+
+        if let Some(h) = &self.orchestrator {
+            // try_send: a wedged orchestrator must never block the main loop.
+            let dead = matches!(
+                h.tx.try_send(crate::orchestrator::OrchestratorMsg::SessionEvent {
+                    session_id,
+                    name,
+                    kind,
+                    state: new_state.label().to_string(),
+                    waiting_prompt,
+                    tail,
+                }),
+                Err(mpsc::error::TrySendError::Closed(_))
+            );
+            if dead {
+                self.orchestrator_gone();
+            }
+        } else if let Some(orch_id) = self.orchestrator_session_id {
+            let prompt = waiting_prompt
+                .map(|p| format!(" prompt: {}", p))
+                .unwrap_or_default();
+            let msg = format!(
+                "[linkshell event] session {} \"{}\" ({}) is now {}.{} Investigate with linkshell-ctl and report to the user via `linkshell-ctl chat`.",
+                session_id,
+                name,
+                kind,
+                new_state.label(),
+                prompt
+            );
+            self.handle_pipe_relay(orch_id, format!("\x1b[200~{}\x1b[201~\r", msg));
         }
     }
 
@@ -1246,6 +1351,7 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.maybe_notify(session_id, &before, &after);
+                self.notify_orchestrator(session_id, &after);
                 self.check_pipes(session_id, &after);
             }
         }
@@ -1280,6 +1386,7 @@ impl App {
             if let Some(old) = old.as_ref() {
                 self.maybe_notify(session_id, old, &state);
             }
+            self.notify_orchestrator(session_id, &state);
             self.check_pipes(session_id, &state);
             self.check_chat_pending(session_id, &state);
             let council_relays = if let Some(router) = &mut self.council {
@@ -1598,6 +1705,12 @@ impl App {
     }
 
     pub fn handle_session_died(&mut self, session_id: usize) {
+        // Snapshot-based event must fire before the session is removed below.
+        self.notify_orchestrator(session_id, &SessionState::Dead);
+        if self.orchestrator_session_id == Some(session_id) {
+            self.orchestrator_session_id = None;
+            self.chat_system("orchestrator session died — /orchestrator restart to reconnect");
+        }
         if let Some((resp_tx, _)) = self.pending_ipc_replies.remove(&session_id) {
             let _ = resp_tx.send(serde_json::json!({
                 "error": "session died before reaching READY",
@@ -1668,6 +1781,17 @@ impl App {
         response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
     ) {
         use crate::events::IpcQueryPayload;
+        /// "output:<id>" or "output:<id>:<n>" → (id, n); n defaults to 50.
+        fn parse_output_query(what: &str) -> Option<(usize, usize)> {
+            let rest = what.strip_prefix("output:")?;
+            let mut parts = rest.splitn(2, ':');
+            let sid = parts.next()?.parse().ok()?;
+            let n = match parts.next() {
+                Some(n) => n.parse().ok()?,
+                None => 50,
+            };
+            Some((sid, n))
+        }
         match payload {
             IpcQueryPayload::SessionCreate {
                 kind_str,
@@ -1695,26 +1819,7 @@ impl App {
             }
             IpcQueryPayload::Query { what } => {
                 let resp = match what.as_str() {
-                    "sessions" => {
-                        let arr: Vec<_> = self
-                            .sessions
-                            .iter()
-                            .map(|s| {
-                                serde_json::json!({
-                                    "id":            s.id,
-                                    "name":          s.name,
-                                    "kind":          s.kind.label(),
-                                    "state":         s.state.label(),
-                                    "group":         s.group,
-                                    "cwd":           s.cwd,
-                                    "input_tokens":  s.stats.input_tokens,
-                                    "output_tokens": s.stats.output_tokens,
-                                    "cost_usd":      s.stats.total_cost_usd,
-                                })
-                            })
-                            .collect();
-                        serde_json::Value::Array(arr)
-                    }
+                    "sessions" => self.sessions_json(),
                     "pipes" => {
                         let arr: Vec<_> = self
                             .pipes
@@ -1743,6 +1848,24 @@ impl App {
                             .collect();
                         serde_json::Value::Array(arr)
                     }
+                    what if what.starts_with("output:") => match parse_output_query(what) {
+                        Some((sid, n)) => match self.sessions.iter().find(|s| s.id == sid) {
+                            Some(s) => {
+                                let lines: Vec<&String> = s
+                                    .output_lines
+                                    .iter()
+                                    .rev()
+                                    .take(n)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+                                serde_json::json!({"session_id": sid, "lines": lines})
+                            }
+                            None => serde_json::json!({"error": "session not found"}),
+                        },
+                        None => serde_json::json!({"error": "bad output query"}),
+                    },
                     _ => serde_json::json!({"error": "unknown query"}),
                 };
                 let _ = response_tx.send(resp);
@@ -1760,6 +1883,218 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Start the resident orchestrator agent per [orchestrator] config.
+    /// API-class providers run as an in-process tool-loop task; CLI-class
+    /// providers run the CLI in a session with operator-tier IPC capabilities.
+    pub fn start_orchestrator(&mut self) -> anyhow::Result<()> {
+        if self.orchestrator.is_some() || self.orchestrator_session_id.is_some() {
+            anyhow::bail!("orchestrator already running");
+        }
+        let cfg = self.config.orchestrator.clone();
+        match cfg.class()? {
+            crate::config::OrchestratorClass::Api(_) => {
+                if self.config.agents.contains_key(&cfg.name) {
+                    self.chat_system(format!(
+                        "note: [agents.{}] is shadowed by the orchestrator of the same name",
+                        cfg.name
+                    ));
+                }
+                self.orchestrator = Some(crate::orchestrator::spawn(cfg, self.event_tx.clone()));
+            }
+            crate::config::OrchestratorClass::Cli(kind_str) => {
+                let kind = crate::session::SessionKind::from_name(kind_str)
+                    .ok_or_else(|| anyhow::anyhow!("unknown session kind: {}", kind_str))?;
+                let id = self.next_id;
+                self.spawn_session(kind, cfg.name.clone(), cfg.cwd.clone())?;
+                // Upgrade from the default worker capset; the LINKSHELL_TOKEN
+                // already in its environment now grants these caps.
+                self.caps.insert(id, crate::auth::orchestrator_caps());
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    s.is_orchestrator = true;
+                }
+                self.orchestrator_session_id = Some(id);
+                // Briefing lands once the CLI reaches READY. Bracketed paste
+                // keeps the multi-line prompt from submitting line by line.
+                let briefing = crate::orchestrator::cli_briefing(&cfg);
+                self.handle_pipe_relay(id, format!("\x1b[200~{}\x1b[201~\r", briefing));
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot of all sessions as JSON — shared by the IPC `query sessions`
+    /// path and the orchestrator's `list_sessions` tool.
+    pub fn sessions_json(&self) -> serde_json::Value {
+        let arr: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id":             s.id,
+                    "display":        s.id + 1,
+                    "name":           s.name,
+                    "kind":           s.kind.label(),
+                    "state":          s.state.label(),
+                    "waiting_prompt": s.waiting_prompt,
+                    "group":          s.group,
+                    "cwd":            s.cwd,
+                    "input_tokens":   s.stats.input_tokens,
+                    "output_tokens":  s.stats.output_tokens,
+                    "cost_usd":       s.stats.total_cost_usd,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(arr)
+    }
+
+    /// Execute one orchestrator tool request synchronously. `RequestKill`
+    /// never kills — it files a request the user must /confirm-kill.
+    pub fn handle_orchestrator_request(
+        &mut self,
+        req: crate::events::OrchestratorReq,
+        response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) {
+        use crate::events::OrchestratorReq;
+        let resp = match req {
+            OrchestratorReq::ListSessions => self.sessions_json(),
+            OrchestratorReq::ReadOutput { session_id, lines } => {
+                match self.sessions.iter().find(|s| s.id == session_id) {
+                    Some(s) => {
+                        let tail: Vec<&String> = s
+                            .output_lines
+                            .iter()
+                            .rev()
+                            .take(lines)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        serde_json::json!({"session_id": session_id, "lines": tail})
+                    }
+                    None => serde_json::json!({"error": "session not found"}),
+                }
+            }
+            OrchestratorReq::StartSession {
+                kind,
+                name,
+                cwd,
+                initial_prompt,
+            } => match crate::session::SessionKind::from_name(&kind) {
+                Some(k) => {
+                    let new_id = self.next_id;
+                    match self.spawn_session(k, name, cwd) {
+                        Ok(()) => {
+                            if let Some(prompt) = initial_prompt {
+                                let mut msg = prompt;
+                                msg.push('\r');
+                                self.handle_pipe_relay(new_id, msg);
+                            }
+                            serde_json::json!({"session_id": new_id})
+                        }
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    }
+                }
+                None => serde_json::json!({"error": format!("unknown session kind: {}", kind)}),
+            },
+            OrchestratorReq::SendInput {
+                session_id,
+                text,
+                wait_ready,
+            } => {
+                let Some(s) = self.sessions.iter().find(|s| s.id == session_id) else {
+                    let _ = response_tx.send(serde_json::json!({"error": "session not found"}));
+                    return;
+                };
+                if wait_ready {
+                    if self.pending_ipc_replies.contains_key(&session_id) {
+                        let _ = response_tx.send(serde_json::json!({
+                            "error": "session already has a pending input waiter"
+                        }));
+                        return;
+                    }
+                    let line_offset = s.output_lines.len();
+                    let mut input = text;
+                    input.push('\r');
+                    s.write_bytes(input.into_bytes());
+                    self.pending_ipc_replies
+                        .insert(session_id, (response_tx, line_offset));
+                    return; // reply arrives via check_ipc_replies on READY
+                }
+                let mut input = text;
+                input.push('\r');
+                s.write_bytes(input.into_bytes());
+                serde_json::json!({"ok": true})
+            }
+            OrchestratorReq::PipeAdd {
+                source,
+                dest,
+                trigger,
+                extract,
+                prefix,
+            } => {
+                self.handle_ipc_pipe_add(source, dest, &trigger, &extract, prefix);
+                serde_json::json!({"ok": true})
+            }
+            OrchestratorReq::PipeRemove { source, dest } => {
+                self.handle_ipc_pipe_remove(source, dest);
+                serde_json::json!({"ok": true})
+            }
+            OrchestratorReq::RequestKill { session_id, reason } => {
+                self.file_kill_request(session_id, reason)
+            }
+        };
+        let _ = response_tx.send(resp);
+    }
+
+    /// File a kill request for human confirmation and announce it in chat.
+    fn file_kill_request(&mut self, session_id: usize, reason: String) -> serde_json::Value {
+        if self.orchestrator_session_id == Some(session_id) {
+            return serde_json::json!({"error": "the orchestrator cannot request its own kill"});
+        }
+        let Some(s) = self.sessions.iter().find(|s| s.id == session_id) else {
+            return serde_json::json!({"error": "session not found"});
+        };
+        let name = s.name.clone();
+        self.pending_kill = Some(PendingKill {
+            session_id,
+            session_name: name.clone(),
+            reason: reason.clone(),
+            requested_at: std::time::Instant::now(),
+        });
+        let why = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" — reason: {}", reason)
+        };
+        self.chat_system(format!(
+            "agent requests killing session {} \"{}\"{}. /confirm-kill to approve, /deny-kill to refuse.",
+            session_id + 1,
+            name,
+            why
+        ));
+        serde_json::json!({"status": "pending_user_confirmation", "session_id": session_id})
+    }
+
+    pub fn handle_orchestrator_usage(&mut self, input: u64, output: u64) {
+        self.orchestrator_stats.input_tokens += input;
+        self.orchestrator_stats.output_tokens += output;
+    }
+
+    /// A line posted into the chat pane via IPC `chat_post`. If it came from
+    /// the CLI orchestrator session, drop any pending PTY-scrape reply for it
+    /// so the answer isn't double-posted.
+    pub fn handle_ipc_chat_post(&mut self, from_session_id: Option<usize>, text: String) {
+        let from = from_session_id
+            .and_then(|sid| self.sessions.iter().find(|s| s.id == sid))
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "ctl".to_string());
+        if let Some(sid) = from_session_id {
+            self.chat.pending.retain(|p| p.session_id != sid);
+        }
+        self.chat.messages.push(ChatMsg { from, text });
+        self.needs_redraw = true;
     }
 
     /// Resolve an IPC connection's identity: returns (session_id, caps) or None for rejection.
@@ -1806,6 +2141,7 @@ impl App {
     }
 
     pub fn handle_tick(&mut self) {
+        self.check_orchestrator_alive();
         let mut tick_ready: Vec<usize> = Vec::new();
 
         for session in self.sessions.iter_mut() {
@@ -2629,7 +2965,143 @@ impl App {
                 }
             }
             ["quit"] | ["q"] => self.should_quit = true,
+            ["orchestrator", "start"] => {
+                self.command_result = match self.start_orchestrator() {
+                    Ok(()) => "orchestrator started".to_string(),
+                    Err(e) => format!("orchestrator: {}", e),
+                };
+            }
+            ["orchestrator", "restart"] => {
+                // Tear down whichever flavor is running, then start fresh.
+                self.orchestrator = None;
+                if let Some(orch_id) = self.orchestrator_session_id.take() {
+                    if let Some(idx) = self.sessions.iter().position(|s| s.id == orch_id) {
+                        self.remove_session(idx);
+                    }
+                }
+                self.command_result = match self.start_orchestrator() {
+                    Ok(()) => "orchestrator restarted".to_string(),
+                    Err(e) => format!("orchestrator: {}", e),
+                };
+            }
+            ["orchestrator", "stop"] => {
+                self.command_result = if self.orchestrator.take().is_some() {
+                    // Dropping the handle closes the channel; the task exits.
+                    "orchestrator stopped".to_string()
+                } else if let Some(orch_id) = self.orchestrator_session_id.take() {
+                    if let Some(idx) = self.sessions.iter().position(|s| s.id == orch_id) {
+                        self.remove_session(idx);
+                    }
+                    "orchestrator session killed".to_string()
+                } else {
+                    "orchestrator is not running".to_string()
+                };
+            }
+            ["orchestrator"] | ["orchestrator", "status"] => {
+                self.command_result = if let Some(h) = &self.orchestrator {
+                    format!(
+                        "orchestrator @{} ({}) — {} in / {} out tokens",
+                        h.name,
+                        self.config.orchestrator.provider,
+                        self.orchestrator_stats.input_tokens,
+                        self.orchestrator_stats.output_tokens
+                    )
+                } else if let Some(orch_id) = self.orchestrator_session_id {
+                    format!(
+                        "orchestrator session {} ({})",
+                        orch_id + 1,
+                        self.config.orchestrator.provider
+                    )
+                } else {
+                    "orchestrator is not running (enable [orchestrator] in linkshell.toml)"
+                        .to_string()
+                };
+            }
+            ["confirm-kill"] => self.resolve_pending_kill(true),
+            ["deny-kill"] => self.resolve_pending_kill(false),
             _ => {}
+        }
+    }
+
+    /// Approve or refuse the orchestrator's pending kill request.
+    fn resolve_pending_kill(&mut self, approve: bool) {
+        let Some(pk) = self.pending_kill.take() else {
+            self.command_result = "no pending kill request".to_string();
+            return;
+        };
+        if pk.requested_at.elapsed() > std::time::Duration::from_secs(600) {
+            self.command_result = "kill request expired; ask the agent again".to_string();
+            return;
+        }
+        if approve {
+            match self.sessions.iter().position(|s| s.id == pk.session_id) {
+                Some(idx) => {
+                    self.remove_session(idx);
+                    self.command_result = format!(
+                        "killed session {} \"{}\"",
+                        pk.session_id + 1,
+                        pk.session_name
+                    );
+                }
+                None => {
+                    self.command_result = "session already gone".to_string();
+                }
+            }
+        } else {
+            self.command_result = format!(
+                "refused kill of session {} \"{}\"",
+                pk.session_id + 1,
+                pk.session_name
+            );
+        }
+        let why = if pk.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" (requested for: {})", pk.reason)
+        };
+        let note = format!(
+            "user {} kill of session {} \"{}\"{}",
+            if approve { "approved" } else { "refused" },
+            pk.session_id + 1,
+            pk.session_name,
+            why
+        );
+        self.notify_orchestrator_note(note);
+    }
+
+    /// Deliver a system note to whichever orchestrator flavor is running.
+    fn notify_orchestrator_note(&mut self, note: String) {
+        if let Some(handle) = &self.orchestrator {
+            let dead = matches!(
+                handle
+                    .tx
+                    .try_send(crate::orchestrator::OrchestratorMsg::SystemNote(note)),
+                Err(mpsc::error::TrySendError::Closed(_))
+            );
+            if dead {
+                self.orchestrator_gone();
+            }
+        } else if let Some(orch_id) = self.orchestrator_session_id {
+            self.handle_pipe_relay(orch_id, format!("[linkshell] {}\r", note));
+        }
+    }
+
+    /// The API-class orchestrator task is gone (its channel closed): clear
+    /// the stale handle and tell the user how to get it back.
+    fn orchestrator_gone(&mut self) {
+        if self.orchestrator.take().is_some() {
+            self.chat_system(
+                "orchestrator agent is no longer running — /orchestrator restart to reconnect",
+            );
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Detect a silently-died orchestrator task even when nobody is talking
+    /// to it. Called every tick; cheap (one atomic load).
+    fn check_orchestrator_alive(&mut self) {
+        if self.orchestrator.as_ref().is_some_and(|h| h.tx.is_closed()) {
+            self.orchestrator_gone();
         }
     }
 
@@ -3094,12 +3566,16 @@ impl App {
         }
 
         if raw == "/agents" {
-            let mut targets: Vec<String> = self
-                .config
-                .agents
-                .keys()
-                .map(|k| format!("@{} (local llm)", k))
-                .collect();
+            let mut targets: Vec<String> = Vec::new();
+            if let Some(h) = &self.orchestrator {
+                targets.push(format!("@{} (orchestrator)", h.name));
+            }
+            targets.extend(
+                self.config
+                    .agents
+                    .keys()
+                    .map(|k| format!("@{} (local llm)", k)),
+            );
             targets.extend(
                 self.sessions
                     .iter()
@@ -3140,10 +3616,14 @@ impl App {
         } else {
             match &self.chat.target {
                 Some(t) => (t.clone(), raw),
-                None => {
-                    self.chat_system("address someone first: @name message (see /agents)");
-                    return;
-                }
+                // Unaddressed messages default to the orchestrator when present.
+                None => match &self.orchestrator {
+                    Some(h) => (h.name.clone(), raw),
+                    None => {
+                        self.chat_system("address someone first: @name message (see /agents)");
+                        return;
+                    }
+                },
             }
         };
         self.chat.target = Some(target.clone());
@@ -3152,7 +3632,7 @@ impl App {
             let ids: Vec<(usize, String)> = self
                 .sessions
                 .iter()
-                .filter(|s| s.base != crate::session::BaseKind::Other)
+                .filter(|s| s.base != crate::session::BaseKind::Other && !s.is_orchestrator)
                 .map(|s| (s.id, s.name.clone()))
                 .collect();
             if ids.is_empty() {
@@ -3166,6 +3646,28 @@ impl App {
                 from: "you → all".to_string(),
                 text: msg,
             });
+            return;
+        }
+
+        // The resident orchestrator agent (API class; the CLI class is a
+        // session and resolves through the session-name path below).
+        if let Some(handle) = self.orchestrator.as_ref().filter(|h| h.name == target) {
+            let send = handle
+                .tx
+                .try_send(crate::orchestrator::OrchestratorMsg::UserChat(msg.clone()));
+            self.chat.messages.push(ChatMsg {
+                from: format!("you → {}", target),
+                text: msg,
+            });
+            match send {
+                Err(mpsc::error::TrySendError::Closed(_)) => self.orchestrator_gone(),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.chat_system(
+                        "orchestrator is backed up and dropped that message — try again, or /orchestrator restart if it stays stuck",
+                    );
+                }
+                Ok(()) => {}
+            }
             return;
         }
 
@@ -5082,5 +5584,183 @@ mod tests {
         app.write_to_active(b"x");
         assert_eq!(app.sessions[0].history_scroll, 0);
         assert_eq!(app.scroll_offset(), 0);
+    }
+
+    fn orch_request(
+        app: &mut App,
+        req: crate::events::OrchestratorReq,
+    ) -> Option<serde_json::Value> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.handle_orchestrator_request(req, tx);
+        rx.try_recv().ok()
+    }
+
+    #[test]
+    fn kill_request_needs_confirmation_and_confirm_removes_the_session() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("victim".into(), None).unwrap();
+
+        let resp = orch_request(
+            &mut app,
+            crate::events::OrchestratorReq::RequestKill {
+                session_id: id,
+                reason: "stuck".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resp["status"], "pending_user_confirmation");
+        assert!(app.pending_kill.is_some());
+        // The request is announced in chat, nothing is killed yet.
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.text.contains("/confirm-kill")));
+
+        app.command_input = "confirm-kill".into();
+        app.execute_command();
+        assert!(app.sessions.is_empty());
+        assert!(app.pending_kill.is_none());
+    }
+
+    #[test]
+    fn deny_kill_keeps_the_session_and_bad_targets_error() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("victim".into(), None).unwrap();
+
+        let resp = orch_request(
+            &mut app,
+            crate::events::OrchestratorReq::RequestKill {
+                session_id: id,
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resp["status"], "pending_user_confirmation");
+        app.command_input = "deny-kill".into();
+        app.execute_command();
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.pending_kill.is_none());
+
+        // Unknown session
+        let resp = orch_request(
+            &mut app,
+            crate::events::OrchestratorReq::RequestKill {
+                session_id: 99,
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(resp["error"].is_string());
+
+        // The orchestrator may not request its own death
+        app.orchestrator_session_id = Some(id);
+        let resp = orch_request(
+            &mut app,
+            crate::events::OrchestratorReq::RequestKill {
+                session_id: id,
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(resp["error"].as_str().unwrap().contains("own kill"));
+    }
+
+    #[test]
+    fn output_query_returns_session_tail() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("noisy".into(), None).unwrap();
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            for i in 0..10 {
+                s.push_output_line(format!("line-{}", i));
+            }
+        }
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.handle_ipc_query(
+            crate::events::IpcQueryPayload::Query {
+                what: format!("output:{}:3", id),
+            },
+            tx,
+        );
+        let resp = rx.try_recv().unwrap();
+        let lines = resp["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "line-9");
+
+        // list_sessions tool shape carries both id and 1-based display
+        let resp = orch_request(&mut app, crate::events::OrchestratorReq::ListSessions).unwrap();
+        assert_eq!(resp[0]["id"], id);
+        assert_eq!(resp[0]["display"], id + 1);
+    }
+
+    #[test]
+    fn dead_orchestrator_task_is_noticed_once_and_cleared() {
+        let mut app = make_app();
+        let (otx, orx) = mpsc::channel(1);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
+            tx: otx,
+            name: "agent".into(),
+        });
+        drop(orx); // the task is gone
+        app.handle_tick();
+        assert!(app.orchestrator.is_none());
+        assert!(app
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.text.contains("/orchestrator restart")));
+        // No duplicate notice on later ticks
+        let notices = app.chat.messages.len();
+        app.handle_tick();
+        assert_eq!(app.chat.messages.len(), notices);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_restart_replaces_a_dead_handle() {
+        let mut app = make_app();
+        let (otx, orx) = mpsc::channel(1);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
+            tx: otx,
+            name: "agent".into(),
+        });
+        drop(orx);
+        app.command_input = "orchestrator restart".into();
+        app.execute_command();
+        assert_eq!(app.command_result, "orchestrator restarted");
+        assert!(app.orchestrator.as_ref().is_some_and(|h| !h.tx.is_closed()));
+    }
+
+    #[test]
+    fn orchestrator_events_respect_filter_cooldown_and_self_exclusion() {
+        let mut app = make_app();
+        let watched = app.spawn_headless_session("worker".into(), None).unwrap();
+        let orch = app.spawn_headless_session("agent".into(), None).unwrap();
+        app.orchestrator_session_id = None;
+        let (otx, mut orx) = mpsc::channel(8);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
+            tx: otx,
+            name: "agent".into(),
+        });
+
+        // READY is not in the default event list
+        app.notify_orchestrator(watched, &SessionState::Ready);
+        assert!(orx.try_recv().is_err());
+
+        // WAITING fires…
+        app.notify_orchestrator(watched, &SessionState::Waiting);
+        assert!(orx.try_recv().is_ok());
+        // …but not twice within the cooldown
+        app.notify_orchestrator(watched, &SessionState::Waiting);
+        assert!(orx.try_recv().is_err());
+        // A different state for the same session still fires
+        app.notify_orchestrator(watched, &SessionState::Error);
+        assert!(orx.try_recv().is_ok());
+
+        // Events about the orchestrator's own session are suppressed
+        app.orchestrator_session_id = Some(orch);
+        app.notify_orchestrator(orch, &SessionState::Waiting);
+        assert!(orx.try_recv().is_err());
     }
 }

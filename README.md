@@ -170,6 +170,46 @@ with `/grant 1 operator`, and delegate from chat — it can then use
 `linkshell-ctl` to create sessions, inject prompts, wait for READY, and wire
 pipes, while you stay in the chat pane.
 
+## Orchestrator Agent
+
+Linkshell can run a resident agent that keeps track of every session, chats
+with you in the chat pane, and acts on your behalf — "start a claude session
+in ~/proj and have it fix the parser bug" from chat, no keystrokes in any
+session. It is also woken proactively when a session hits WAITING, ERROR, or
+dies, and posts a short summary of what's blocked.
+
+```toml
+[orchestrator]
+enabled = true
+provider = "anthropic"    # anthropic | openai | lmstudio  (API loop)
+                          # claude | codex | opencode | omp (CLI session)
+name = "agent"            # chat target: @agent ...
+# model = "claude-opus-4-8"
+# endpoint = "http://localhost:1234/v1"   # openai/lmstudio
+# api_key = "..."          # else ANTHROPIC_API_KEY / OPENAI_API_KEY
+# system = "extra instructions"
+# events = ["waiting", "error", "dead"]
+# event_cooldown_secs = 30
+```
+
+Two provider classes:
+
+- **API class** (`anthropic`, `openai`, `lmstudio`): an in-process tool-use
+  loop with tools for listing sessions, reading output, starting sessions
+  (with cwd + initial prompt), typing into sessions, and managing pipes.
+- **CLI class** (`claude`, `codex`, `opencode`, `omp`): the CLI runs as a
+  normal session with operator-tier IPC capabilities and drives linkshell via
+  `linkshell-ctl` (`list`, `read`, `new`, `input --wait`, `pipe`, `chat`). It
+  occupies one of the 8 session slots and replies through `linkshell-ctl chat`.
+
+In chat, unaddressed messages default to the orchestrator when one is running.
+`:orchestrator start|stop|restart|status` manages it at runtime (also usable
+from chat as `/orchestrator …`). If the agent dies — its task exits or the
+CLI session ends — a chat notice appears with the restart command.
+
+The orchestrator can never kill a session on its own: a kill request shows up
+in chat and only `/confirm-kill` executes it (`/deny-kill` refuses).
+
 ## Local agent sessions
 
 Sessions running `opencode`, `omp` (oh-my-pi), `pi`, `aider`, `llama-cli`, or
@@ -297,6 +337,11 @@ linkshell-ctl output "step done"      # inject a line into this session's displa
 linkshell-ctl send [--wait] <name> <msg...>   # direct-message another agent
 linkshell-ctl wait-ready <id> [--timeout=N]   # block until session <id> returns to READY
 linkshell-ctl pipe list / add / remove / fire # manage pipes (operator capability)
+linkshell-ctl new <kind> [name] [--cwd=PATH]  # start a session (operator capability)
+linkshell-ctl input <id> <text...> [--wait]   # type into a session; --wait returns its answer
+linkshell-ctl read <id> [n]                   # last n output lines of a session
+linkshell-ctl chat <msg...>                   # post a line into the chat pane
+linkshell-ctl kill <id> [reason...]           # request a kill; the user must /confirm-kill
 ```
 
 ### Capabilities
@@ -308,6 +353,7 @@ Every IPC connection is scoped by a capability set, resolved at handshake:
 | operator | the human (same-uid Unix peer without a token), shell sessions, headless registrations | everything, incl. `session_create`, `session_input_wait`, pipe management |
 | worker | spawned Claude/Codex/custom sessions (via `LINKSHELL_TOKEN`) | report state/tokens/output, query, direct-message, fire pipes |
 | council | council members | report their own state only |
+| orchestrator | the resident CLI-class orchestrator session | same as operator (incl. `chat_post` and `session_kill_request`; kills still require human `/confirm-kill`) |
 
 TCP connections must present a valid token; tokenless TCP is rejected.
 
