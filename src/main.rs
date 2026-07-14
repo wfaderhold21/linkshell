@@ -250,6 +250,9 @@ async fn main() -> anyhow::Result<()> {
             app.command_bar_area = layout.command_bar_area;
             app.help_area = layout.help_area;
             app.chat_area = layout.chat_area;
+            app.chat_transcript_area = layout.chat_transcript_area;
+            app.chat_scroll_max = layout.chat_scroll_max;
+            app.chat_visible_lines = layout.chat_visible_lines;
             app.menu_bar_area = layout.menu_bar_area;
             app.menu_item_areas = layout.menu_item_areas;
             app.menu_submenu_area = layout.menu_submenu_area;
@@ -522,6 +525,7 @@ fn handle_paste(app: &mut App, text: String) {
                 }
             }
         }
+        AppMode::Chat => app.chat_paste(&text),
         _ => {}
     }
 }

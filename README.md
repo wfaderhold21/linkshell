@@ -146,6 +146,7 @@ switching panes:
 @all status update please       broadcast to every AI session
 looks good, continue            bare messages go to the last target
 /new claude worker              any command-bar command works with /
+/yes  /no                       answer a pending permission prompt
 /agents                         list everyone you can talk to
 ```
 
@@ -153,6 +154,18 @@ Messages to sessions are injected into their PTY; when the session returns to
 READY its answer is extracted (last code block, falling back to recent lines)
 back into the transcript. Local LLM agents keep a bounded per-agent
 conversation history.
+
+The transcript scrolls with the mouse wheel or `PageUp`/`PageDown` (a marker
+on the input separator shows how far up you are). Drag to select transcript
+text — it is copied to the clipboard on release, like the session panes.
+Pasting into the chat input works too; multi-line pastes are delivered to
+sessions via bracketed paste so they arrive as one message.
+
+When an AI session stops on a permission dialog or y/n question, the prompt
+is posted into the chat transcript. `/yes` and `/no` answer the most recent
+request with the CLI's own keys (claude: `1`/Esc, codex: `y`/`n`); use
+`/yes <session>` or `/no <session>` to target a specific one, or type
+anything else with `@name <text>`.
 
 Local LLM agents are any OpenAI-compatible endpoint — llama.cpp server,
 Ollama, vLLM, LM Studio:
@@ -189,6 +202,9 @@ name = "agent"            # chat target: @agent ...
 # api_key = "..."          # else ANTHROPIC_API_KEY / OPENAI_API_KEY
 # system = "extra instructions"
 # hidden = true             # CLI class: keep the agent out of the session bar
+# permission_mode = "accept-edits"  # CLI class: start with safe auto-approval
+#                                   # flags (claude: --permission-mode acceptEdits,
+#                                   # codex: --full-auto); "default" disables
 # events = ["waiting", "error", "dead"]
 # event_cooldown_secs = 30
 ```
@@ -205,9 +221,13 @@ Two provider classes:
   against the 8-session limit — you talk to it through the chat pane and it
   replies through `linkshell-ctl chat`. Set `hidden = false` (or use
   `:orchestrator show|hide` at runtime) to give it a visible session tab.
-  If the hidden CLI hits a permission dialog or errors, the prompt is posted
-  to chat — answer it right there (`@agent 1`, `@agent y`); the reply is
-  typed into its terminal.
+  CLI-class orchestrators launch with `permission_mode = "accept-edits"` by
+  default — the CLI's own safe auto-approval flags — so routine edits don't
+  stop to ask. Bypass-style modes are rejected, same as
+  `--dangerously-skip-permissions` in session commands.
+  If the hidden CLI still hits a permission dialog or errors, the prompt is
+  posted to chat — answer it right there with `/yes` / `/no`, or type any
+  other reply with `@agent <text>`; it is typed into its terminal.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
 `:orchestrator start|stop|restart|status|show|hide` manages it at runtime

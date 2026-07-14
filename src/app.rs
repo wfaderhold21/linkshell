@@ -277,6 +277,12 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
     ),
     ("kill <session>", "Stop a session", "kill "),
     (
+        "yes [session]",
+        "Approve a pending permission prompt",
+        "yes ",
+    ),
+    ("no [session]", "Deny a pending permission prompt", "no "),
+    (
         "pipe <src> <dst> [options]",
         "Wire session output to another session",
         "pipe ",
@@ -408,6 +414,14 @@ pub struct App {
     pub command_bar_area: Rect,
     pub help_area: Rect,
     pub chat_area: Rect,
+    /// Transcript sub-rect of the chat pane (for mouse hit-testing).
+    pub chat_transcript_area: Rect,
+    /// Highest valid chat.scroll for the last-drawn transcript.
+    pub chat_scroll_max: usize,
+    /// Plain text of the transcript rows visible in the last draw, for copy.
+    pub chat_visible_lines: Vec<String>,
+    /// Mouse selection inside the chat transcript (content coordinates).
+    pub chat_selection: Option<Selection>,
     pub menu_bar_area: Rect,
     pub menu_item_areas: Vec<Rect>,
     pub menu_submenu_area: Rect,
@@ -441,6 +455,9 @@ pub struct App {
     pub orchestrator_stats: crate::session::TokenStats,
     /// Per-(session_id, state label) cooldown for proactive orchestrator events
     orch_event_cooldowns: HashMap<(usize, &'static str), std::time::Instant>,
+    /// Session behind the most recent permission request surfaced in chat;
+    /// `/yes` and `/no` without a target answer this one.
+    pub last_permission_request: Option<usize>,
     pub chat: ChatState,
     /// When true, key input is forwarded to all non-dead sessions
     pub broadcast_mode: bool,
@@ -502,6 +519,10 @@ impl App {
             command_bar_area: Rect::default(),
             help_area: Rect::default(),
             chat_area: Rect::default(),
+            chat_transcript_area: Rect::default(),
+            chat_scroll_max: 0,
+            chat_visible_lines: Vec::new(),
+            chat_selection: None,
             menu_bar_area: Rect::default(),
             menu_item_areas: Vec::new(),
             menu_submenu_area: Rect::default(),
@@ -522,6 +543,7 @@ impl App {
             pending_kill: None,
             orchestrator_stats: crate::session::TokenStats::default(),
             orch_event_cooldowns: HashMap::new(),
+            last_permission_request: None,
             chat: ChatState::default(),
             broadcast_mode: false,
             settings_state: SettingsState::new_empty(),
@@ -612,6 +634,26 @@ impl App {
 
     // ── Session management ─────────────────────────────────────────────────
 
+    /// The command line a session kind launches with, per config overrides.
+    pub fn resolved_command(&self, kind: &SessionKind) -> String {
+        match kind {
+            SessionKind::Claude => self.config.sessions.commands.claude.clone(),
+            SessionKind::Codex => self.config.sessions.commands.codex.clone(),
+            SessionKind::OpenCode => self.config.sessions.commands.opencode.clone(),
+            SessionKind::OhMyPi => self.config.sessions.commands.ohmypi.clone(),
+            SessionKind::Aider => self.config.sessions.commands.aider.clone(),
+            SessionKind::Shell => {
+                let c = &self.config.sessions.commands.shell;
+                if c.is_empty() {
+                    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+                } else {
+                    c.clone()
+                }
+            }
+            SessionKind::Custom(cmd) => cmd.clone(),
+        }
+    }
+
     pub fn spawn_session(
         &mut self,
         kind: SessionKind,
@@ -643,22 +685,7 @@ impl App {
         };
 
         // Resolve command from config overrides.
-        let cmd_str = match &kind {
-            SessionKind::Claude => self.config.sessions.commands.claude.clone(),
-            SessionKind::Codex => self.config.sessions.commands.codex.clone(),
-            SessionKind::OpenCode => self.config.sessions.commands.opencode.clone(),
-            SessionKind::OhMyPi => self.config.sessions.commands.ohmypi.clone(),
-            SessionKind::Aider => self.config.sessions.commands.aider.clone(),
-            SessionKind::Shell => {
-                let c = &self.config.sessions.commands.shell;
-                if c.is_empty() {
-                    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
-                } else {
-                    c.clone()
-                }
-            }
-            SessionKind::Custom(cmd) => cmd.clone(),
-        };
+        let cmd_str = self.resolved_command(&kind);
 
         // Safety: refuse any command containing forbidden flags.
         config::validate_command(&cmd_str).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1180,6 +1207,7 @@ impl App {
     ) {
         self.maybe_notify(session_id, before, after);
         self.notify_orchestrator(session_id, after);
+        self.surface_permission_request(session_id, after);
         self.check_pipes(session_id, after);
         self.check_chat_pending(session_id, after);
         let council_relays = if let Some(router) = &mut self.council {
@@ -1309,8 +1337,9 @@ impl App {
             .clone()
             .unwrap_or_else(|| s.read_tail(3).join(" "));
         let msg = if *new_state == SessionState::Waiting {
+            self.last_permission_request = Some(session_id);
             format!(
-                "@{} needs input: {} — reply \"@{} <answer>\" here, or /orchestrator show",
+                "@{} needs input: {} — /yes or /no here answers it, \"@{} <answer>\" types anything else, /orchestrator show inspects",
                 name, detail, name
             )
         } else {
@@ -1320,6 +1349,40 @@ impl App {
             )
         };
         self.chat_system(msg);
+    }
+
+    /// An AI session stopped on what looks like a permission / y-n prompt.
+    /// Mirror it into the chat pane so it can be answered there (/yes, /no,
+    /// or "@name <text>") without switching to the session.
+    fn surface_permission_request(&mut self, session_id: usize, new_state: &SessionState) {
+        if *new_state != SessionState::Waiting {
+            return;
+        }
+        let Some(s) = self.sessions.iter().find(|s| s.id == session_id) else {
+            return;
+        };
+        // The orchestrator's own prompts go through surface_orchestrator_prompt;
+        // non-AI sessions (shells) wait at their prompt all the time.
+        if s.is_orchestrator || s.base == crate::session::BaseKind::Other {
+            return;
+        }
+        let Some(prompt) = s.waiting_prompt.clone() else {
+            return;
+        };
+        let cooldown = std::time::Duration::from_secs(self.config.orchestrator.event_cooldown_secs);
+        if let Some(last) = self.orch_event_cooldowns.get(&(session_id, "perm-request")) {
+            if last.elapsed() < cooldown {
+                return;
+            }
+        }
+        self.orch_event_cooldowns
+            .insert((session_id, "perm-request"), std::time::Instant::now());
+        let name = s.name.clone();
+        self.last_permission_request = Some(session_id);
+        self.chat_system(format!(
+            "@{} is asking: {} — /yes {} or /no {} answers it (bare /yes answers the latest request)",
+            name, prompt, name, name
+        ));
     }
 
     fn check_pipes(&mut self, session_id: usize, new_state: &SessionState) {
@@ -1982,6 +2045,16 @@ impl App {
             crate::config::OrchestratorClass::Cli(kind_str) => {
                 let kind = crate::session::SessionKind::from_name(kind_str)
                     .ok_or_else(|| anyhow::anyhow!("unknown session kind: {}", kind_str))?;
+                // permission_mode: launch with the CLI's own safe auto-approval
+                // flags so the orchestrator isn't stopped by routine prompts.
+                let kind = match cfg.cli_permission_args(kind_str)? {
+                    Some(args) => crate::session::SessionKind::Custom(format!(
+                        "{} {}",
+                        self.resolved_command(&kind),
+                        args
+                    )),
+                    None => kind,
+                };
                 let id = self.next_id;
                 self.spawn_session(kind, cfg.name.clone(), cfg.cwd.clone())?;
                 // Upgrade from the default worker capset; the LINKSHELL_TOKEN
@@ -2321,8 +2394,21 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 match self.mode.clone() {
                     AppMode::Chat => {
-                        if !rect_hit(self.chat_area, col, row) {
+                        if rect_hit(self.chat_transcript_area, col, row) {
+                            // Begin transcript selection (borderless rect)
+                            let c = col - self.chat_transcript_area.x;
+                            let r = row - self.chat_transcript_area.y;
+                            self.chat_selection = Some(Selection {
+                                start_col: c,
+                                start_row: r,
+                                end_col: c,
+                                end_row: r,
+                            });
+                        } else if !rect_hit(self.chat_area, col, row) {
+                            self.chat_selection = None;
                             self.mode = AppMode::Normal;
+                        } else {
+                            self.chat_selection = None;
                         }
                         return;
                     }
@@ -2403,6 +2489,31 @@ impl App {
                     }
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) if matches!(self.mode, AppMode::Chat) => {
+                let area = self.chat_transcript_area;
+                if let Some(sel) = &mut self.chat_selection {
+                    sel.end_col = col.saturating_sub(area.x).min(area.width.saturating_sub(1));
+                    sel.end_row = row
+                        .saturating_sub(area.y)
+                        .min(area.height.saturating_sub(1));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if matches!(self.mode, AppMode::Chat) => {
+                // Finalize transcript selection; auto-copy like the panes
+                if let Some(sel) = &self.chat_selection {
+                    let ((mr, mc), (er, ec)) = sel.normalized();
+                    if mr == er && mc == ec {
+                        self.chat_selection = None;
+                    } else {
+                        self.copy_chat_selection();
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right)
+                if matches!(self.mode, AppMode::Chat) && self.chat_selection.is_some() =>
+            {
+                self.copy_chat_selection();
+            }
             MouseEventKind::Drag(MouseButton::Left)
                 if self
                     .output_areas
@@ -2432,7 +2543,11 @@ impl App {
                 self.copy_selection();
             }
             MouseEventKind::ScrollUp => {
-                if matches!(self.mode, AppMode::NewSession) {
+                if matches!(self.mode, AppMode::Chat) {
+                    if rect_hit(self.chat_area, col, row) {
+                        self.chat_scroll_up(3);
+                    }
+                } else if matches!(self.mode, AppMode::NewSession) {
                     self.new_session_select_kind(-1);
                 } else if self.focus_pane_at(col, row) {
                     self.scroll_up(3);
@@ -2441,7 +2556,11 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if matches!(self.mode, AppMode::NewSession) {
+                if matches!(self.mode, AppMode::Chat) {
+                    if rect_hit(self.chat_area, col, row) {
+                        self.chat_scroll_down(3);
+                    }
+                } else if matches!(self.mode, AppMode::NewSession) {
                     self.new_session_select_kind(1);
                 } else if self.focus_pane_at(col, row) {
                     self.scroll_down(3);
@@ -2622,10 +2741,47 @@ impl App {
         Some(text)
     }
 
+    /// Text covered by the chat transcript selection, from the plain-text
+    /// snapshot of the rows visible in the last draw.
+    fn chat_selected_text(&self) -> Option<String> {
+        let sel = self.chat_selection.as_ref()?;
+        let ((min_row, min_col), (max_row, max_col)) = sel.normalized();
+        let mut out: Vec<String> = Vec::new();
+        for row in min_row..=max_row {
+            let Some(line) = self.chat_visible_lines.get(row as usize) else {
+                continue;
+            };
+            let chars: Vec<char> = line.chars().collect();
+            let start = if row == min_row { min_col as usize } else { 0 };
+            let end = if row == max_row {
+                (max_col as usize + 1).min(chars.len())
+            } else {
+                chars.len()
+            };
+            let slice: String = chars
+                .get(start.min(chars.len())..end)
+                .unwrap_or(&[])
+                .iter()
+                .collect();
+            out.push(slice.trim_end().to_string());
+        }
+        Some(out.join("\n"))
+    }
+
+    fn copy_chat_selection(&mut self) {
+        if let Some(text) = self.chat_selected_text().filter(|t| !t.trim().is_empty()) {
+            self.copy_text(text);
+        }
+    }
+
     fn copy_selection(&mut self) {
         let Some(text) = self.selected_text().filter(|t| !t.is_empty()) else {
             return;
         };
+        self.copy_text(text);
+    }
+
+    fn copy_text(&mut self, text: String) {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
@@ -3154,6 +3310,10 @@ impl App {
             }
             ["confirm-kill"] => self.resolve_pending_kill(true),
             ["deny-kill"] => self.resolve_pending_kill(false),
+            ["yes"] => self.answer_permission(None, true),
+            ["yes", t] => self.answer_permission(Some(t), true),
+            ["no"] => self.answer_permission(None, false),
+            ["no", t] => self.answer_permission(Some(t), false),
             _ => {}
         }
     }
@@ -3634,6 +3794,7 @@ pub const MENU: &[(&str, &[&str])] = &[
 
 impl App {
     pub fn toggle_chat(&mut self) {
+        self.chat_selection = None;
         self.mode = if matches!(self.mode, AppMode::Chat) {
             AppMode::Normal
         } else {
@@ -3644,7 +3805,10 @@ impl App {
     pub fn chat_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
         match key.code {
-            KeyCode::Esc => self.mode = AppMode::Normal,
+            KeyCode::Esc => {
+                self.chat_selection = None;
+                self.mode = AppMode::Normal;
+            }
             KeyCode::Enter => self.chat_send(),
             KeyCode::Backspace if self.chat.cursor > 0 => {
                 let mut i = self.chat.cursor - 1;
@@ -3668,14 +3832,36 @@ impl App {
                 }
                 self.chat.cursor = i;
             }
-            KeyCode::PageUp => self.chat.scroll += 10,
-            KeyCode::PageDown => self.chat.scroll = self.chat.scroll.saturating_sub(10),
+            KeyCode::PageUp => self.chat_scroll_up(10),
+            KeyCode::PageDown => self.chat_scroll_down(10),
             KeyCode::Char(c) => {
                 self.chat.input.insert(self.chat.cursor, c);
                 self.chat.cursor += c.len_utf8();
             }
             _ => {}
         }
+    }
+
+    pub fn chat_scroll_up(&mut self, lines: usize) {
+        self.chat.scroll = (self.chat.scroll + lines).min(self.chat_scroll_max);
+    }
+
+    pub fn chat_scroll_down(&mut self, lines: usize) {
+        self.chat.scroll = self.chat.scroll.saturating_sub(lines);
+    }
+
+    /// Insert pasted text into the chat input at the cursor. Newlines are
+    /// kept (rendered as ⏎; sent via bracketed paste); other control
+    /// characters are dropped.
+    pub fn chat_paste(&mut self, text: &str) {
+        let cleaned: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect();
+        self.chat.input.insert_str(self.chat.cursor, &cleaned);
+        self.chat.cursor += cleaned.len();
     }
 
     fn chat_system(&mut self, text: impl Into<String>) {
@@ -3876,10 +4062,83 @@ impl App {
         }
     }
 
+    /// Answer a pending permission / y-n prompt in a session with the CLI's
+    /// own keys (claude: `1` / Esc, codex: `y` / `n`, others: `y⏎` / `n⏎`).
+    /// Without a target, answers the request most recently surfaced in chat.
+    fn answer_permission(&mut self, target: Option<&str>, approve: bool) {
+        let id = match target {
+            Some(t) => {
+                let by_number = t
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|p| self.visible_to_idx(p));
+                let found = self
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, s)| s.name == t || by_number == Some(*idx))
+                    .map(|(_, s)| s.id);
+                match found {
+                    Some(id) => id,
+                    None => {
+                        self.command_result = format!("no session '{}'", t);
+                        return;
+                    }
+                }
+            }
+            None => match self
+                .last_permission_request
+                .filter(|id| self.sessions.iter().any(|s| s.id == *id))
+            {
+                Some(id) => id,
+                None => {
+                    self.command_result =
+                        "no pending permission request — use yes/no <session>".to_string();
+                    return;
+                }
+            },
+        };
+        let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        if s.state != SessionState::Waiting {
+            self.command_result = format!(
+                "@{} isn't waiting on a prompt (state: {})",
+                s.name,
+                s.state.label()
+            );
+            return;
+        }
+        let bytes: &[u8] = match (&s.base, approve) {
+            (crate::session::BaseKind::Claude, true) => b"1",
+            (crate::session::BaseKind::Claude, false) => b"\x1b",
+            (crate::session::BaseKind::Codex, true) => b"y",
+            (crate::session::BaseKind::Codex, false) => b"n",
+            (_, true) => b"y\r",
+            (_, false) => b"n\r",
+        };
+        s.write_bytes(bytes.to_vec());
+        let name = s.name.clone();
+        if self.last_permission_request == Some(id) {
+            self.last_permission_request = None;
+        }
+        self.command_result = format!("sent {} to @{}", if approve { "yes" } else { "no" }, name);
+    }
+
     /// Inject a chat message into a session's PTY and await its READY reply.
     fn send_chat_to_session(&mut self, id: usize, name: String, msg: &str) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
-            let mut bytes = msg.as_bytes().to_vec();
+            // Multi-line messages (pastes) go through bracketed paste so the
+            // target CLI doesn't submit at each embedded newline.
+            let mut bytes = Vec::with_capacity(msg.len() + 13);
+            if msg.contains('\n') {
+                bytes.extend_from_slice(b"\x1b[200~");
+                bytes.extend_from_slice(msg.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+            } else {
+                bytes.extend_from_slice(msg.as_bytes());
+            }
             bytes.push(b'\r');
             s.write_bytes(bytes);
         }
@@ -4758,6 +5017,112 @@ mod tests {
 
     fn cursor_pos(app: &App) -> usize {
         app.new_session_state.cursor_pos()
+    }
+
+    #[test]
+    fn chat_paste_inserts_at_cursor_and_normalizes_newlines() {
+        let mut app = make_app();
+        app.chat.input = "ab".into();
+        app.chat.cursor = 1;
+        app.chat_paste("x\r\ny\tz");
+        assert_eq!(app.chat.input, "ax\nyzb");
+        assert_eq!(app.chat.cursor, 5);
+    }
+
+    #[test]
+    fn chat_scroll_clamps_to_last_drawn_max() {
+        let mut app = make_app();
+        app.chat_scroll_max = 7;
+        app.chat_scroll_up(10);
+        assert_eq!(app.chat.scroll, 7);
+        app.chat_scroll_down(3);
+        assert_eq!(app.chat.scroll, 4);
+    }
+
+    #[test]
+    fn chat_selection_extracts_visible_text_by_char_columns() {
+        let mut app = make_app();
+        app.chat_visible_lines = vec![
+            "you: hello there".into(),
+            "agent: hi".into(),
+            "linkshell: note".into(),
+        ];
+        app.chat_selection = Some(Selection {
+            start_col: 5,
+            start_row: 0,
+            end_col: 7,
+            end_row: 1,
+        });
+        assert_eq!(app.chat_selected_text().unwrap(), "hello there\nagent: h");
+    }
+
+    #[test]
+    fn chat_multiline_message_is_sent_via_bracketed_paste() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("worker".into(), None).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        app.sessions[0].pty_writer = Some(tx);
+        assert_eq!(app.sessions[0].id, id);
+
+        app.chat.input = "@worker line1\nline2".into();
+        app.chat_send();
+
+        let sent = rx.try_recv().unwrap();
+        assert_eq!(sent, b"\x1b[200~line1\nline2\x1b[201~\r".to_vec());
+    }
+
+    #[test]
+    fn yes_no_commands_answer_with_cli_specific_keys() {
+        let mut app = make_app();
+        app.spawn_headless_session("coder".into(), None).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        app.sessions[0].pty_writer = Some(tx);
+        app.sessions[0].base = crate::session::BaseKind::Claude;
+        app.sessions[0].state = SessionState::Waiting;
+        let id = app.sessions[0].id;
+
+        // Bare /yes answers the most recently surfaced request
+        app.last_permission_request = Some(id);
+        app.command_input = "yes".into();
+        app.execute_command();
+        assert_eq!(rx.try_recv().unwrap(), b"1".to_vec());
+        assert_eq!(app.last_permission_request, None);
+
+        // Targeted /no on a codex-based session sends 'n'
+        app.sessions[0].base = crate::session::BaseKind::Codex;
+        app.command_input = "no coder".into();
+        app.execute_command();
+        assert_eq!(rx.try_recv().unwrap(), b"n".to_vec());
+    }
+
+    #[test]
+    fn yes_command_refuses_sessions_that_are_not_waiting() {
+        let mut app = make_app();
+        app.spawn_headless_session("coder".into(), None).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        app.sessions[0].pty_writer = Some(tx);
+        app.sessions[0].state = SessionState::Ready;
+
+        app.command_input = "yes coder".into();
+        app.execute_command();
+        assert!(rx.try_recv().is_err());
+        assert!(app.command_result.contains("isn't waiting"));
+    }
+
+    #[test]
+    fn waiting_ai_session_surfaces_permission_request_in_chat() {
+        let mut app = make_app();
+        app.spawn_headless_session("coder".into(), None).unwrap();
+        app.sessions[0].base = crate::session::BaseKind::Claude;
+        app.sessions[0].waiting_prompt = Some("Allow Bash(cargo test)?".into());
+        let id = app.sessions[0].id;
+
+        app.surface_permission_request(id, &SessionState::Waiting);
+
+        assert_eq!(app.last_permission_request, Some(id));
+        let last = app.chat.messages.last().unwrap();
+        assert!(last.text.contains("Allow Bash(cargo test)?"));
+        assert!(last.text.contains("/yes coder"));
     }
 
     #[test]

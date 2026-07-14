@@ -22,6 +22,9 @@ pub struct LayoutInfo {
     pub command_bar_area: Rect,
     pub help_area: Rect,
     pub chat_area: Rect,
+    pub chat_transcript_area: Rect,
+    pub chat_scroll_max: usize,
+    pub chat_visible_lines: Vec<String>,
     pub menu_bar_area: Rect,
     pub menu_item_areas: Vec<Rect>,
     pub menu_submenu_area: Rect,
@@ -187,6 +190,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let mut command_bar_area = Rect::default();
     let mut help_area = Rect::default();
     let mut chat_area = Rect::default();
+    let mut chat_layout = ChatLayout::default();
 
     match &app.mode {
         AppMode::NewSession => {
@@ -213,7 +217,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             help_area = draw_pipe_list(f, app, size);
         }
         AppMode::Chat => {
-            chat_area = draw_chat(f, app, size);
+            chat_layout = draw_chat(f, app, size);
+            chat_area = chat_layout.area;
         }
         AppMode::Menu { .. } => {
             let menu = draw_menu_bar(f, app, menu_bar_area);
@@ -241,6 +246,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         command_bar_area,
         help_area,
         chat_area,
+        chat_transcript_area: chat_layout.transcript_area,
+        chat_scroll_max: chat_layout.scroll_max,
+        chat_visible_lines: chat_layout.visible_lines,
         menu_bar_area,
         menu_item_areas,
         menu_submenu_area,
@@ -1168,7 +1176,41 @@ fn chat_from_style(from: &str) -> Style {
     }
 }
 
-fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+#[derive(Default)]
+struct ChatLayout {
+    area: Rect,
+    transcript_area: Rect,
+    scroll_max: usize,
+    visible_lines: Vec<String>,
+}
+
+/// Overlay REVERSED onto the char columns of `line` covered by the selection
+/// on this row. `from`/`to` are inclusive char columns; `None` means the
+/// selection extends past that edge of the row.
+fn highlight_line(line: Line<'static>, from: Option<usize>, to: Option<usize>) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = 0usize;
+    for span in line.spans {
+        let style = span.style;
+        for c in span.content.chars() {
+            let selected =
+                from.map(|s| col >= s).unwrap_or(true) && to.map(|e| col <= e).unwrap_or(true);
+            let style = if selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            };
+            match spans.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push(c),
+                _ => spans.push(Span::styled(c.to_string(), style)),
+            }
+            col += 1;
+        }
+    }
+    Line::from(spans)
+}
+
+fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
     let popup = centered_rect(86, 86, area);
     f.render_widget(Clear, popup);
 
@@ -1204,11 +1246,20 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     };
     let prompt_style = Style::default().fg(Color::Cyan);
     let cursor_style = Style::default().fg(Color::Black).bg(Color::White);
+    // Pasted newlines stay in the string but render as a single '⏎' glyph so
+    // the char↔cell math below holds.
+    let display = |c: char, style: Style| {
+        if c == '\n' {
+            ('⏎', style.patch(Style::default().fg(Color::DarkGray)))
+        } else {
+            (c, style)
+        }
+    };
     let mut input_chars: Vec<(char, Style)> = Vec::new();
     input_chars.extend("❯ ".chars().map(|c| (c, prompt_style)));
-    input_chars.extend(before.chars().map(|c| (c, Style::default())));
-    input_chars.extend(cursor_ch.chars().map(|c| (c, cursor_style)));
-    input_chars.extend(after.chars().map(|c| (c, Style::default())));
+    input_chars.extend(before.chars().map(|c| display(c, Style::default())));
+    input_chars.extend(cursor_ch.chars().map(|c| display(c, cursor_style)));
+    input_chars.extend(after.chars().map(|c| display(c, Style::default())));
 
     let cols = width.max(1);
     let total_rows = input_chars.len().div_ceil(cols).max(1);
@@ -1248,12 +1299,37 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
 
     // Window: scroll counts lines up from the tail
     let total = lines.len();
-    let end = total.saturating_sub(app.chat.scroll.min(total));
+    let scroll_max = total.saturating_sub(transcript_h);
+    let end = total.saturating_sub(app.chat.scroll.min(scroll_max));
     let start = end.saturating_sub(transcript_h);
+    let visible_lines: Vec<String> = lines[start..end]
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    // Mouse selection highlight (content coordinates within the window)
+    let sel = app.chat_selection.as_ref().map(|s| s.normalized());
     let items: Vec<ListItem> = lines[start..end]
         .iter()
         .cloned()
-        .map(ListItem::new)
+        .enumerate()
+        .map(|(row, line)| {
+            let row = row as u16;
+            match sel {
+                Some(((min_row, min_col), (max_row, max_col)))
+                    if row >= min_row && row <= max_row =>
+                {
+                    let from = (row == min_row).then_some(min_col as usize);
+                    let to = (row == max_row).then_some(max_col as usize);
+                    ListItem::new(highlight_line(line, from, to))
+                }
+                _ => ListItem::new(line),
+            }
+        })
         .collect();
     let transcript = Rect {
         x: inner.x,
@@ -1270,9 +1346,19 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         width: inner.width,
         height: 1,
     };
+    let sep_text = if app.chat.scroll > 0 {
+        let label = format!(
+            "─ ↓ {} more line(s) below ",
+            app.chat.scroll.min(scroll_max)
+        );
+        let pad = (inner.width as usize).saturating_sub(label.chars().count());
+        format!("{}{}", label, "─".repeat(pad))
+    } else {
+        "─".repeat(inner.width as usize)
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "─".repeat(inner.width as usize),
+            sep_text,
             Style::default().fg(Color::DarkGray),
         ))),
         sep,
@@ -1301,7 +1387,12 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         .collect();
     f.render_widget(Paragraph::new(input_lines), input_area);
 
-    popup
+    ChatLayout {
+        area: popup,
+        transcript_area: transcript,
+        scroll_max,
+        visible_lines,
+    }
 }
 
 // ── Command bar ────────────────────────────────────────────────────────────
