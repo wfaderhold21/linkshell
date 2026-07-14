@@ -360,7 +360,8 @@ Use the `linkshell-ctl` CLI (already authorized via your environment):\n\
   linkshell-ctl pipe add <src> <dst> [--extract=X] [--trigger=X]\n\
   linkshell-ctl kill <id> [reason]                # only ASKS the user; they must /confirm-kill\n\
   linkshell-ctl chat <message>                    # speak to the user in the chat pane\n\
-Session ids here are the raw `id` field from `list`; the user sees id+1 in the UI.\n\
+Session ids here are the raw `id` field from `list`; when talking to the user, use the \
+`display` number from `list` — that is what they see in the UI.\n\
 ALWAYS reply to the user with `linkshell-ctl chat` — plain text you print may not reach them. \
 Keep chat messages short.\n\
 Lines arriving that start with [linkshell event] mean a session changed state \

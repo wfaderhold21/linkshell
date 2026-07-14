@@ -157,10 +157,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         .sessions
         .iter()
         .filter(|session| {
-            session.state == SessionState::Waiting && session.waiting_prompt.is_some()
+            !session.hidden
+                && session.state == SessionState::Waiting
+                && session.waiting_prompt.is_some()
         })
         .count() as u16;
-    let desired_status_rows = app.sessions.len().max(1) as u16 + 4 + previews;
+    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + previews;
     let status_rows = desired_status_rows.min((body.height / 3).max(4));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -354,7 +356,10 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
 // ── Session bar ────────────────────────────────────────────────────────────
 
 fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
-    let n = app.sessions.len();
+    // Slots (and the returned click rects) cover visible sessions only;
+    // mouse handling maps a slot position back through visible_to_idx.
+    let visible = app.visible_indices();
+    let n = visible.len();
 
     // outer block
     let outer = Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
@@ -392,7 +397,8 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let total_w = slot_w * n as u16;
     let offset_x = inner.x + (inner.width.saturating_sub(total_w)) / 2;
 
-    for (i, session) in app.sessions.iter().enumerate() {
+    for (i, &idx) in visible.iter().enumerate() {
+        let session = &app.sessions[idx];
         let slot = Rect {
             x: offset_x + i as u16 * slot_w,
             y: inner.y,
@@ -400,8 +406,8 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             height: inner.height,
         };
 
-        let is_active = app.active_idx() == Some(i);
-        let is_visible = app.panes.contains(&Some(i));
+        let is_active = app.active_idx() == Some(idx);
+        let is_visible = app.panes.contains(&Some(idx));
         let label = format!("{} {}", i + 1, session.kind.label());
         let color = kind_color(&session.kind);
         let border_style = state_border_style(&session.state, is_active);
@@ -518,7 +524,10 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
     let mut row_areas = Vec::new();
     let mut row_y = inner.y + 1;
-    for (i, session) in app.sessions.iter().enumerate() {
+    // Rows (and the returned click rects) cover visible sessions only, in
+    // the same order as the session bar slots.
+    for (i, idx) in app.visible_indices().into_iter().enumerate() {
+        let session = &app.sessions[idx];
         if row_y >= inner.y + inner.height {
             break;
         }

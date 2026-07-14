@@ -548,7 +548,13 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::Quit => app.should_quit = true,
                     Action::PrevSession => app.prev_session(),
                     Action::NextSession => app.next_session(),
-                    Action::SwitchSession(i) => app.switch_to(i),
+                    Action::SwitchSession(i) => {
+                        // Alt+N addresses the N-th visible session; a hidden
+                        // orchestrator session doesn't consume a digit.
+                        if let Some(idx) = app.visible_to_idx(i) {
+                            app.switch_to(idx);
+                        }
+                    }
                     Action::ScrollUpPage => app.scroll_up(20),
                     Action::ScrollDownPage => app.scroll_down(20),
                     Action::ScrollUpLine => app.scroll_up(3),

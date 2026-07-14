@@ -231,6 +231,10 @@ pub struct Session {
     /// True for the resident CLI-class orchestrator session: excluded from
     /// @all broadcasts and from proactive orchestrator events about itself.
     pub is_orchestrator: bool,
+    /// Not shown in the session bar / status panel and unreachable by
+    /// session switching. Still fully alive (PTY, state inference, IPC);
+    /// used for the CLI-class orchestrator so it lives behind the chat pane.
+    pub hidden: bool,
     /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
     /// Cleared when pattern matching updates the state from PTY output.
     pub ipc_state: bool,
@@ -307,6 +311,7 @@ impl Session {
             last_notified: None,
             headless: false,
             is_orchestrator: false,
+            hidden: false,
             ipc_state: false,
             ipc_state_set_at: None,
             group: None,
@@ -344,6 +349,31 @@ impl Session {
         if self.output_lines.len() > self.scroll_buffer_lines {
             self.output_lines.pop_front();
         }
+    }
+
+    /// Session output as readable lines, for programmatic consumers
+    /// (orchestrator tools, `linkshell-ctl read`, pipe extraction).
+    ///
+    /// Full-screen TUIs (claude, codex, opencode, …) live on the alternate
+    /// screen and repaint via cursor movement and bare `\r`, so the
+    /// newline-split `output_lines` buffer is sparse repaint noise for them.
+    /// For those, render the current vt100 screen — exactly what the user
+    /// sees. Line-oriented sessions (shells) keep their full line history.
+    pub fn readable_lines(&self) -> Vec<String> {
+        if self.screen.screen().alternate_screen() {
+            let contents = self.screen.screen().contents();
+            clean_tui_lines(contents.lines())
+        } else {
+            self.output_lines.iter().cloned().collect()
+        }
+    }
+
+    /// The last `n` readable lines (see `readable_lines`).
+    pub fn read_tail(&self, n: usize) -> Vec<String> {
+        let mut lines = self.readable_lines();
+        let start = lines.len().saturating_sub(n);
+        lines.drain(..start);
+        lines
     }
 
     pub fn elapsed_secs(&self) -> u64 {
@@ -437,6 +467,64 @@ impl Session {
     }
 }
 
+/// Reduce a rendered TUI screen to its meaningful content for programmatic
+/// readers and the chat pane. Drops window chrome — box-drawing borders,
+/// the empty input box, keyboard-hint footers — and collapses blank runs,
+/// while keeping real content: text, code, diffs, and permission dialogs
+/// (their "❯ 1. Yes" options carry text, so they survive).
+pub fn clean_tui_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    const BORDER: &str = "─│╭╮╰╯┌┐└┘├┤┬┴┼━┃═║╔╗╚╝╠╣▔▁";
+    fn is_chrome(line: &str) -> bool {
+        let t = line.trim();
+        if t.is_empty() {
+            return false; // blanks are separators, handled by the caller
+        }
+        // Border-only rows and the empty input prompt
+        if t.chars().all(|c| BORDER.contains(c) || c.is_whitespace()) {
+            return true;
+        }
+        if matches!(t, "❯" | ">" | "›") {
+            return true;
+        }
+        // Keyboard-hint footers ("? for shortcuts", "esc to interrupt", …)
+        let lower = t.to_ascii_lowercase();
+        [
+            "? for shortcuts",
+            "esc to interrupt",
+            "esc to cancel",
+            "shift+tab to cycle",
+            "ctrl+c to quit",
+        ]
+        .iter()
+        .any(|hint| lower.contains(hint))
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        if is_chrome(line) {
+            continue;
+        }
+        // Strip framing borders at the edges, keep inner content
+        let stripped = line
+            .trim_end()
+            .trim_start_matches(['│', '┃', '║'])
+            .trim_end_matches(['│', '┃', '║'])
+            .trim_end();
+        if stripped.trim().is_empty() {
+            // Collapse blank runs to a single separator
+            if out.last().is_some_and(|l| !l.is_empty()) {
+                out.push(String::new());
+            }
+            continue;
+        }
+        out.push(stripped.to_string());
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
 pub fn extract_waiting_prompt(lines: &VecDeque<String>) -> Option<String> {
     lines
         .iter()
@@ -513,6 +601,58 @@ mod tests {
         assert_eq!(s.state, SessionState::Starting);
         assert!(!s.headless);
         assert_eq!(s.screen.screen().size(), (PTY_ROWS, PTY_COLS));
+    }
+
+    #[test]
+    fn read_tail_uses_line_history_on_the_normal_screen() {
+        let mut s = session(SessionKind::Shell);
+        for i in 0..10 {
+            s.push_output_line(format!("line-{i}"));
+        }
+        assert_eq!(s.read_tail(3), vec!["line-7", "line-8", "line-9"]);
+    }
+
+    #[test]
+    fn read_tail_renders_the_screen_for_alternate_screen_tuis() {
+        let mut s = session(SessionKind::Claude);
+        // TUI-style output: enter the alternate screen, then paint with
+        // cursor positioning — no newline-terminated lines ever arrive.
+        s.process_bytes(b"\x1b[?1049h\x1b[1;1Hfirst row\x1b[2;1Hsecond row");
+        assert!(s.output_lines.is_empty());
+
+        let tail = s.read_tail(50);
+        assert_eq!(tail, vec!["first row", "second row"]);
+        // Bounded by n, taking the last lines
+        assert_eq!(s.read_tail(1), vec!["second row"]);
+    }
+
+    #[test]
+    fn clean_tui_lines_drops_chrome_and_keeps_dialogs_and_content() {
+        let screen = [
+            "╭──────────────────────────────╮",
+            "│ Do you want to run this command? │",
+            "│                              │",
+            "│ ❯ 1. Yes                     │",
+            "│   2. No, tell Claude what to do │",
+            "╰──────────────────────────────╯",
+            "",
+            "",
+            "⏺ I'll update the parser now.",
+            "",
+            "❯",
+            "  ? for shortcuts",
+        ];
+        let cleaned = clean_tui_lines(screen.iter().copied());
+        assert_eq!(
+            cleaned,
+            vec![
+                " Do you want to run this command?",
+                " ❯ 1. Yes",
+                "   2. No, tell Claude what to do",
+                "",
+                "⏺ I'll update the parser now.",
+            ]
+        );
     }
 
     #[test]

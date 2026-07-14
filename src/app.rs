@@ -541,6 +541,28 @@ impl App {
         self.panes[self.focused_pane]
     }
 
+    /// Indices into `sessions` of the sessions the user can see and switch
+    /// to. A hidden orchestrator session is excluded everywhere the user
+    /// addresses sessions by position (session bar, Alt+N, `kill <n>`).
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.hidden)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Map a 0-based visible position (what the user sees in the bar) to a
+    /// real index into `sessions`.
+    pub fn visible_to_idx(&self, pos: usize) -> Option<usize> {
+        self.visible_indices().get(pos).copied()
+    }
+
+    fn visible_count(&self) -> usize {
+        self.sessions.iter().filter(|s| !s.hidden).count()
+    }
+
     pub fn apply_profile(&mut self, profile: &config::Profile) -> anyhow::Result<()> {
         let mut ids = HashMap::new();
         for profile_session in &profile.sessions {
@@ -596,7 +618,7 @@ impl App {
         name: String,
         cwd: String,
     ) -> anyhow::Result<()> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.visible_count() >= MAX_SESSIONS {
             return Err(anyhow::anyhow!("Maximum {} sessions reached", MAX_SESSIONS));
         }
 
@@ -813,7 +835,7 @@ impl App {
         name: String,
         group: Option<String>,
     ) -> anyhow::Result<usize> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.visible_count() >= MAX_SESSIONS {
             return Err(anyhow::anyhow!("Maximum {} sessions reached", MAX_SESSIONS));
         }
         let id = self.next_id;
@@ -873,13 +895,19 @@ impl App {
         }
         if self.layout == LayoutMode::Single && self.panes[0].is_none() && !self.sessions.is_empty()
         {
-            self.panes[0] = Some(idx.min(self.sessions.len() - 1));
+            // Fall back to the nearest visible session, if any remain.
+            let target = idx.min(self.sessions.len() - 1);
+            self.panes[0] = self
+                .visible_indices()
+                .into_iter()
+                .min_by_key(|i| i.abs_diff(target));
         }
     }
 
     pub fn switch_to(&mut self, idx: usize) {
         let other = self.focused_pane ^ 1;
         if idx < self.sessions.len()
+            && !self.sessions[idx].hidden
             && (self.layout == LayoutMode::Single || self.panes[other] != Some(idx))
         {
             self.panes[self.focused_pane] = Some(idx);
@@ -931,8 +959,10 @@ impl App {
             LayoutMode::Single => {
                 self.layout = LayoutMode::SplitV;
                 if self.panes[1].is_none() {
-                    self.panes[1] =
-                        (0..self.sessions.len()).find(|idx| Some(*idx) != self.panes[0]);
+                    self.panes[1] = self
+                        .visible_indices()
+                        .into_iter()
+                        .find(|idx| Some(*idx) != self.panes[0]);
                 }
             }
             LayoutMode::SplitV => {
@@ -1132,23 +1162,37 @@ impl App {
 
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
-                self.maybe_notify(session_id, &before, &after);
-                self.notify_orchestrator(session_id, &after);
-                self.check_pipes(session_id, &after);
-                self.check_chat_pending(session_id, &after);
-                let council_relays = if let Some(router) = &mut self.council {
-                    router.on_state(&self.sessions, session_id, &after)
-                } else {
-                    vec![]
-                };
-                for (dest, payload) in council_relays {
-                    self.handle_pipe_relay(dest, payload);
-                }
-                self.check_ipc_replies(session_id, &after);
-                if after == SessionState::Ready {
-                    self.flush_pending_relays(session_id);
-                }
+                self.on_state_transition(session_id, &before, &after);
             }
+        }
+    }
+
+    /// Everything that reacts to a session state transition. Every path that
+    /// changes session state (complete lines, partial lines, IPC overrides)
+    /// must funnel through here — a consumer wired into only some paths gets
+    /// subtle misses, e.g. wait-ready replies never resolving because shell
+    /// prompts arrive as partial lines.
+    fn on_state_transition(
+        &mut self,
+        session_id: usize,
+        before: &SessionState,
+        after: &SessionState,
+    ) {
+        self.maybe_notify(session_id, before, after);
+        self.notify_orchestrator(session_id, after);
+        self.check_pipes(session_id, after);
+        self.check_chat_pending(session_id, after);
+        let council_relays = if let Some(router) = &mut self.council {
+            router.on_state(&self.sessions, session_id, after)
+        } else {
+            vec![]
+        };
+        for (dest, payload) in council_relays {
+            self.handle_pipe_relay(dest, payload);
+        }
+        self.check_ipc_replies(session_id, after);
+        if *after == SessionState::Ready {
+            self.flush_pending_relays(session_id);
         }
     }
 
@@ -1159,6 +1203,7 @@ impl App {
             return;
         }
         if self.orchestrator_session_id == Some(session_id) {
+            self.surface_orchestrator_prompt(session_id, new_state);
             return;
         }
         let state_key: &'static str = match new_state {
@@ -1230,6 +1275,51 @@ impl App {
             );
             self.handle_pipe_relay(orch_id, format!("\x1b[200~{}\x1b[201~\r", msg));
         }
+    }
+
+    /// The orchestrator session itself blocked on a prompt (permission
+    /// dialog, y/n question) or errored. Nobody watches the watcher, and
+    /// when hidden it has no session-bar slot to flag WAITING — surface it
+    /// in the chat pane instead. A chat reply addressed to it ("@name 1",
+    /// "@name y") types straight into its terminal, so prompts can be
+    /// answered without ever showing the session.
+    fn surface_orchestrator_prompt(&mut self, session_id: usize, new_state: &SessionState) {
+        let state_key: &'static str = match new_state {
+            SessionState::Waiting => "orch-self-waiting",
+            SessionState::Error => "orch-self-error",
+            _ => return,
+        };
+        let Some(s) = self.sessions.iter().find(|s| s.id == session_id) else {
+            return;
+        };
+        if !s.hidden {
+            return; // visible sessions already flag WAITING in the bar
+        }
+        let cooldown = std::time::Duration::from_secs(self.config.orchestrator.event_cooldown_secs);
+        if let Some(last) = self.orch_event_cooldowns.get(&(session_id, state_key)) {
+            if last.elapsed() < cooldown {
+                return;
+            }
+        }
+        self.orch_event_cooldowns
+            .insert((session_id, state_key), std::time::Instant::now());
+        let name = s.name.clone();
+        let detail = s
+            .waiting_prompt
+            .clone()
+            .unwrap_or_else(|| s.read_tail(3).join(" "));
+        let msg = if *new_state == SessionState::Waiting {
+            format!(
+                "@{} needs input: {} — reply \"@{} <answer>\" here, or /orchestrator show",
+                name, detail, name
+            )
+        } else {
+            format!(
+                "@{} hit an error: {} — /orchestrator show to inspect, /orchestrator restart to recover",
+                name, detail
+            )
+        };
+        self.chat_system(msg);
     }
 
     fn check_pipes(&mut self, session_id: usize, new_state: &SessionState) {
@@ -1350,9 +1440,7 @@ impl App {
 
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
-                self.maybe_notify(session_id, &before, &after);
-                self.notify_orchestrator(session_id, &after);
-                self.check_pipes(session_id, &after);
+                self.on_state_transition(session_id, &before, &after);
             }
         }
     }
@@ -1383,23 +1471,11 @@ impl App {
             session.ipc_state_set_at = Some(std::time::Instant::now());
         }
         if old.as_ref() != Some(&state) {
-            if let Some(old) = old.as_ref() {
-                self.maybe_notify(session_id, old, &state);
-            }
-            self.notify_orchestrator(session_id, &state);
-            self.check_pipes(session_id, &state);
-            self.check_chat_pending(session_id, &state);
-            let council_relays = if let Some(router) = &mut self.council {
-                router.on_state(&self.sessions, session_id, &state)
-            } else {
-                vec![]
-            };
-            for (dest, payload) in council_relays {
-                self.handle_pipe_relay(dest, payload);
-            }
-            self.check_ipc_replies(session_id, &state);
-            if state == SessionState::Ready {
-                self.flush_pending_relays(session_id);
+            match old {
+                Some(old) => self.on_state_transition(session_id, &old, &state),
+                // No previous state (unknown session): run the hooks anyway,
+                // passing the new state as "before" so notify sees no change.
+                None => self.on_state_transition(session_id, &state.clone(), &state),
             }
         }
     }
@@ -1762,11 +1838,20 @@ impl App {
             return;
         }
         if let Some((resp_tx, line_offset)) = self.pending_ipc_replies.remove(&session_id) {
+            // Line-oriented sessions answer with the output since the input
+            // was sent; alt-screen TUIs repaint in place (the line delta is
+            // repaint noise), so return the rendered screen instead.
             let lines: Vec<String> = self
                 .sessions
                 .iter()
                 .find(|s| s.id == session_id)
-                .map(|s| s.output_lines.iter().skip(line_offset).cloned().collect())
+                .map(|s| {
+                    if s.screen.screen().alternate_screen() {
+                        s.read_tail(50)
+                    } else {
+                        s.output_lines.iter().skip(line_offset).cloned().collect()
+                    }
+                })
                 .unwrap_or_default();
             let _ = resp_tx.send(serde_json::json!({
                 "session_id": session_id,
@@ -1851,16 +1936,7 @@ impl App {
                     what if what.starts_with("output:") => match parse_output_query(what) {
                         Some((sid, n)) => match self.sessions.iter().find(|s| s.id == sid) {
                             Some(s) => {
-                                let lines: Vec<&String> = s
-                                    .output_lines
-                                    .iter()
-                                    .rev()
-                                    .take(n)
-                                    .collect::<Vec<_>>()
-                                    .into_iter()
-                                    .rev()
-                                    .collect();
-                                serde_json::json!({"session_id": sid, "lines": lines})
+                                serde_json::json!({"session_id": sid, "lines": s.read_tail(n)})
                             }
                             None => serde_json::json!({"error": "session not found"}),
                         },
@@ -1913,6 +1989,20 @@ impl App {
                 self.caps.insert(id, crate::auth::orchestrator_caps());
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
                     s.is_orchestrator = true;
+                    s.hidden = cfg.hidden;
+                }
+                if cfg.hidden {
+                    // spawn_session may have focused it (first session);
+                    // hidden sessions must never occupy a pane.
+                    let idx = self.sessions.iter().position(|s| s.id == id);
+                    for pane in &mut self.panes {
+                        if *pane == idx {
+                            *pane = None;
+                        }
+                    }
+                    if self.panes[0].is_none() {
+                        self.panes[0] = self.visible_indices().first().copied();
+                    }
                 }
                 self.orchestrator_session_id = Some(id);
                 // Briefing lands once the CLI reaches READY. Bracketed paste
@@ -1927,18 +2017,28 @@ impl App {
     /// Snapshot of all sessions as JSON — shared by the IPC `query sessions`
     /// path and the orchestrator's `list_sessions` tool.
     pub fn sessions_json(&self) -> serde_json::Value {
+        // `display` is the 1-based number the user sees in the session bar:
+        // position among visible sessions. Hidden sessions have none.
+        let mut display = 0usize;
         let arr: Vec<_> = self
             .sessions
             .iter()
             .map(|s| {
+                let display = if s.hidden {
+                    serde_json::Value::Null
+                } else {
+                    display += 1;
+                    serde_json::json!(display)
+                };
                 serde_json::json!({
                     "id":             s.id,
-                    "display":        s.id + 1,
+                    "display":        display,
                     "name":           s.name,
                     "kind":           s.kind.label(),
                     "state":          s.state.label(),
                     "waiting_prompt": s.waiting_prompt,
                     "group":          s.group,
+                    "hidden":         s.hidden,
                     "cwd":            s.cwd,
                     "input_tokens":   s.stats.input_tokens,
                     "output_tokens":  s.stats.output_tokens,
@@ -1962,16 +2062,7 @@ impl App {
             OrchestratorReq::ReadOutput { session_id, lines } => {
                 match self.sessions.iter().find(|s| s.id == session_id) {
                     Some(s) => {
-                        let tail: Vec<&String> = s
-                            .output_lines
-                            .iter()
-                            .rev()
-                            .take(lines)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        serde_json::json!({"session_id": session_id, "lines": tail})
+                        serde_json::json!({"session_id": session_id, "lines": s.read_tail(lines)})
                     }
                     None => serde_json::json!({"error": "session not found"}),
                 }
@@ -2053,10 +2144,22 @@ impl App {
         if self.orchestrator_session_id == Some(session_id) {
             return serde_json::json!({"error": "the orchestrator cannot request its own kill"});
         }
-        let Some(s) = self.sessions.iter().find(|s| s.id == session_id) else {
+        let Some((idx, s)) = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.id == session_id)
+        else {
             return serde_json::json!({"error": "session not found"});
         };
         let name = s.name.clone();
+        // The number the user sees in the session bar, falling back to the
+        // raw id for sessions with no bar slot.
+        let display = self
+            .visible_indices()
+            .iter()
+            .position(|&i| i == idx)
+            .map_or(session_id + 1, |p| p + 1);
         self.pending_kill = Some(PendingKill {
             session_id,
             session_name: name.clone(),
@@ -2070,7 +2173,7 @@ impl App {
         };
         self.chat_system(format!(
             "agent requests killing session {} \"{}\"{}. /confirm-kill to approve, /deny-kill to refuse.",
-            session_id + 1,
+            display,
             name,
             why
         ));
@@ -2268,10 +2371,13 @@ impl App {
                     AppMode::Normal | AppMode::Menu { .. } => {}
                 }
 
-                // Session bar click → switch session
+                // Session bar click → switch session (slots cover visible
+                // sessions only, so map the slot position to a real index)
                 for (i, slot) in self.session_slot_areas.iter().enumerate() {
                     if rect_hit(*slot, col, row) {
-                        self.switch_to(i);
+                        if let Some(idx) = self.visible_to_idx(i) {
+                            self.switch_to(idx);
+                        }
                         self.selection = None;
                         return;
                     }
@@ -2289,7 +2395,9 @@ impl App {
                 }
                 for (i, row_area) in self.status_row_areas.iter().enumerate() {
                     if rect_hit(*row_area, col, row) {
-                        self.switch_to(i);
+                        if let Some(idx) = self.visible_to_idx(i) {
+                            self.switch_to(idx);
+                        }
                         self.selection = None;
                         return;
                     }
@@ -2959,8 +3067,8 @@ impl App {
             ["kill"] => self.kill_active_session(),
             ["kill", n] => {
                 if let Ok(num) = n.parse::<usize>() {
-                    if num >= 1 && num <= self.sessions.len() {
-                        self.remove_session(num - 1);
+                    if let Some(idx) = num.checked_sub(1).and_then(|p| self.visible_to_idx(p)) {
+                        self.remove_session(idx);
                     }
                 }
             }
@@ -2995,6 +3103,33 @@ impl App {
                     "orchestrator session killed".to_string()
                 } else {
                     "orchestrator is not running".to_string()
+                };
+            }
+            ["orchestrator", vis @ ("show" | "hide")] => {
+                let show = *vis == "show";
+                self.command_result = match self.orchestrator_session_id {
+                    Some(orch_id) => {
+                        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == orch_id) {
+                            s.hidden = !show;
+                        }
+                        if !show {
+                            // Move any pane showing it to another session.
+                            let idx = self.sessions.iter().position(|s| s.id == orch_id);
+                            for pane in &mut self.panes {
+                                if *pane == idx {
+                                    *pane = None;
+                                }
+                            }
+                            if self.panes[0].is_none() {
+                                self.panes[0] = self.visible_indices().first().copied();
+                            }
+                        }
+                        format!(
+                            "orchestrator session {}",
+                            if show { "shown" } else { "hidden" }
+                        )
+                    }
+                    None => "no CLI orchestrator session running".to_string(),
                 };
             }
             ["orchestrator"] | ["orchestrator", "status"] => {
@@ -3570,6 +3705,12 @@ impl App {
             if let Some(h) = &self.orchestrator {
                 targets.push(format!("@{} (orchestrator)", h.name));
             }
+            if let Some(s) = self
+                .orchestrator_session_id
+                .and_then(|id| self.sessions.iter().find(|s| s.id == id))
+            {
+                targets.push(format!("@{} (orchestrator)", s.name));
+            }
             targets.extend(
                 self.config
                     .agents
@@ -3579,6 +3720,7 @@ impl App {
             targets.extend(
                 self.sessions
                     .iter()
+                    .filter(|s| !s.hidden)
                     .map(|s| format!("@{} / @{} ({})", s.name, s.id + 1, s.kind.label())),
             );
             targets.push("@all (every AI session)".to_string());
@@ -3616,14 +3758,26 @@ impl App {
         } else {
             match &self.chat.target {
                 Some(t) => (t.clone(), raw),
-                // Unaddressed messages default to the orchestrator when present.
-                None => match &self.orchestrator {
-                    Some(h) => (h.name.clone(), raw),
-                    None => {
-                        self.chat_system("address someone first: @name message (see /agents)");
-                        return;
+                // Unaddressed messages default to the orchestrator when
+                // present — the API-class agent or the CLI-class session.
+                None => {
+                    let orch_name =
+                        self.orchestrator
+                            .as_ref()
+                            .map(|h| h.name.clone())
+                            .or_else(|| {
+                                self.orchestrator_session_id
+                                    .and_then(|id| self.sessions.iter().find(|s| s.id == id))
+                                    .map(|s| s.name.clone())
+                            });
+                    match orch_name {
+                        Some(name) => (name, raw),
+                        None => {
+                            self.chat_system("address someone first: @name message (see /agents)");
+                            return;
+                        }
                     }
-                },
+                }
             }
         };
         self.chat.target = Some(target.clone());
@@ -3693,18 +3847,18 @@ impl App {
             return;
         }
 
-        // Session by name or number
+        // Session by name or by the number shown in the session bar
+        let by_number = target
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|p| self.visible_to_idx(p));
         let found = self
             .sessions
             .iter()
-            .find(|s| {
-                s.name == target
-                    || target
-                        .parse::<usize>()
-                        .map(|n| s.id + 1 == n)
-                        .unwrap_or(false)
-            })
-            .map(|s| (s.id, s.name.clone()));
+            .enumerate()
+            .find(|(idx, s)| s.name == target || by_number == Some(*idx))
+            .map(|(_, s)| (s.id, s.name.clone()));
         match found {
             Some((id, name)) => {
                 self.send_chat_to_session(id, name.clone(), &msg);
@@ -3758,11 +3912,14 @@ impl App {
             &crate::pipe::ExtractMode::LastBlock,
         )
         .or_else(|| {
+            // A raw screen tail shows everything still on screen (the echoed
+            // question, earlier turns); cut it down to the latest reply.
             crate::pipe::extract_from_session(
                 &self.sessions,
                 session_id,
                 &crate::pipe::ExtractMode::LastN(40),
             )
+            .map(|t| last_reply_block(&t))
         });
         if let Some(text) = reply {
             self.chat.messages.push(ChatMsg {
@@ -4192,11 +4349,11 @@ impl App {
                 "a council is already running — `council stop` first"
             ));
         }
-        if self.sessions.len() + cfg.agent.len() > MAX_SESSIONS {
+        if self.visible_count() + cfg.agent.len() > MAX_SESSIONS {
             return Err(anyhow::anyhow!(
                 "council needs {} sessions but only {} slots are free",
                 cfg.agent.len(),
-                MAX_SESSIONS - self.sessions.len()
+                MAX_SESSIONS - self.visible_count()
             ));
         }
         // Validate route names before spawning anything.
@@ -4373,7 +4530,19 @@ async fn run_pty(
         loop {
             tokio::select! {
                 Some(bytes) = write_rx.recv() => {
-                    if write_half.write_all(&bytes).await.is_err() { break; }
+                    // Injected input (pipes, chat, orchestrator send_input)
+                    // arrives as one chunk ending in '\r'/'\n'. Full-screen
+                    // TUIs (claude, codex) treat such a chunk as a paste and
+                    // turn the trailing newline into a line break in their
+                    // input box instead of submitting. Write the text, give
+                    // the TUI a beat to process it, then press Enter as its
+                    // own keystroke. A lone '\r' (real Enter keypress) and
+                    // user pastes (bracketed, ending in '~') pass through.
+                    if chunk_carries_enter(&bytes) {
+                        if write_half.write_all(&bytes[..bytes.len() - 1]).await.is_err() { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if write_half.write_all(b"\r").await.is_err() { break; }
+                    } else if write_half.write_all(&bytes).await.is_err() { break; }
                 }
                 Some((rows, cols)) = resize_rx.recv() => {
                     let _ = write_half.resize(pty_process::Size::new(rows, cols));
@@ -4522,6 +4691,27 @@ fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
         .saturating_sub(area.y + 1)
         .min(area.height.saturating_sub(2));
     (c, r)
+}
+
+/// True when a PTY write chunk is injected input carrying its own Enter:
+/// longer than one byte and newline-terminated. A lone '\r' is a real Enter
+/// keypress; bracketed user pastes end in '~'; escape responses end in a
+/// letter — none of those match. The writer task sends the trailing Enter
+/// separately after a pause so TUIs register a submit, not a pasted newline.
+fn chunk_carries_enter(bytes: &[u8]) -> bool {
+    bytes.len() > 1 && matches!(bytes.last(), Some(b'\r') | Some(b'\n'))
+}
+
+/// Best-effort cut of a screen scrape down to the agent's latest reply:
+/// content from the last "⏺" response marker (used by claude code and codex
+/// for assistant turns) onward. Falls back to the full text when no marker
+/// is present (shells, other TUIs).
+fn last_reply_block(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    match lines.iter().rposition(|l| l.trim_start().starts_with('⏺')) {
+        Some(i) => lines[i..].join("\n"),
+        None => text.to_string(),
+    }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -5037,6 +5227,98 @@ mod tests {
     }
 
     #[test]
+    fn chunk_carries_enter_matches_injected_input_only() {
+        assert!(chunk_carries_enter(b"ls -la /tmp\r"));
+        assert!(chunk_carries_enter(b"fix the bug\n"));
+        assert!(chunk_carries_enter(b"\x1b[200~multi\nline~\x1b[201~\r"));
+        // Real Enter keypress, user paste, escape response: untouched
+        assert!(!chunk_carries_enter(b"\r"));
+        assert!(!chunk_carries_enter(b"\x1b[200~pasted text\n\x1b[201~"));
+        assert!(!chunk_carries_enter(b"\x1b[?1u"));
+        assert!(!chunk_carries_enter(b"a"));
+    }
+
+    #[test]
+    fn last_reply_block_cuts_at_the_last_response_marker() {
+        let screen = "you: fix the bug\n⏺ Reading files\n⏺ Done — the bug was a typo.\n  Fixed in src/foo.rs";
+        assert_eq!(
+            last_reply_block(screen),
+            "⏺ Done — the bug was a typo.\n  Fixed in src/foo.rs"
+        );
+        // No marker: unchanged
+        assert_eq!(last_reply_block("plain output"), "plain output");
+    }
+
+    #[test]
+    fn hidden_orchestrator_waiting_prompt_is_surfaced_in_chat() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+        app.orchestrator_session_id = Some(id);
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            s.is_orchestrator = true;
+            s.hidden = true;
+            s.waiting_prompt = Some("Allow Bash(cargo test)?".into());
+        }
+
+        app.notify_orchestrator(id, &SessionState::Waiting);
+
+        let last = app.chat.messages.last().expect("chat notice");
+        assert!(last.text.contains("needs input"));
+        assert!(last.text.contains("Allow Bash(cargo test)?"));
+
+        // Cooldown: an immediate repeat stays quiet
+        let count = app.chat.messages.len();
+        app.notify_orchestrator(id, &SessionState::Waiting);
+        assert_eq!(app.chat.messages.len(), count);
+
+        // A visible orchestrator session flags WAITING in the bar instead
+        app.orch_event_cooldowns.clear();
+        app.sessions[0].hidden = false;
+        app.notify_orchestrator(id, &SessionState::Waiting);
+        assert_eq!(app.chat.messages.len(), count);
+    }
+
+    #[test]
+    fn hidden_sessions_are_skipped_by_switching_and_visible_numbering() {
+        let mut app = make_app();
+        let _ = app.spawn_headless_session("orch".into(), None).unwrap();
+        let _ = app.spawn_headless_session("one".into(), None).unwrap();
+        let _ = app.spawn_headless_session("two".into(), None).unwrap();
+        app.sessions[0].hidden = true;
+        app.panes[0] = Some(1);
+
+        // Visible positions map past the hidden session
+        assert_eq!(app.visible_indices(), vec![1, 2]);
+        assert_eq!(app.visible_to_idx(0), Some(1));
+        assert_eq!(app.visible_to_idx(2), None);
+
+        // Direct switching to the hidden session is refused
+        app.switch_to(0);
+        assert_eq!(app.active_idx(), Some(1));
+
+        // Cycling wraps across it in both directions
+        app.next_session();
+        assert_eq!(app.active_idx(), Some(2));
+        app.next_session();
+        assert_eq!(app.active_idx(), Some(1));
+        app.prev_session();
+        assert_eq!(app.active_idx(), Some(2));
+
+        // Killing the last visible session must not focus the hidden one
+        app.kill_active_session();
+        app.kill_active_session();
+        assert_eq!(app.active_idx(), None);
+        assert_eq!(app.sessions.len(), 1);
+
+        // display in sessions_json is the bar number; hidden gets null
+        let _ = app.spawn_headless_session("three".into(), None).unwrap();
+        let json = app.sessions_json();
+        assert!(json[0]["display"].is_null());
+        assert_eq!(json[1]["display"], 1);
+    }
+
+    #[test]
     fn session_output_strips_ansi_and_updates_state_without_scraping_shell_stats() {
         let mut app = make_app();
         let id = app.spawn_headless_session("shell".into(), None).unwrap();
@@ -5402,6 +5684,25 @@ mod tests {
 
         assert_eq!(app.sessions[0].state, SessionState::Ready);
         assert!(!app.sessions[0].ipc_state);
+    }
+
+    #[test]
+    fn partial_line_prompt_resolves_pending_wait_ready_reply() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("shell".into(), None).unwrap();
+        app.sessions[0].state = SessionState::Running;
+        app.sessions[0].push_output_line("total 4".into());
+        let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+        app.pending_ipc_replies.insert(id, (resp_tx, 0));
+
+        // Shell prompts are partial lines (no trailing newline); the READY
+        // they trigger must resolve the parked wait-ready reply.
+        app.handle_session_current_line(id, "user@host:~$ ".into());
+
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+        let resp = resp_rx.try_recv().expect("reply resolved on prompt");
+        assert_eq!(resp["session_id"], id);
+        assert_eq!(resp["lines"][0], "total 4");
     }
 
     #[test]
