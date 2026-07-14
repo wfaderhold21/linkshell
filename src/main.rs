@@ -127,7 +127,12 @@ async fn main() -> anyhow::Result<()> {
     // SwappableWriter holds an Arc<Mutex<WriterBox>> that we swap on reattach.
     // Drop `stdout` — SwappableWriter owns the Write target from here.
     drop(stdout);
-    let backend = CrosstermBackend::new(swappable);
+    // SizedBackend answers ratatui's autoresize from this shared value instead
+    // of an ioctl on our tty, so a reattached relay client's dimensions win.
+    let term_size: reattach::SharedSize =
+        Arc::new(Mutex::new(crossterm::terminal::size().unwrap_or((80, 24))));
+    let backend =
+        reattach::SizedBackend::new(CrosstermBackend::new(swappable), Arc::clone(&term_size));
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
@@ -184,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
                     {
                         break;
                     }
-                    Ok(Event::Resize(_, _)) if key_tx.send(AppEvent::Resize).await.is_err() => {
+                    Ok(Event::Resize(cols, rows))
+                        if key_tx.send(AppEvent::Resize { cols, rows }).await.is_err() =>
+                    {
                         break;
                     }
                     _ => {}
@@ -297,16 +304,22 @@ async fn main() -> anyhow::Result<()> {
                             *writer_handle.lock().unwrap() = Box::new(std::io::sink());
                         }
                     }
+                    Some(AppEvent::Resize { cols, rows }) => {
+                        // Feed the new dimensions to the backend; the next
+                        // draw autoresizes ratatui and the post-draw pass
+                        // propagates pane sizes to session PTYs.
+                        *term_size.lock().unwrap() = (cols, rows);
+                        app.needs_redraw = true;
+                    }
                     Some(AppEvent::Reattach { stream, rows, cols }) => {
                         do_reattach(
                             &mut terminal,
                             &writer_handle,
                             &tx,
                             stream,
-                            rows,
-                            cols,
                             kitty_supported,
                         ).await;
+                        *term_size.lock().unwrap() = (cols, rows);
                         headless = false;
                         app.needs_redraw = true;
                         // Resize all sessions to the relay client's dimensions.
@@ -482,9 +495,6 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::Key(key) => handle_key(app, key),
         AppEvent::Mouse(ev) => app.handle_mouse(ev),
         AppEvent::Paste(text) => handle_paste(app, text),
-        // needs_redraw is set below; the draw autoresizes the backend and the
-        // post-draw pane-size pass propagates new dimensions to session PTYs.
-        AppEvent::Resize => {}
         AppEvent::Authenticate {
             token,
             transport,
@@ -495,7 +505,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
             app.handle_authenticate(token, transport, name, group, response_tx);
         }
         // Intercepted in the main select! loop before handle_event is reached.
-        AppEvent::Detach | AppEvent::Reattach { .. } => {}
+        AppEvent::Detach | AppEvent::Reattach { .. } | AppEvent::Resize { .. } => {}
     }
     app.needs_redraw = true;
 }
@@ -1119,12 +1129,10 @@ fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String, token: Stri
 // ── Reattach: swap the terminal backend and spawn the relay reader task ────
 
 async fn do_reattach(
-    terminal: &mut Terminal<CrosstermBackend<SwappableWriter>>,
+    terminal: &mut Terminal<reattach::SizedBackend>,
     writer_handle: &Arc<Mutex<WriterBox>>,
     event_tx: &mpsc::Sender<AppEvent>,
     stream: tokio::net::UnixStream,
-    rows: u16,
-    cols: u16,
     kitty_supported: bool,
 ) {
     // Convert to std UnixStream so we can clone the fd for the sync writer.
@@ -1177,8 +1185,6 @@ async fn do_reattach(
         use tokio::io::AsyncBufReadExt;
         let mut reader = tokio::io::BufReader::new(relay_reader);
         let mut line = String::new();
-        // Propagate the terminal size the relay client reported.
-        let _ = tx.send(AppEvent::Resize).await;
         loop {
             line.clear();
             match reader.read_line(&mut line).await {
@@ -1195,11 +1201,8 @@ async fn do_reattach(
         // Relay client disconnected → go headless again.
         let _ = tx2.send(AppEvent::Detach).await;
     });
-
-    // Notify main loop of the new terminal dimensions.
-    let _ = event_tx.send(AppEvent::Resize).await;
-    let _ = rows; // used via the Resize path
-    let _ = cols;
+    // The caller updates the shared backend size from the handshake's
+    // rows/cols; subsequent relay resize events carry their own dimensions.
 }
 
 fn parse_council_flag() -> Option<String> {

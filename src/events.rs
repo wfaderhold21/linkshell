@@ -127,9 +127,13 @@ pub enum AppEvent {
         dest: Option<usize>,
     },
     Paste(String),
-    /// Terminal window resized — triggers a redraw; pane sizes are recomputed
+    /// Terminal window resized (locally or on the relay client) — updates the
+    /// backend's shared size and triggers a redraw; pane sizes are recomputed
     /// from the new layout after the draw
-    Resize,
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Tick,
     /// Voluntary detach (`:detach` / Alt+D) or SIGHUP: release the terminal
     /// and continue running headlessly. Sessions and pipes keep going.
