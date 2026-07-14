@@ -244,9 +244,19 @@ async fn main() -> anyhow::Result<()> {
     loop {
         if !headless && app.needs_redraw && last_render.elapsed() >= frame_cap {
             let mut layout = ui::LayoutInfo::default();
-            terminal.draw(|f| {
+            if let Err(error) = terminal.draw(|f| {
                 layout = ui::draw(f, &app);
-            })?;
+            }) {
+                if is_transient_terminal_error(&error) {
+                    // A busy terminal or relay socket may briefly reject a
+                    // frame. Keep the redraw pending and retry after the frame
+                    // interval instead of terminating the whole application.
+                    last_render = Instant::now();
+                    continue;
+                }
+                restore_terminal(kitty_supported);
+                return Err(error.into());
+            }
             app.output_areas = layout.output_areas.clone();
             app.session_bar_area = layout.session_bar_area;
             app.session_slot_areas = layout.session_slot_areas;
@@ -367,6 +377,13 @@ fn restore_terminal(kitty_supported: bool) {
         DisableBracketedPaste,
         crossterm::cursor::Show
     );
+}
+
+fn is_transient_terminal_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(libc::EAGAIN)
 }
 
 fn handle_event(app: &mut App, event: AppEvent) {
@@ -1264,6 +1281,19 @@ fn parse_tcp_flag() -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_terminal_errors_are_retried() {
+        let would_block = std::io::Error::new(std::io::ErrorKind::WouldBlock, "busy");
+        let interrupted = std::io::Error::new(std::io::ErrorKind::Interrupted, "signal");
+        let eagain = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        let broken_pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed");
+
+        assert!(is_transient_terminal_error(&would_block));
+        assert!(is_transient_terminal_error(&interrupted));
+        assert!(is_transient_terminal_error(&eagain));
+        assert!(!is_transient_terminal_error(&broken_pipe));
+    }
 
     #[test]
     fn documentation_index_links_required_guides_and_recipes_cover_core_workflows() {
