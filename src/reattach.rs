@@ -34,6 +34,74 @@ impl Write for SwappableWriter {
     }
 }
 
+// ── SizedBackend ───────────────────────────────────────────────────────────
+// CrosstermBackend answers size() with an ioctl on this process's tty, which
+// is the terminal linkshell was *started* in. After a detach/reattach the UI
+// renders on the relay client's terminal, so that answer is stale — ratatui's
+// per-draw autoresize would pin the layout to the original terminal's size
+// forever. This wrapper delegates everything to CrosstermBackend except
+// size()/window_size(), which report a shared value updated from resize
+// events: the local terminal's while attached directly, the relay client's
+// (handshake + forwarded resizes) while reattached.
+
+/// Current terminal dimensions as (cols, rows).
+pub type SharedSize = Arc<Mutex<(u16, u16)>>;
+
+pub struct SizedBackend {
+    inner: ratatui::backend::CrosstermBackend<SwappableWriter>,
+    size: SharedSize,
+}
+
+impl SizedBackend {
+    pub fn new(
+        inner: ratatui::backend::CrosstermBackend<SwappableWriter>,
+        size: SharedSize,
+    ) -> Self {
+        Self { inner, size }
+    }
+}
+
+impl ratatui::backend::Backend for SizedBackend {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor(&mut self) -> io::Result<(u16, u16)> {
+        self.inner.get_cursor()
+    }
+    fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
+        self.inner.set_cursor(x, y)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+    fn size(&self) -> io::Result<ratatui::layout::Rect> {
+        let (cols, rows) = *self.size.lock().unwrap();
+        Ok(ratatui::layout::Rect::new(0, 0, cols, rows))
+    }
+    fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+        let (cols, rows) = *self.size.lock().unwrap();
+        Ok(ratatui::backend::WindowSize {
+            columns_rows: ratatui::layout::Size {
+                width: cols,
+                height: rows,
+            },
+            pixels: ratatui::layout::Size::default(),
+        })
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+}
+
 // ── Session / reattach file ────────────────────────────────────────────────
 
 fn linkshell_config_dir() -> Option<std::path::PathBuf> {
@@ -273,11 +341,58 @@ pub fn decode_relay_line(line: &str) -> Option<crate::events::AppEvent> {
             let m: crossterm::event::MouseEvent = serde_json::from_value(v["e"].clone()).ok()?;
             Some(crate::events::AppEvent::Mouse(m))
         }
-        "r" => Some(crate::events::AppEvent::Resize),
+        "r" => Some(crate::events::AppEvent::Resize {
+            cols: v["cols"].as_u64()? as u16,
+            rows: v["rows"].as_u64()? as u16,
+        }),
         "p" => {
             let s = v["s"].as_str().unwrap_or("").to_string();
             Some(crate::events::AppEvent::Paste(s))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::Backend;
+
+    #[test]
+    fn relay_resize_lines_carry_dimensions() {
+        let ev = decode_relay_line(r#"{"t":"r","cols":120,"rows":40}"#).unwrap();
+        match ev {
+            crate::events::AppEvent::Resize { cols, rows } => assert_eq!((cols, rows), (120, 40)),
+            _ => panic!("expected Resize"),
+        }
+    }
+
+    #[test]
+    fn sized_backend_reports_the_shared_size_not_the_tty() {
+        let (swappable, _handle) = SwappableWriter::with_stdout();
+        let size: SharedSize = Arc::new(Mutex::new((80, 24)));
+        let mut backend = SizedBackend::new(
+            ratatui::backend::CrosstermBackend::new(swappable),
+            Arc::clone(&size),
+        );
+        assert_eq!(
+            backend.size().unwrap(),
+            ratatui::layout::Rect::new(0, 0, 80, 24)
+        );
+
+        // A reattach from a larger terminal updates the shared value…
+        *size.lock().unwrap() = (200, 60);
+        // …and the backend (thus ratatui's autoresize) sees it immediately.
+        assert_eq!(
+            backend.size().unwrap(),
+            ratatui::layout::Rect::new(0, 0, 200, 60)
+        );
+        assert_eq!(
+            backend.window_size().unwrap().columns_rows,
+            ratatui::layout::Size {
+                width: 200,
+                height: 60
+            }
+        );
     }
 }
