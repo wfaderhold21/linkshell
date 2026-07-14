@@ -147,7 +147,13 @@ async fn summarize_for_relay(
     config: &Config,
 ) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
-    let api_key = std::env::var("ANTHROPIC_API_KEY")?;
+    let auth = crate::config::AnthropicAuth::from_env().ok_or_else(|| {
+        anyhow::anyhow!("no Anthropic credentials (set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)")
+    })?;
+    let url = format!(
+        "{}/v1/messages",
+        crate::config::anthropic_base_url().trim_end_matches('/')
+    );
 
     let body = serde_json::json!({
         "model": config.pipe.summarize.model,
@@ -156,9 +162,8 @@ async fn summarize_for_relay(
         "messages": [{ "role": "user", "content": content }]
     });
 
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
+    let resp = auth
+        .apply(client.post(&url))
         .header("anthropic-version", "2023-06-01")
         .json(&body)
         .send()

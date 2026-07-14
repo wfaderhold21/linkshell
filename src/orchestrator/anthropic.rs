@@ -14,8 +14,11 @@ pub async fn run_turn(
     user_text: &str,
     event_tx: &mpsc::Sender<AppEvent>,
 ) -> anyhow::Result<String> {
-    let api_key = cfg.resolve_api_key().ok_or_else(|| {
-        anyhow::anyhow!("no API key (set ANTHROPIC_API_KEY or [orchestrator].api_key)")
+    let auth = cfg.resolve_anthropic_auth().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no Anthropic credentials (set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY or \
+             [orchestrator].auth_token / api_key)"
+        )
     })?;
     let url = format!("{}/v1/messages", cfg.endpoint_url().trim_end_matches('/'));
     let tools = super::anthropic_tools();
@@ -33,9 +36,8 @@ pub async fn run_turn(
             "tools": tools,
             "messages": history,
         });
-        let resp: serde_json::Value = client
-            .post(&url)
-            .header("x-api-key", &api_key)
+        let resp: serde_json::Value = auth
+            .apply(client.post(&url))
             .header("anthropic-version", "2023-06-01")
             .json(&body)
             .timeout(std::time::Duration::from_secs(

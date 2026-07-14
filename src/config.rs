@@ -42,10 +42,16 @@ pub struct OrchestratorConfig {
     pub name: String,
     /// API class: model id.
     pub model: String,
-    /// openai/lmstudio base URL; also overrides the anthropic base URL (tests).
+    /// openai/lmstudio base URL; also overrides the anthropic base URL.
+    /// Anthropic falls back to the ANTHROPIC_BASE_URL env var when empty.
     pub endpoint: String,
     /// Falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY env vars when empty.
     pub api_key: String,
+    /// Anthropic bearer token (`Authorization: Bearer ...`), used instead of
+    /// the x-api-key header. Some gateways (e.g. NVIDIA) require this. Takes
+    /// precedence over `api_key`; falls back to the ANTHROPIC_AUTH_TOKEN env
+    /// var when empty.
+    pub auth_token: String,
     /// Appended to the built-in system prompt / CLI briefing.
     pub system: String,
     /// CLI class: working directory for the orchestrator session.
@@ -79,6 +85,7 @@ impl Default for OrchestratorConfig {
             model: String::new(),
             endpoint: String::new(),
             api_key: String::new(),
+            auth_token: String::new(),
             system: String::new(),
             cwd: String::new(),
             hidden: true,
@@ -154,7 +161,7 @@ impl OrchestratorConfig {
             return self.endpoint.clone();
         }
         match self.provider.as_str() {
-            "anthropic" => "https://api.anthropic.com".to_string(),
+            "anthropic" => anthropic_base_url(),
             "lmstudio" => "http://localhost:1234/v1".to_string(),
             _ => String::new(),
         }
@@ -172,6 +179,61 @@ impl OrchestratorConfig {
         };
         std::env::var(var).ok().filter(|k| !k.is_empty())
     }
+
+    /// Effective Anthropic credentials (API class). A bearer auth token — from
+    /// `auth_token` or ANTHROPIC_AUTH_TOKEN — takes precedence; otherwise the
+    /// x-api-key from `api_key` or ANTHROPIC_API_KEY.
+    pub fn resolve_anthropic_auth(&self) -> Option<AnthropicAuth> {
+        if !self.auth_token.is_empty() {
+            return Some(AnthropicAuth::BearerToken(self.auth_token.clone()));
+        }
+        if !self.api_key.is_empty() {
+            return Some(AnthropicAuth::ApiKey(self.api_key.clone()));
+        }
+        AnthropicAuth::from_env()
+    }
+}
+
+/// How to authenticate against an Anthropic-compatible endpoint.
+pub enum AnthropicAuth {
+    /// Standard Anthropic API key, sent as the `x-api-key` header.
+    ApiKey(String),
+    /// Bearer token, sent as `Authorization: Bearer ...`. Required by some
+    /// gateways (e.g. NVIDIA) that front the Anthropic API.
+    BearerToken(String),
+}
+
+impl AnthropicAuth {
+    /// Resolve from env vars: ANTHROPIC_AUTH_TOKEN (preferred) then
+    /// ANTHROPIC_API_KEY.
+    pub fn from_env() -> Option<AnthropicAuth> {
+        if let Some(tok) = std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            return Some(AnthropicAuth::BearerToken(tok));
+        }
+        std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(AnthropicAuth::ApiKey)
+    }
+
+    /// Attach the appropriate auth header to a request.
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            AnthropicAuth::ApiKey(k) => req.header("x-api-key", k),
+            AnthropicAuth::BearerToken(t) => req.header("authorization", format!("Bearer {t}")),
+        }
+    }
+}
+
+/// Anthropic base URL: ANTHROPIC_BASE_URL env var or the public default.
+pub fn anthropic_base_url() -> String {
+    std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string())
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -1003,5 +1065,47 @@ system = "Be concise."
         assert_eq!(a.model, "qwen3.6-27b");
         assert_eq!(a.system.as_deref(), Some("Be concise."));
         assert!(a.api_key.is_none());
+    }
+
+    #[test]
+    fn orchestrator_parses_auth_token_and_base_url() {
+        let toml = r#"
+[orchestrator]
+provider = "anthropic"
+endpoint = "https://integrate.api.nvidia.com"
+auth_token = "nvapi-secret"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.orchestrator.auth_token, "nvapi-secret");
+        assert_eq!(
+            cfg.orchestrator.endpoint_url(),
+            "https://integrate.api.nvidia.com"
+        );
+        match cfg.orchestrator.resolve_anthropic_auth() {
+            Some(AnthropicAuth::BearerToken(t)) => assert_eq!(t, "nvapi-secret"),
+            _ => panic!("expected bearer token auth"),
+        }
+    }
+
+    #[test]
+    fn anthropic_auth_prefers_token_over_api_key() {
+        let cfg = OrchestratorConfig {
+            api_key: "sk-key".into(),
+            auth_token: "tok".into(),
+            ..Default::default()
+        };
+        match cfg.resolve_anthropic_auth() {
+            Some(AnthropicAuth::BearerToken(t)) => assert_eq!(t, "tok"),
+            _ => panic!("auth_token should take precedence over api_key"),
+        }
+
+        let cfg = OrchestratorConfig {
+            api_key: "sk-key".into(),
+            ..Default::default()
+        };
+        match cfg.resolve_anthropic_auth() {
+            Some(AnthropicAuth::ApiKey(k)) => assert_eq!(k, "sk-key"),
+            _ => panic!("expected x-api-key auth"),
+        }
     }
 }
