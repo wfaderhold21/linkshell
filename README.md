@@ -188,6 +188,7 @@ name = "agent"            # chat target: @agent ...
 # endpoint = "http://localhost:1234/v1"   # openai/lmstudio
 # api_key = "..."          # else ANTHROPIC_API_KEY / OPENAI_API_KEY
 # system = "extra instructions"
+# hidden = true             # CLI class: keep the agent out of the session bar
 # events = ["waiting", "error", "dead"]
 # event_cooldown_secs = 30
 ```
@@ -198,14 +199,20 @@ Two provider classes:
   loop with tools for listing sessions, reading output, starting sessions
   (with cwd + initial prompt), typing into sessions, and managing pipes.
 - **CLI class** (`claude`, `codex`, `opencode`, `omp`): the CLI runs as a
-  normal session with operator-tier IPC capabilities and drives linkshell via
-  `linkshell-ctl` (`list`, `read`, `new`, `input --wait`, `pipe`, `chat`). It
-  occupies one of the 8 session slots and replies through `linkshell-ctl chat`.
+  session with operator-tier IPC capabilities and drives linkshell via
+  `linkshell-ctl` (`list`, `read`, `new`, `input --wait`, `pipe`, `chat`). By
+  default it is *hidden*: no session bar slot, no Alt+N digit, doesn't count
+  against the 8-session limit — you talk to it through the chat pane and it
+  replies through `linkshell-ctl chat`. Set `hidden = false` (or use
+  `:orchestrator show|hide` at runtime) to give it a visible session tab.
+  If the hidden CLI hits a permission dialog or errors, the prompt is posted
+  to chat — answer it right there (`@agent 1`, `@agent y`); the reply is
+  typed into its terminal.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
-`:orchestrator start|stop|restart|status` manages it at runtime (also usable
-from chat as `/orchestrator …`). If the agent dies — its task exits or the
-CLI session ends — a chat notice appears with the restart command.
+`:orchestrator start|stop|restart|status|show|hide` manages it at runtime
+(also usable from chat as `/orchestrator …`). If the agent dies — its task
+exits or the CLI session ends — a chat notice appears with the restart command.
 
 The orchestrator can never kill a session on its own: a kill request shows up
 in chat and only `/confirm-kill` executes it (`/deny-kill` refuses).

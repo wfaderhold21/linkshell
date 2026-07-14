@@ -62,7 +62,7 @@ pub struct Pipe {
 
 pub fn extract_from_session(sessions: &[Session], id: usize, mode: &ExtractMode) -> Option<String> {
     let session = sessions.iter().find(|s| s.id == id)?;
-    let lines = &session.output_lines;
+    let lines = session.readable_lines();
 
     match mode {
         ExtractMode::LastN(n) => {
@@ -107,7 +107,7 @@ pub fn extract_from_session(sessions: &[Session], id: usize, mode: &ExtractMode)
                 Some(diff.join("\n"))
             }
         }
-        ExtractMode::Summarize(_) => Some(lines.iter().cloned().collect::<Vec<_>>().join("\n")),
+        ExtractMode::Summarize(_) => Some(lines.join("\n")),
     }
 }
 

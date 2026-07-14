@@ -50,6 +50,10 @@ pub struct OrchestratorConfig {
     pub system: String,
     /// CLI class: working directory for the orchestrator session.
     pub cwd: String,
+    /// CLI class: keep the orchestrator session out of the session bar and
+    /// session switching; interact with it through the chat pane instead.
+    /// `/orchestrator show` / `hide` toggles it at runtime.
+    pub hidden: bool,
     /// Session states that proactively wake the orchestrator.
     pub events: Vec<String>,
     /// Minimum seconds between events for the same (session, state).
@@ -71,6 +75,7 @@ impl Default for OrchestratorConfig {
             api_key: String::new(),
             system: String::new(),
             cwd: String::new(),
+            hidden: true,
             events: vec!["waiting".into(), "error".into(), "dead".into()],
             event_cooldown_secs: 30,
             max_history_turns: 40,
