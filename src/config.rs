@@ -54,6 +54,12 @@ pub struct OrchestratorConfig {
     /// session switching; interact with it through the chat pane instead.
     /// `/orchestrator show` / `hide` toggles it at runtime.
     pub hidden: bool,
+    /// CLI class: how much the orchestrator CLI may do without asking.
+    /// "accept-edits" (default) starts the CLI with safe auto-approval flags
+    /// (claude: `--permission-mode acceptEdits`, codex: `--full-auto`);
+    /// "default" leaves the CLI's own prompting untouched. Anything that
+    /// would bypass the CLI's sandboxing entirely is rejected.
+    pub permission_mode: String,
     /// Session states that proactively wake the orchestrator.
     pub events: Vec<String>,
     /// Minimum seconds between events for the same (session, state).
@@ -76,6 +82,7 @@ impl Default for OrchestratorConfig {
             system: String::new(),
             cwd: String::new(),
             hidden: true,
+            permission_mode: "accept-edits".to_string(),
             events: vec!["waiting".into(), "error".into(), "dead".into()],
             event_cooldown_secs: 30,
             max_history_turns: 40,
@@ -109,6 +116,25 @@ impl OrchestratorConfig {
             "omp" | "oh-my-pi" | "ohmypi" => Cli("oh-my-pi"),
             other => anyhow::bail!("unknown orchestrator provider: {}", other),
         })
+    }
+
+    /// CLI class: extra flags implementing `permission_mode` for the given
+    /// session-kind name. None when the mode is "default" or the CLI has no
+    /// safe auto-approval flag (opencode / oh-my-pi: configure the tool's own
+    /// permission settings instead).
+    pub fn cli_permission_args(&self, kind: &str) -> anyhow::Result<Option<&'static str>> {
+        match self.permission_mode.as_str() {
+            "" | "default" => Ok(None),
+            "accept-edits" | "acceptEdits" | "auto" => Ok(match kind {
+                "claude" => Some("--permission-mode acceptEdits"),
+                "codex" => Some("--full-auto"),
+                _ => None,
+            }),
+            other => anyhow::bail!(
+                "unknown orchestrator permission_mode '{}' (use \"accept-edits\" or \"default\")",
+                other
+            ),
+        }
     }
 
     /// Effective model id (API class).
@@ -761,6 +787,31 @@ mod tests {
         cfg.endpoint = "http://localhost:9999".into();
         assert_eq!(cfg.model_id(), "claude-haiku-4-5-20251001");
         assert_eq!(cfg.endpoint_url(), "http://localhost:9999");
+    }
+
+    #[test]
+    fn orchestrator_permission_mode_maps_safe_flags_per_cli() {
+        let mut cfg = OrchestratorConfig::default();
+        // Default reduces prompting via each CLI's safe auto-approval flags
+        assert_eq!(cfg.permission_mode, "accept-edits");
+        assert_eq!(
+            cfg.cli_permission_args("claude").unwrap(),
+            Some("--permission-mode acceptEdits")
+        );
+        assert_eq!(
+            cfg.cli_permission_args("codex").unwrap(),
+            Some("--full-auto")
+        );
+        // CLIs without a safe flag get none
+        assert_eq!(cfg.cli_permission_args("opencode").unwrap(), None);
+        assert_eq!(cfg.cli_permission_args("oh-my-pi").unwrap(), None);
+
+        cfg.permission_mode = "default".into();
+        assert_eq!(cfg.cli_permission_args("claude").unwrap(), None);
+
+        // Anything unrecognized (including bypass-style modes) is rejected
+        cfg.permission_mode = "bypass".into();
+        assert!(cfg.cli_permission_args("claude").is_err());
     }
 
     #[test]
