@@ -1203,7 +1203,14 @@ fn spawn_reattach_listener(
                 if stream.write_all(b"{\"ok\":true}\n").await.is_err() {
                     return;
                 }
-                let _ = tx.send(AppEvent::Reattach { stream, rows, cols, kitty }).await;
+                let _ = tx
+                    .send(AppEvent::Reattach {
+                        stream,
+                        rows,
+                        cols,
+                        kitty,
+                    })
+                    .await;
             });
         }
     });

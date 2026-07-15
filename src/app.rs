@@ -5797,7 +5797,11 @@ mod tests {
         app.spawn_headless_session("two".into(), None).unwrap();
 
         app.rotate_split();
-        assert_eq!(app.layout, LayoutMode::Single, "rotate is a no-op in Single");
+        assert_eq!(
+            app.layout,
+            LayoutMode::Single,
+            "rotate is a no-op in Single"
+        );
 
         app.toggle_split();
         assert_eq!(app.layout, LayoutMode::SplitV);
