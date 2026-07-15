@@ -1,0 +1,43 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Linux gnu targets built on ubuntu-22.04 for older-glibc
+          # compatibility (musl fights reqwest's native-tls/openssl).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf linkshell-${{ github.ref_name }}-${{ matrix.target }}.tar.gz linkshell linkshell-ctl
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.target }}/release/linkshell-${{ github.ref_name }}-${{ matrix.target }}.tar.gz

@@ -124,9 +124,8 @@ async fn main() -> anyhow::Result<()> {
     // reattach without reconstructing the Terminal object.
     let (swappable, writer_handle) = SwappableWriter::with_stdout();
     // The initial backend targets stdout (already captured above); the
-    // SwappableWriter holds an Arc<Mutex<WriterBox>> that we swap on reattach.
-    // Drop `stdout` — SwappableWriter owns the Write target from here.
-    drop(stdout);
+    // SwappableWriter holds an Arc<Mutex<WriterBox>> that we swap on reattach
+    // and owns the Write target from here.
     // SizedBackend answers ratatui's autoresize from this shared value instead
     // of an ioctl on our tty, so a reattached relay client's dimensions win.
     let term_size: reattach::SharedSize =
@@ -907,9 +906,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     }
                 }
                 KeyCode::Up if !app.settings_state.editing => {
-                    if app.settings_state.selected > 0 {
-                        app.settings_state.selected -= 1;
-                    }
+                    app.settings_state.selected = app.settings_state.selected.saturating_sub(1);
                 }
                 KeyCode::Down if !app.settings_state.editing => {
                     let max = app.settings_state.fields.len().saturating_sub(1);
