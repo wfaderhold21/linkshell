@@ -16,14 +16,6 @@ pub struct SwappableWriter {
 }
 
 impl SwappableWriter {
-    pub fn with_stdout() -> (Self, Arc<Mutex<WriterBox>>) {
-        let handle: Arc<Mutex<WriterBox>> = Arc::new(Mutex::new(Box::new(std::io::stdout())));
-        let sw = Self {
-            handle: Arc::clone(&handle),
-        };
-        (sw, handle)
-    }
-
     /// A writer that starts pointed at io::sink() — the server's initial
     /// state, before any relay client has attached.
     pub fn with_sink() -> (Self, Arc<Mutex<WriterBox>>) {
@@ -447,7 +439,7 @@ mod tests {
 
     #[test]
     fn sized_backend_reports_the_shared_size_not_the_tty() {
-        let (swappable, _handle) = SwappableWriter::with_stdout();
+        let (swappable, _handle) = SwappableWriter::with_sink();
         let size: SharedSize = Arc::new(Mutex::new((80, 24)));
         let mut backend = SizedBackend::new(
             ratatui::backend::CrosstermBackend::new(swappable),
