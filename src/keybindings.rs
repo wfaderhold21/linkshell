@@ -19,6 +19,7 @@ pub enum Action {
     OpenMenu,
     ToggleChat,
     ToggleSplit,
+    RotateSplit,
     FocusNextPane,
     BroadcastToggle,
     Detach,
@@ -60,6 +61,7 @@ fn default_keymap() -> Keymap {
     m.insert((ctrl, KeyCode::Char(' ')), Action::OpenMenu);
     m.insert((alt, KeyCode::Char('t')), Action::ToggleChat);
     m.insert((alt, KeyCode::Char('\\')), Action::ToggleSplit);
+    m.insert((alt, KeyCode::Char('-')), Action::RotateSplit);
     m.insert((alt, KeyCode::Char('o')), Action::FocusNextPane);
     m.insert((alt, KeyCode::Char('b')), Action::BroadcastToggle);
     m.insert((alt, KeyCode::Char('d')), Action::Detach);
@@ -151,6 +153,7 @@ fn parse_action(s: &str) -> Option<Action> {
         "toggle_chat" | "chat" => Some(Action::ToggleChat),
         "open_menu" => Some(Action::OpenMenu),
         "toggle_split" => Some(Action::ToggleSplit),
+        "rotate_split" => Some(Action::RotateSplit),
         "focus_next_pane" => Some(Action::FocusNextPane),
         "broadcast_toggle" => Some(Action::BroadcastToggle),
         "detach" => Some(Action::Detach),
@@ -244,6 +247,7 @@ mod tests {
         assert_eq!(parse_action("switch_1"), Some(Action::SwitchSession(0)));
         assert_eq!(parse_action("switch_8"), Some(Action::SwitchSession(7)));
         assert_eq!(parse_action("toggle_split"), Some(Action::ToggleSplit));
+        assert_eq!(parse_action("rotate_split"), Some(Action::RotateSplit));
         assert_eq!(parse_action("focus_next_pane"), Some(Action::FocusNextPane));
         assert_eq!(parse_action("switch_0"), None);
         assert_eq!(parse_action("switch_9"), None);

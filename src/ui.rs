@@ -257,14 +257,18 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 }
 
 fn split_output_areas(area: Rect, mode: LayoutMode) -> Vec<Rect> {
-    match mode {
-        LayoutMode::Single => vec![area],
-        LayoutMode::SplitV => Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area)
-            .to_vec(),
-    }
+    // Note the naming inversion: our SplitV ("vertical split", panes side by
+    // side) is ratatui's Direction::Horizontal, and vice versa.
+    let direction = match mode {
+        LayoutMode::Single => return vec![area],
+        LayoutMode::SplitV => Direction::Horizontal,
+        LayoutMode::SplitH => Direction::Vertical,
+    };
+    Layout::default()
+        .direction(direction)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area)
+        .to_vec()
 }
 
 // ── Main output zone ───────────────────────────────────────────────────────
@@ -2070,5 +2074,13 @@ mod tests {
         assert_eq!(split[0].width + split[1].width, area.width);
         assert_eq!(split[0].height, area.height);
         assert_eq!(split[1].height, area.height);
+
+        let stacked = split_output_areas(area, LayoutMode::SplitH);
+        assert_eq!(stacked.len(), 2);
+        assert_eq!(stacked[0].y, area.y);
+        assert_eq!(stacked[1].y, stacked[0].y + stacked[0].height);
+        assert_eq!(stacked[0].height + stacked[1].height, area.height);
+        assert_eq!(stacked[0].width, area.width);
+        assert_eq!(stacked[1].width, area.width);
     }
 }

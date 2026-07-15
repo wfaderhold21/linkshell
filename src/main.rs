@@ -592,6 +592,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::OpenMenu => app.open_menu(),
                     Action::ToggleChat => app.toggle_chat(),
                     Action::ToggleSplit => app.toggle_split(),
+                    Action::RotateSplit => app.rotate_split(),
                     Action::FocusNextPane => app.focus_next_pane(),
                     Action::BroadcastToggle => {
                         app.broadcast_mode = !app.broadcast_mode;
