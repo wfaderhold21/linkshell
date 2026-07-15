@@ -101,6 +101,17 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
     Some(raw)
 }
 
+/// Dedup key for a usage record. Claude CLI emits one JSONL line per content
+/// block of the same API response, and every line repeats the full usage
+/// object — summing per line multiplies real usage. Count each response once,
+/// keyed on message id + request id (same scheme `/cost` uses). Records
+/// without a message id (synthetic entries) get no key and are always counted.
+fn usage_key(v: &serde_json::Value) -> Option<String> {
+    let msg_id = v["message"]["id"].as_str()?;
+    let req_id = v["requestId"].as_str().unwrap_or("");
+    Some(format!("{}:{}", msg_id, req_id))
+}
+
 fn compute_cost(raw: &RawUsage, config: &Config) -> f64 {
     let rate = config.pricing.claude_rate(&raw.model);
     (raw.input as f64 / 1_000_000.0) * rate.input
@@ -137,14 +148,13 @@ async fn tail(
     config: &Config,
 ) {
     let mut acc_input: u64 = 0;
-    let mut acc_cache_write: u64 = 0;
-    let mut acc_cache_read: u64 = 0;
     let mut acc_output: u64 = 0;
     let mut acc_cost: f64 = 0.0;
     let mut context_tokens: u64 = 0;
     let mut billing_detected: bool = false;
     let mut last_model: Option<String> = None;
     let mut offset: u64 = 0;
+    let mut seen_usage: HashSet<String> = HashSet::new();
 
     loop {
         if tx.is_closed() {
@@ -189,6 +199,9 @@ async fn tail(
                                     .await;
                             }
                             if let Some(raw) = parse_usage_from_value(&v) {
+                                if usage_key(&v).is_some_and(|k| !seen_usage.insert(k)) {
+                                    continue;
+                                }
                                 if last_model.as_deref() != Some(&raw.model) {
                                     last_model = Some(raw.model.clone());
                                     let _ = tx
@@ -212,8 +225,6 @@ async fn tail(
                                 }
                                 acc_cost += compute_cost(&raw, config);
                                 acc_input += raw.input;
-                                acc_cache_write += raw.cache_write;
-                                acc_cache_read += raw.cache_read;
                                 acc_output += raw.output;
                                 context_tokens = raw.input + raw.cache_write + raw.cache_read;
                                 new_stats = true;
@@ -226,8 +237,11 @@ async fn tail(
         }
 
         if new_stats {
+            // input_tokens matches `/cost` semantics: non-cache input only.
+            // Cache reads/writes still price into acc_cost and show up in
+            // context_tokens (the real context footprint).
             let stats = TokenStats {
-                input_tokens: acc_input + acc_cache_write + acc_cache_read,
+                input_tokens: acc_input,
                 output_tokens: acc_output,
                 context_tokens,
                 total_cost_usd: acc_cost,
@@ -365,6 +379,37 @@ mod tests {
             "message": {"usage": {"input_tokens": 0, "output_tokens": 0}}
         }))
         .is_none());
+    }
+
+    #[test]
+    fn usage_key_dedupes_content_block_lines_of_one_response() {
+        let line = |block: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "requestId": "req_1",
+                "message": {
+                    "id": "msg_abc",
+                    "usage": {"input_tokens": 10, "output_tokens": 40},
+                    "content": [{"type": block}]
+                }
+            })
+        };
+        let mut seen = HashSet::new();
+        assert!(seen.insert(usage_key(&line("text")).unwrap()));
+        // Second JSONL line for the same API response: same key, must not count.
+        assert!(!seen.insert(usage_key(&line("tool_use")).unwrap()));
+        // A different response counts again.
+        let other = serde_json::json!({
+            "type": "assistant",
+            "requestId": "req_2",
+            "message": {"id": "msg_def", "usage": {"input_tokens": 5}}
+        });
+        assert!(seen.insert(usage_key(&other).unwrap()));
+        // No message id → no key → always counted.
+        assert!(
+            usage_key(&serde_json::json!({"type": "assistant", "message": {"usage": {}}}))
+                .is_none()
+        );
     }
 
     #[test]
