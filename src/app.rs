@@ -380,12 +380,17 @@ impl FileBrowserState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
     Single,
+    /// Two panes side by side (vertical divider).
     SplitV,
+    /// Two panes stacked (horizontal divider).
+    SplitH,
 }
 
 pub struct App {
     pub sessions: Vec<Session>,
     pub layout: LayoutMode,
+    /// Split direction restored by toggle_split after a collapse to Single.
+    pub last_split: LayoutMode,
     pub panes: [Option<usize>; 2],
     pub focused_pane: usize,
     pub mode: AppMode,
@@ -493,6 +498,7 @@ impl App {
         Self {
             sessions: Vec::new(),
             layout: LayoutMode::Single,
+            last_split: LayoutMode::SplitV,
             panes: [None, None],
             focused_pane: 0,
             mode: AppMode::Normal,
@@ -935,7 +941,7 @@ impl App {
         let other = self.focused_pane ^ 1;
         if idx < self.sessions.len()
             && !self.sessions[idx].hidden
-            && (self.layout == LayoutMode::Single || self.panes[other] != Some(idx))
+            && (!self.is_split() || self.panes[other] != Some(idx))
         {
             self.panes[self.focused_pane] = Some(idx);
             let (rows, cols) = self.pane_sizes[self.focused_pane];
@@ -981,10 +987,15 @@ impl App {
         }
     }
 
+    pub fn is_split(&self) -> bool {
+        self.layout != LayoutMode::Single
+    }
+
     pub fn toggle_split(&mut self) {
         match self.layout {
             LayoutMode::Single => {
-                self.layout = LayoutMode::SplitV;
+                // Reopen in whichever direction was used last (default SplitV).
+                self.layout = self.last_split;
                 if self.panes[1].is_none() {
                     self.panes[1] = self
                         .visible_indices()
@@ -992,7 +1003,8 @@ impl App {
                         .find(|idx| Some(*idx) != self.panes[0]);
                 }
             }
-            LayoutMode::SplitV => {
+            LayoutMode::SplitV | LayoutMode::SplitH => {
+                self.last_split = self.layout;
                 self.panes[0] = self.active_idx();
                 self.panes[1] = None;
                 self.focused_pane = 0;
@@ -1002,8 +1014,22 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Flip an active split between side-by-side (SplitV) and stacked
+    /// (SplitH). No-op in Single layout — the pane pair and focus are
+    /// preserved; only the divider direction changes. The post-draw
+    /// handle_pane_resize pass propagates the new geometry to session PTYs.
+    pub fn rotate_split(&mut self) {
+        match self.layout {
+            LayoutMode::SplitV => self.layout = LayoutMode::SplitH,
+            LayoutMode::SplitH => self.layout = LayoutMode::SplitV,
+            LayoutMode::Single => return,
+        }
+        self.last_split = self.layout;
+        self.needs_redraw = true;
+    }
+
     pub fn focus_next_pane(&mut self) {
-        if self.layout == LayoutMode::SplitV {
+        if self.is_split() {
             self.focused_pane ^= 1;
             self.needs_redraw = true;
         }
@@ -5762,6 +5788,39 @@ mod tests {
             [Some(0), Some(2)],
             "a session cannot be displayed in both panes"
         );
+    }
+
+    #[test]
+    fn rotate_split_flips_direction_and_toggle_remembers_it() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+
+        app.rotate_split();
+        assert_eq!(
+            app.layout,
+            LayoutMode::Single,
+            "rotate is a no-op in Single"
+        );
+
+        app.toggle_split();
+        assert_eq!(app.layout, LayoutMode::SplitV);
+        let panes = app.panes;
+        app.focus_next_pane();
+
+        app.rotate_split();
+        assert_eq!(app.layout, LayoutMode::SplitH);
+        assert_eq!(app.panes, panes, "rotation preserves the pane pair");
+        assert_eq!(app.focused_pane, 1, "rotation preserves focus");
+
+        app.focus_next_pane();
+        assert_eq!(app.focused_pane, 0, "pane focus works in SplitH");
+
+        // Collapse and reopen: the split comes back stacked.
+        app.toggle_split();
+        assert_eq!(app.layout, LayoutMode::Single);
+        app.toggle_split();
+        assert_eq!(app.layout, LayoutMode::SplitH);
     }
 
     #[test]

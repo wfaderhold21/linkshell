@@ -16,8 +16,10 @@ pub struct SwappableWriter {
 }
 
 impl SwappableWriter {
-    pub fn with_stdout() -> (Self, Arc<Mutex<WriterBox>>) {
-        let handle: Arc<Mutex<WriterBox>> = Arc::new(Mutex::new(Box::new(std::io::stdout())));
+    /// A writer that starts pointed at io::sink() — the server's initial
+    /// state, before any relay client has attached.
+    pub fn with_sink() -> (Self, Arc<Mutex<WriterBox>>) {
+        let handle: Arc<Mutex<WriterBox>> = Arc::new(Mutex::new(Box::new(std::io::sink())));
         let sw = Self {
             handle: Arc::clone(&handle),
         };
@@ -143,10 +145,63 @@ pub fn write_reattach_info(pid: u32, ipc_socket: &str, token: &str) {
     }
 }
 
+/// The reattach socket path recorded in the info file, if present. This is
+/// the server's own view of the path — the default socket path embeds the
+/// server's pid, so other processes must read it from here rather than
+/// recompute it.
+pub fn recorded_reattach_socket() -> Option<String> {
+    let path = reattach_info_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    let info: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    info["reattach"].as_str().map(str::to_string)
+}
+
 pub fn clear_reattach_info() {
     if let Some(path) = reattach_info_path() {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// True if a linkshell server appears to be running: the reattach info file
+/// exists and its recorded pid is alive. A stale file (dead pid) is removed
+/// so the launcher can start a fresh server.
+pub fn server_alive() -> bool {
+    let Some(path) = reattach_info_path() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(pid) = info["pid"].as_u64() else {
+        return false;
+    };
+    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+    if !alive {
+        let _ = std::fs::remove_file(&path);
+    }
+    alive
+}
+
+fn server_log_path() -> Option<std::path::PathBuf> {
+    linkshell_config_dir().map(|d| d.join("server.log"))
+}
+
+pub fn server_log_path_display() -> String {
+    server_log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/linkshell/server.log".into())
+}
+
+/// Open (create/truncate) the server log for the daemon's stderr.
+pub fn open_server_log() -> Option<std::fs::File> {
+    let path = server_log_path()?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::File::create(path).ok()
 }
 
 // ── Relay client: `linkshell -r` / `linkshell --reattach` ─────────────────
@@ -193,9 +248,17 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
         anyhow::bail!("no active linkshell session (pid {} is not running)", pid);
     }
 
-    // ── Connect ───────────────────────────────────────────────────────────
+    // ── Probe terminal capabilities ───────────────────────────────────────
+    // The kitty keyboard protocol probe writes a query and reads the reply
+    // from stdin, which requires raw mode. Enable it for the probe; if the
+    // handshake fails below we restore before bailing.
     let (cols, rows) = crossterm::terminal::size()?;
+    enable_raw_mode()?;
+    let kitty = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+
+    // ── Connect ───────────────────────────────────────────────────────────
     let stream = UnixStream::connect(&reattach_socket).await.map_err(|e| {
+        let _ = disable_raw_mode();
         anyhow::anyhow!(
             "cannot connect to linkshell reattach socket ({}): {}",
             reattach_socket,
@@ -207,21 +270,30 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     // Handshake: tell the server our terminal dimensions.
     let handshake = format!(
         "{}\n",
-        serde_json::json!({"type":"reattach","token":token,"rows":rows,"cols":cols})
+        serde_json::json!({"type":"reattach","token":token,"rows":rows,"cols":cols,"kitty":kitty})
     );
-    write_half.write_all(handshake.as_bytes()).await?;
+    if let Err(e) = write_half.write_all(handshake.as_bytes()).await {
+        let _ = disable_raw_mode();
+        return Err(e.into());
+    }
 
     // Wait for the server's verdict before taking over the terminal.
     let (read_half, ack) = {
         use tokio::io::AsyncBufReadExt;
         let mut reader = tokio::io::BufReader::new(read_half);
         let mut ack = String::new();
-        reader.read_line(&mut ack).await?;
+        if let Err(e) = reader.read_line(&mut ack).await {
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
         (reader, ack)
     };
-    let ack: serde_json::Value = serde_json::from_str(ack.trim())
-        .map_err(|_| anyhow::anyhow!("unexpected reattach handshake response"))?;
+    let ack: serde_json::Value = serde_json::from_str(ack.trim()).map_err(|_| {
+        let _ = disable_raw_mode();
+        anyhow::anyhow!("unexpected reattach handshake response")
+    })?;
     if ack["ok"].as_bool() != Some(true) {
+        let _ = disable_raw_mode();
         anyhow::bail!(
             "reattach rejected: {}",
             ack["error"].as_str().unwrap_or("unknown error")
@@ -229,13 +301,23 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     }
 
     // ── Set up our terminal ───────────────────────────────────────────────
-    enable_raw_mode()?;
+    // Raw mode is already on (kitty probe). The server re-issues alternate
+    // screen / mouse capture / kitty-push sequences over the relay on attach,
+    // but we enter the alternate screen locally too so there is no flash of
+    // shell content between connect and the server's first frame.
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
-    let restore = || {
+    let restore = move || {
         let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        if kitty {
+            // The server pushes kitty flags on our terminal; pop them in case
+            // the server-side restore didn't reach us (crash, abort).
+            use crossterm::event::PopKeyboardEnhancementFlags;
+            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
-            std::io::stdout(),
+            stdout,
             LeaveAlternateScreen,
             DisableMouseCapture,
             crossterm::cursor::Show
@@ -368,7 +450,7 @@ mod tests {
 
     #[test]
     fn sized_backend_reports_the_shared_size_not_the_tty() {
-        let (swappable, _handle) = SwappableWriter::with_stdout();
+        let (swappable, _handle) = SwappableWriter::with_sink();
         let size: SharedSize = Arc::new(Mutex::new((80, 24)));
         let mut backend = SizedBackend::new(
             ratatui::backend::CrosstermBackend::new(swappable),
