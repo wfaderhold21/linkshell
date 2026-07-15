@@ -11,6 +11,7 @@
 
 mod anthropic;
 mod openai;
+mod skills;
 
 use crate::config::{ApiProvider, OrchestratorClass, OrchestratorConfig};
 use crate::events::{AppEvent, OrchestratorReq};
@@ -197,6 +198,17 @@ fn tool_specs() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             }),
         ),
         (
+            "use_skill",
+            "Load the full text of a named skill from the skills list in your instructions. Returns the skill's markdown; follow it for the task at hand.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        (
             "request_kill",
             "Ask the user for permission to kill a session. This never kills directly — the user must approve with /confirm-kill.",
             serde_json::json!({
@@ -242,6 +254,20 @@ async fn exec_tool(
     name: &str,
     args: &serde_json::Value,
 ) -> String {
+    // use_skill reads from the skills directory directly — no main-loop trip.
+    if name == "use_skill" {
+        let Some(skill_name) = args["name"].as_str() else {
+            return "{\"error\": \"missing required arguments\"}".to_string();
+        };
+        let Some(dir) = cfg.skills_path() else {
+            return "{\"error\": \"no skills directory configured\"}".to_string();
+        };
+        return match skills::read_skill(&dir, skill_name) {
+            Ok(content) => serde_json::json!({"name": skill_name, "content": content}).to_string(),
+            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+        };
+    }
+
     let sid = |key: &str| args[key].as_u64().map(|v| v as usize);
     let req = match name {
         "list_sessions" => Some(OrchestratorReq::ListSessions),
@@ -339,6 +365,13 @@ with [linkshell] are system notes.\n\
 \n\
 Your replies render in a small chat pane: be concise, no markdown headers.",
     );
+    if let Some(list) = skills_section(cfg, false) {
+        p.push_str(
+            "\n\nSkills — playbooks you can load with the use_skill tool. When a task \
+matches a skill's description, load it and follow it:\n",
+        );
+        p.push_str(&list);
+    }
     if !cfg.system.is_empty() {
         p.push_str("\n\n");
         p.push_str(&cfg.system);
@@ -368,11 +401,28 @@ Lines arriving that start with [linkshell event] mean a session changed state \
 (WAITING/ERROR/DEAD): investigate with `list`/`read`, then summarize for the user via \
 `linkshell-ctl chat`. Do not modify files unless the user asks; your role is coordination.",
     );
+    if let Some(list) = skills_section(cfg, true) {
+        p.push_str(
+            "\nSkills — playbooks stored as files. When a task matches a skill's \
+description, read the file and follow it:\n",
+        );
+        p.push_str(&list);
+    }
     if !cfg.system.is_empty() {
         p.push_str("\n\n");
         p.push_str(&cfg.system);
     }
     p
+}
+
+/// Skills list for a prompt, or None when no skills are configured/present.
+fn skills_section(cfg: &OrchestratorConfig, with_paths: bool) -> Option<String> {
+    let dir = cfg.skills_path()?;
+    let list = skills::load_skills(&dir);
+    if list.is_empty() {
+        return None;
+    }
+    Some(skills::skill_list(&list, with_paths))
 }
 
 /// Trim provider history in place, dropping oldest turns but only cutting at
