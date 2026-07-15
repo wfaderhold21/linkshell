@@ -145,6 +145,17 @@ pub fn write_reattach_info(pid: u32, ipc_socket: &str, token: &str) {
     }
 }
 
+/// The reattach socket path recorded in the info file, if present. This is
+/// the server's own view of the path — the default socket path embeds the
+/// server's pid, so other processes must read it from here rather than
+/// recompute it.
+pub fn recorded_reattach_socket() -> Option<String> {
+    let path = reattach_info_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    let info: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    info["reattach"].as_str().map(str::to_string)
+}
+
 pub fn clear_reattach_info() {
     if let Some(path) = reattach_info_path() {
         let _ = std::fs::remove_file(path);

@@ -69,16 +69,18 @@ async fn launch_and_attach() -> anyhow::Result<()> {
         spawn_server_detached()?;
         // Wait for the server to write its reattach info file and bind the
         // socket. The server does this early in startup, so 5s is generous.
-        // The info file is written before the reattach socket is bound, so
-        // wait for both — otherwise the relay client can race the bind.
-        let config = config::load();
-        let sock = reattach::reattach_socket_from_ipc(&ipc::socket_path(&config));
+        // The socket path must come from the info file, not be recomputed
+        // here: the default path embeds the server's pid, and the info file
+        // is written before the socket is bound — waiting for both avoids
+        // racing the bind.
         let mut ready = false;
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if reattach::server_alive() && std::path::Path::new(&sock).exists() {
-                ready = true;
-                break;
+            if let Some(sock) = reattach::recorded_reattach_socket() {
+                if std::path::Path::new(&sock).exists() {
+                    ready = true;
+                    break;
+                }
             }
         }
         if !ready {
