@@ -4372,13 +4372,11 @@ impl App {
         let to_idx = to_1 - 1;
         self.sessions.swap(from_idx, to_idx);
         // Update pane indices to follow the swapped sessions
-        for pane in &mut self.panes {
-            if let Some(ref mut idx) = pane {
-                if *idx == from_idx {
-                    *idx = to_idx;
-                } else if *idx == to_idx {
-                    *idx = from_idx;
-                }
+        for idx in self.panes.iter_mut().flatten() {
+            if *idx == from_idx {
+                *idx = to_idx;
+            } else if *idx == to_idx {
+                *idx = from_idx;
             }
         }
         self.command_result = format!("moved session {} ↔ {}", from_1, to_1);

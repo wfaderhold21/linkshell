@@ -268,8 +268,7 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     let (ev_tx, mut ev_rx) = mpsc::channel::<Vec<u8>>(64);
     let done_tx3 = done_tx.clone();
     tokio::task::spawn_blocking(move || {
-        loop {
-            let Ok(ev) = event::read() else { break };
+        while let Ok(ev) = event::read() {
             let bytes = encode_relay_event(&ev);
             if bytes.is_empty() {
                 continue;

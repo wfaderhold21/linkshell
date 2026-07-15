@@ -53,6 +53,16 @@ tmux doesn't know your Claude session is blocked waiting on you. It doesn't know
 ## Install
 
 ```bash
+cargo install linkshell        # installs linkshell + linkshell-ctl
+```
+
+Or grab a prebuilt binary for Linux (x86_64/aarch64) or macOS
+(Intel/Apple Silicon) from the
+[releases page](https://github.com/wfaderhold21/linkshell/releases).
+
+From source:
+
+```bash
 git clone https://github.com/wfaderhold21/linkshell
 cd linkshell
 cargo build --release
