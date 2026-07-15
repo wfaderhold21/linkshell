@@ -24,12 +24,11 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
@@ -51,7 +50,92 @@ async fn main() -> anyhow::Result<()> {
     if args.iter().any(|a| a == "-r" || a == "--reattach") {
         return reattach::run_relay_client().await;
     }
+    if args.iter().any(|a| a == "--server") {
+        return run_server().await;
+    }
 
+    // ── Default path: client/server split (tmux-style) ─────────────────────
+    // `linkshell` is a thin launcher: make sure a detached server exists,
+    // then run the relay client in the foreground. Detaching just exits the
+    // client — the shell comes back immediately and the server keeps running.
+    launch_and_attach().await
+}
+
+/// Ensure a linkshell server is running (spawning one detached if needed),
+/// then attach the relay client to it in the foreground.
+async fn launch_and_attach() -> anyhow::Result<()> {
+    let already_running = reattach::server_alive();
+    if !already_running {
+        spawn_server_detached()?;
+        // Wait for the server to write its reattach info file and bind the
+        // socket. The server does this early in startup, so 5s is generous.
+        // The info file is written before the reattach socket is bound, so
+        // wait for both — otherwise the relay client can race the bind.
+        let config = config::load();
+        let sock = reattach::reattach_socket_from_ipc(&ipc::socket_path(&config));
+        let mut ready = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if reattach::server_alive() && std::path::Path::new(&sock).exists() {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            anyhow::bail!(
+                "linkshell server did not start within 5s\n  \
+                 (run `linkshell --server` in the foreground to see errors, \
+                 or check {})",
+                reattach::server_log_path_display()
+            );
+        }
+    } else {
+        eprintln!("[linkshell] attaching to existing session");
+    }
+
+    let result = reattach::run_relay_client().await;
+    if result.is_ok() {
+        println!("[linkshell] detached — sessions keep running; run `linkshell` to reattach");
+    }
+    result
+}
+
+/// Spawn `linkshell --server` as a daemon: new session (setsid) so it has no
+/// controlling terminal and survives SSH drops, stdio detached from our tty.
+/// stderr goes to a log file so server-side startup errors are diagnosable.
+/// All CLI flags (--profile, --council, --tcp, ...) are forwarded verbatim.
+fn spawn_server_detached() -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let stderr = reattach::open_server_log()
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
+    let mut cmd = Command::new(exe);
+    cmd.arg("--server")
+        .args(std::env::args().skip(1))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    unsafe {
+        cmd.pre_exec(|| {
+            // Detach from the launcher's session and controlling terminal.
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
+    // Deliberately not waited on: the daemon outlives the launcher, and
+    // setsid means it is never our session's job to reap.
+    Ok(())
+}
+
+/// The linkshell server: owns all sessions, renders headlessly until a relay
+/// client attaches, and keeps running across attach/detach cycles. Never
+/// touches its own stdio as a terminal — all terminal I/O goes over the
+/// relay socket.
+async fn run_server() -> anyhow::Result<()> {
     let config = Arc::new(config::load());
     let profile = match parse_profile_flag() {
         Some(name) => match config.profiles.iter().find(|profile| profile.name == name) {
@@ -90,63 +174,24 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
-    // Restore the terminal even on panic — otherwise raw mode + alternate
-    // screen are left active and the user's shell needs `reset`.
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal(true);
-        default_panic(info);
-    }));
-    // Enable kitty keyboard protocol so the outer terminal (e.g. iTerm) sends
-    // extended sequences for keys like Shift+Enter that would otherwise be
-    // indistinguishable from plain Enter. Pushed *after* entering the alternate
-    // screen: the protocol keeps independent per-screen-buffer stacks, so push
-    // and pop must happen on the same buffer or Shift+Enter is dead while the
-    // TUI runs and the main screen is left with the flags stuck on after exit
-    // (garbled Ctrl+R etc. until `reset`). Must run before the input reader
-    // task spawns — the support probe reads the reply from stdin.
-    let kitty_supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if kitty_supported {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        )?;
-    }
-    // SwappableWriter lets us redirect ratatui output to a relay socket on
-    // reattach without reconstructing the Terminal object.
-    let (swappable, writer_handle) = SwappableWriter::with_stdout();
-    // The initial backend targets stdout (already captured above); the
-    // SwappableWriter holds an Arc<Mutex<WriterBox>> that we swap on reattach
-    // and owns the Write target from here.
+    // The server never renders to its own stdio: the writer starts as a sink
+    // and is swapped to the relay socket when a client attaches. This process
+    // typically has no controlling terminal at all (spawned via setsid).
+    let (swappable, writer_handle) = SwappableWriter::with_sink();
     // SizedBackend answers ratatui's autoresize from this shared value instead
-    // of an ioctl on our tty, so a reattached relay client's dimensions win.
-    let term_size: reattach::SharedSize =
-        Arc::new(Mutex::new(crossterm::terminal::size().unwrap_or((80, 24))));
+    // of an ioctl on a tty; the relay client's handshake dimensions win. The
+    // placeholder size only matters until the first attach — nothing is
+    // rendered to the sink anyway.
+    let term_size: reattach::SharedSize = Arc::new(Mutex::new((80, 24)));
     let backend =
         reattach::SizedBackend::new(CrosstermBackend::new(swappable), Arc::clone(&term_size));
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
     let mut app = App::new(tx.clone(), Arc::clone(&config));
-    // Seed pane size from actual terminal dimensions (best-effort; refined on first draw)
-    if let Ok((term_cols, term_rows)) = crossterm::terminal::size() {
-        // Reserve rows for session bar (3) + status panel (sessions+3, assume 1 session = 4)
-        let chrome_rows = 3 + 4;
-        let rows = term_rows.saturating_sub(chrome_rows).max(1);
-        let cols = term_cols.saturating_sub(2).max(1);
-        app.pane_sizes = [(rows, cols); 2];
-    }
     if let Some(profile) = profile {
         if let Err(error) = app.apply_profile(&profile) {
-            restore_terminal(kitty_supported);
+            // stderr is the server log when daemonized.
             eprintln!("linkshell: profile '{}': {}", profile.name, error);
             std::process::exit(1);
         }
@@ -169,37 +214,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Input reader task — forwards key and mouse events
-    let key_tx = tx.clone();
-    tokio::spawn(async move {
-        loop {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) if key_tx.send(AppEvent::Key(key)).await.is_err() => {
-                        break;
-                    }
-                    Ok(Event::Mouse(mouse))
-                        if key_tx.send(AppEvent::Mouse(mouse)).await.is_err() =>
-                    {
-                        break;
-                    }
-                    Ok(Event::Paste(text))
-                        if key_tx.send(AppEvent::Paste(text.clone())).await.is_err() =>
-                    {
-                        break;
-                    }
-                    Ok(Event::Resize(cols, rows))
-                        if key_tx.send(AppEvent::Resize { cols, rows }).await.is_err() =>
-                    {
-                        break;
-                    }
-                    _ => {}
-                }
-            } else if key_tx.is_closed() {
-                break;
-            }
-        }
-    });
+    // No local stdin input reader: all input arrives as JSON relay events
+    // from the attached client via the reattach socket.
 
     // Write the reattach info file so `linkshell -r` can find this session.
     // The minted token authenticates relay clients; it lives only in the
@@ -208,9 +224,17 @@ async fn main() -> anyhow::Result<()> {
     let reattach_token = auth::mint_token();
     reattach::write_reattach_info(std::process::id(), &ipc_socket_path, &reattach_token);
 
-    // Reattach socket — accepts a single relay client (`linkshell -r`).
+    // Reattach socket — accepts a single relay client (plain `linkshell` or
+    // `linkshell -r`). One client at a time by design: a second connection
+    // attempt is rejected at the handshake while `attached` is set.
+    let attached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reattach_socket_path = reattach::reattach_socket_from_ipc(&ipc_socket_path);
-    spawn_reattach_listener(tx.clone(), reattach_socket_path.clone(), reattach_token);
+    spawn_reattach_listener(
+        tx.clone(),
+        reattach_socket_path.clone(),
+        reattach_token,
+        Arc::clone(&attached),
+    );
 
     // IPC listener — external orchestrators connect to the per-instance socket.
     ipc::spawn_listener(tx.clone(), Arc::clone(&config));
@@ -234,12 +258,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // SIGHUP → detach (SSH drop, controlling terminal closed, etc.)
+    // SIGHUP → detach (only relevant when --server runs in a foreground tty).
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     let frame_cap = Duration::from_millis(16);
     let mut last_render = Instant::now() - frame_cap;
-    let mut headless = false;
+    // The server starts headless and becomes attached on the first relay
+    // connection. relay_task/relay_kitty track the current connection so a
+    // server-initiated detach (`:detach` / Alt+D) can restore the client's
+    // terminal and drop the socket, which makes the client exit cleanly.
+    let mut headless = true;
+    let mut relay_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut relay_kitty = false;
     loop {
         if !headless && app.needs_redraw && last_render.elapsed() >= frame_cap {
             let mut layout = ui::LayoutInfo::default();
@@ -253,7 +283,6 @@ async fn main() -> anyhow::Result<()> {
                     last_render = Instant::now();
                     continue;
                 }
-                restore_terminal(kitty_supported);
                 return Err(error.into());
             }
             app.output_areas = layout.output_areas.clone();
@@ -306,11 +335,18 @@ async fn main() -> anyhow::Result<()> {
                     None => break,
                     Some(AppEvent::Detach) => {
                         if !headless {
-                            restore_terminal(kitty_supported);
-                            headless = true;
-                            // Swap the backend back to a sink so ratatui
-                            // doesn't try to write to the now-dead terminal.
+                            // Restore the *client's* terminal through the
+                            // relay before dropping it, then close the
+                            // connection: the client sees EOF and exits,
+                            // returning the user's shell. Best-effort — the
+                            // client restores its own terminal on exit too.
+                            send_restore_sequences(&writer_handle, relay_kitty);
                             *writer_handle.lock().unwrap() = Box::new(std::io::sink());
+                            if let Some(task) = relay_task.take() {
+                                task.abort();
+                            }
+                            headless = true;
+                            attached.store(false, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                     Some(AppEvent::Resize { cols, rows }) => {
@@ -320,14 +356,21 @@ async fn main() -> anyhow::Result<()> {
                         *term_size.lock().unwrap() = (cols, rows);
                         app.needs_redraw = true;
                     }
-                    Some(AppEvent::Reattach { stream, rows, cols }) => {
-                        do_reattach(
+                    Some(AppEvent::Reattach { stream, rows, cols, kitty }) => {
+                        // Belt and braces: if a previous relay task is still
+                        // around (client vanished without EOF), drop it.
+                        if let Some(task) = relay_task.take() {
+                            task.abort();
+                        }
+                        relay_task = do_reattach(
                             &mut terminal,
                             &writer_handle,
                             &tx,
                             stream,
-                            kitty_supported,
+                            kitty,
                         ).await;
+                        relay_kitty = kitty;
+                        attached.store(true, std::sync::atomic::Ordering::SeqCst);
                         *term_size.lock().unwrap() = (cols, rows);
                         headless = false;
                         app.needs_redraw = true;
@@ -341,41 +384,48 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             _ = sighup.recv() => {
-                if !headless {
-                    restore_terminal(kitty_supported);
-                    headless = true;
-                    *writer_handle.lock().unwrap() = Box::new(std::io::sink());
-                }
+                // A daemonized server (setsid) never receives SIGHUP; this
+                // only fires when run as `linkshell --server` in a foreground
+                // terminal that closes. Treat it as a detach.
+                let _ = tx.try_send(AppEvent::Detach);
             }
             _ = time::sleep(wait) => {}
         }
     }
 
+    // Restore an attached client's terminal before the socket drops on exit.
+    if !headless {
+        send_restore_sequences(&writer_handle, relay_kitty);
+    }
+    if let Some(task) = relay_task.take() {
+        task.abort();
+    }
     reattach::clear_reattach_info();
     let _ = std::fs::remove_file(&reattach_socket_path);
     ipc::cleanup(&config);
-    restore_terminal(kitty_supported);
 
     Ok(())
 }
 
-/// Undo everything terminal-init set up, in reverse order: pop the kitty
-/// keyboard flags while still on the alternate screen (each screen buffer has
-/// its own flag stack), then leave it. Best-effort so it is safe from the
-/// panic hook.
-fn restore_terminal(kitty_supported: bool) {
-    let _ = disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    if kitty_supported {
-        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+/// Write terminal-restore sequences to the current writer (the relay socket
+/// while attached): pop kitty flags while still on the alternate screen, then
+/// leave it. Best-effort; the relay client restores its own terminal on exit
+/// as a second line of defense.
+fn send_restore_sequences(writer_handle: &Arc<Mutex<WriterBox>>, kitty: bool) {
+    let mut buf: Vec<u8> = Vec::new();
+    if kitty {
+        let _ = crossterm::execute!(&mut buf, PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(
-        stdout,
+    let _ = crossterm::execute!(
+        &mut buf,
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste,
         crossterm::cursor::Show
     );
+    let mut w = writer_handle.lock().unwrap();
+    let _ = w.write_all(&buf);
+    let _ = w.flush();
 }
 
 fn is_transient_terminal_error(error: &std::io::Error) -> bool {
@@ -1085,7 +1135,12 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
 
 // ── Reattach socket listener ───────────────────────────────────────────────
 
-fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String, token: String) {
+fn spawn_reattach_listener(
+    tx: mpsc::Sender<AppEvent>,
+    path: String,
+    token: String,
+    attached: Arc<std::sync::atomic::AtomicBool>,
+) {
     tokio::spawn(async move {
         let _ = std::fs::remove_file(&path);
         let Ok(listener) = tokio::net::UnixListener::bind(&path) else {
@@ -1105,6 +1160,7 @@ fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String, token: Stri
             }
             let tx = tx.clone();
             let token = token.clone();
+            let attached = Arc::clone(&attached);
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
                 let mut reader = tokio::io::BufReader::new(stream);
@@ -1129,13 +1185,25 @@ fn spawn_reattach_listener(tx: mpsc::Sender<AppEvent>, path: String, token: Stri
                         .await;
                     return;
                 }
+                // One client at a time, by design: reject while attached
+                // instead of hijacking the existing client's session.
+                if attached.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut stream = reader.into_inner();
+                    let _ = stream
+                        .write_all(
+                            b"{\"ok\":false,\"error\":\"session already attached; detach the other client first\"}\n",
+                        )
+                        .await;
+                    return;
+                }
                 let rows = v["rows"].as_u64().unwrap_or(40) as u16;
                 let cols = v["cols"].as_u64().unwrap_or(200) as u16;
+                let kitty = v["kitty"].as_bool().unwrap_or(false);
                 let mut stream = reader.into_inner();
                 if stream.write_all(b"{\"ok\":true}\n").await.is_err() {
                     return;
                 }
-                let _ = tx.send(AppEvent::Reattach { stream, rows, cols }).await;
+                let _ = tx.send(AppEvent::Reattach { stream, rows, cols, kitty }).await;
             });
         }
     });
@@ -1149,18 +1217,18 @@ async fn do_reattach(
     event_tx: &mpsc::Sender<AppEvent>,
     stream: tokio::net::UnixStream,
     kitty_supported: bool,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     // Convert to std UnixStream so we can clone the fd for the sync writer.
     let Ok(std_stream) = stream.into_std() else {
-        return;
+        return None;
     };
     let _ = std_stream.set_nonblocking(false); // writer clone must be blocking
     let Ok(writer_clone) = std_stream.try_clone() else {
-        return;
+        return None;
     };
     let _ = std_stream.set_nonblocking(true); // back to non-blocking for tokio
     let Ok(relay_reader) = tokio::net::UnixStream::from_std(std_stream) else {
-        return;
+        return None;
     };
 
     // Point the ratatui backend at the relay socket.
@@ -1196,7 +1264,7 @@ async fn do_reattach(
     // inject them into the main event loop.
     let tx = event_tx.clone();
     let tx2 = event_tx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         use tokio::io::AsyncBufReadExt;
         let mut reader = tokio::io::BufReader::new(relay_reader);
         let mut line = String::new();
@@ -1218,6 +1286,7 @@ async fn do_reattach(
     });
     // The caller updates the shared backend size from the handshake's
     // rows/cols; subsequent relay resize events carry their own dimensions.
+    Some(handle)
 }
 
 fn parse_council_flag() -> Option<String> {

@@ -145,6 +145,9 @@ pub enum AppEvent {
         stream: tokio::net::UnixStream,
         rows: u16,
         cols: u16,
+        /// Whether the relay client's terminal supports the kitty keyboard
+        /// protocol (probed client-side, reported in the handshake).
+        kitty: bool,
     },
     /// Tool request from the in-process orchestrator agent (Class A) or a
     /// privileged IPC client; the caller awaits the JSON reply on response_tx.
