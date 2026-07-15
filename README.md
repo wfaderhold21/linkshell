@@ -201,6 +201,8 @@ name = "agent"            # chat target: @agent ...
 # endpoint = "http://localhost:1234/v1"   # openai/lmstudio
 # api_key = "..."          # else ANTHROPIC_API_KEY / OPENAI_API_KEY
 # system = "extra instructions"
+# skills_dir = "~/.config/linkshell/skills"  # *.md skill files; defaults to
+#                                            # this path when the dir exists
 # hidden = true             # CLI class: keep the agent out of the session bar
 # permission_mode = "accept-edits"  # CLI class: start with safe auto-approval
 #                                   # flags (claude: --permission-mode acceptEdits,
@@ -228,6 +230,14 @@ Two provider classes:
   If the hidden CLI still hits a permission dialog or errors, the prompt is
   posted to chat — answer it right there with `/yes` / `/no`, or type any
   other reply with `@agent <text>`; it is typed into its terminal.
+
+**Skills** give the orchestrator reusable playbooks. Drop `*.md` files into
+`~/.config/linkshell/skills/` (or set `skills_dir`): the file stem is the
+skill name, and the description comes from a `description:` line in leading
+`---` frontmatter (or the first non-empty line). Only name + description go
+into the prompt; the full text is loaded on demand — API-class orchestrators
+call a `use_skill` tool, CLI-class orchestrators get the file paths in their
+briefing and read them directly.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
 `:orchestrator start|stop|restart|status|show|hide` manages it at runtime

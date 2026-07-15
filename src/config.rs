@@ -54,6 +54,14 @@ pub struct OrchestratorConfig {
     pub auth_token: String,
     /// Appended to the built-in system prompt / CLI briefing.
     pub system: String,
+    /// Directory of skill files (*.md) the orchestrator can pull in on
+    /// demand. Each file is one skill: the file stem is the skill name, the
+    /// description comes from a `description:` line in leading `---`
+    /// frontmatter (or the first non-empty line). API-class orchestrators
+    /// load skills through the `use_skill` tool; CLI-class orchestrators get
+    /// the file paths in their briefing. Empty = ~/.config/linkshell/skills
+    /// when that directory exists.
+    pub skills_dir: String,
     /// CLI class: working directory for the orchestrator session.
     pub cwd: String,
     /// CLI class: keep the orchestrator session out of the session bar and
@@ -87,6 +95,7 @@ impl Default for OrchestratorConfig {
             api_key: String::new(),
             auth_token: String::new(),
             system: String::new(),
+            skills_dir: String::new(),
             cwd: String::new(),
             hidden: true,
             permission_mode: "accept-edits".to_string(),
@@ -142,6 +151,24 @@ impl OrchestratorConfig {
                 other
             ),
         }
+    }
+
+    /// Effective skills directory: the configured path (with `~` expansion),
+    /// or the default ~/.config/linkshell/skills when it exists.
+    pub fn skills_path(&self) -> Option<std::path::PathBuf> {
+        if !self.skills_dir.is_empty() {
+            let dir = if self.skills_dir == "~" || self.skills_dir.starts_with("~/") {
+                match std::env::var("HOME") {
+                    Ok(home) => format!("{}{}", home, &self.skills_dir[1..]),
+                    Err(_) => self.skills_dir.clone(),
+                }
+            } else {
+                self.skills_dir.clone()
+            };
+            return Some(std::path::PathBuf::from(dir));
+        }
+        let default = config_path()?.parent()?.join("skills");
+        default.is_dir().then_some(default)
     }
 
     /// Effective model id (API class).
