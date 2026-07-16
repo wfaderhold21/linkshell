@@ -122,14 +122,27 @@ fn spawn_server_detached() -> anyhow::Result<()> {
         .stderr(stderr);
     unsafe {
         cmd.pre_exec(|| {
-            // Detach from the launcher's session and controlling terminal.
-            libc::setsid();
-            Ok(())
+            // Detach from the launcher's session and controlling terminal,
+            // then fork once more so the daemon is NOT a session leader: a
+            // session leader that opens a pty slave (pty-process opens the
+            // pts without O_NOCTTY) acquires it as its controlling terminal,
+            // which makes the session child's TIOCSCTTY fail with EPERM and
+            // delivers SIGHUP (→ Detach) to the server when that pty closes.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::fork() {
+                -1 => Err(std::io::Error::last_os_error()),
+                0 => Ok(()),         // grandchild continues to exec the server
+                _ => libc::_exit(0), // intermediate exits immediately
+            }
         });
     }
-    cmd.spawn()?;
-    // Deliberately not waited on: the daemon outlives the launcher, and
-    // setsid means it is never our session's job to reap.
+    let mut child = cmd.spawn()?;
+    // The direct child is only the short-lived intermediate fork; reap it so
+    // it doesn't linger as a zombie. The real server (grandchild) outlives
+    // the launcher and is reparented to init.
+    let _ = child.wait();
     Ok(())
 }
 
