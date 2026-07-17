@@ -171,8 +171,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     } else {
         0
     };
-    let desired_status_rows =
-        app.visible_indices().len().max(1) as u16 + 4 + previews + orch_row;
+    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + previews + orch_row;
     let status_rows = desired_status_rows.min((body.height / 3).max(4));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -643,9 +642,10 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         // Health indicator: red when the agent has failed (Error/Dead),
         // green once it is connected and healthy again.
         let (health_dot, health_style) = match session.state {
-            SessionState::Error | SessionState::Dead => {
-                ("●", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            }
+            SessionState::Error | SessionState::Dead => (
+                "●",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             SessionState::Starting => ("○", Style::default().fg(Color::Gray)),
             _ => ("●", Style::default().fg(Color::Green)),
         };

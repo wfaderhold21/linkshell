@@ -48,12 +48,9 @@ fn find_session(conn: &Connection, dir: &str, since_ms: i64) -> Option<String> {
 /// `{"id":"qwen3.6-28b","providerID":"lmstudio"}`; older rows may be a bare id.
 fn parse_model_column(raw: String) -> Option<(String, Option<String>)> {
     match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(v) => v["id"].as_str().map(|id| {
-            (
-                id.to_owned(),
-                v["providerID"].as_str().map(str::to_owned),
-            )
-        }),
+        Ok(v) => v["id"]
+            .as_str()
+            .map(|id| (id.to_owned(), v["providerID"].as_str().map(str::to_owned))),
         Err(_) if !raw.is_empty() => Some((raw, None)),
         Err(_) => None,
     }
@@ -492,20 +489,14 @@ mod tests {
             3,
             &serde_json::json!({"role": "assistant", "time": {"created": 5, "completed": 9}}),
         );
-        assert_eq!(
-            read_latest_state(&conn, "ses_1"),
-            Some(SessionState::Ready)
-        );
+        assert_eq!(read_latest_state(&conn, "ses_1"), Some(SessionState::Ready));
 
         insert(
             "m4",
             4,
             &serde_json::json!({"role": "assistant", "error": {"name": "boom"}}),
         );
-        assert_eq!(
-            read_latest_state(&conn, "ses_1"),
-            Some(SessionState::Error)
-        );
+        assert_eq!(read_latest_state(&conn, "ses_1"), Some(SessionState::Error));
     }
 
     #[test]
