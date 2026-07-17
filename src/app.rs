@@ -2194,8 +2194,10 @@ impl App {
                     match self.spawn_session(k, name, cwd) {
                         Ok(()) => {
                             if let Some(prompt) = initial_prompt {
-                                let mut msg = prompt;
-                                msg.push('\r');
+                                // Shaped here (bracketed paste for multi-line)
+                                // because pipe relay forwards it verbatim.
+                                let msg = String::from_utf8(shape_injected_input(&prompt))
+                                    .unwrap_or(prompt);
                                 self.handle_pipe_relay(new_id, msg);
                             }
                             serde_json::json!({"session_id": new_id})
@@ -2222,16 +2224,12 @@ impl App {
                         return;
                     }
                     let line_offset = s.output_lines.len();
-                    let mut input = text;
-                    input.push('\r');
-                    s.write_bytes(input.into_bytes());
+                    s.write_bytes(shape_injected_input(&text));
                     self.pending_ipc_replies
                         .insert(session_id, (response_tx, line_offset));
                     return; // reply arrives via check_ipc_replies on READY
                 }
-                let mut input = text;
-                input.push('\r');
-                s.write_bytes(input.into_bytes());
+                s.write_bytes(shape_injected_input(&text));
                 serde_json::json!({"ok": true})
             }
             OrchestratorReq::PipeAdd {
@@ -2435,10 +2433,7 @@ impl App {
             if expired {
                 let tool = p.tool.clone();
                 self.pending_proposal = None;
-                self.chat_system(format!(
-                    "proposal for {} timed out and was denied",
-                    tool
-                ));
+                self.chat_system(format!("proposal for {} timed out and was denied", tool));
                 self.needs_redraw = true;
             }
         }
@@ -3439,6 +3434,7 @@ impl App {
             }
             ["confirm-kill"] => self.resolve_pending_kill(true),
             ["deny-kill"] => self.resolve_pending_kill(false),
+            ["interrupt"] | ["stop"] => self.interrupt_orchestrator(),
             ["approve"] => self.resolve_pending_proposal(true, String::new()),
             ["deny", rest @ ..] => self.resolve_pending_proposal(false, rest.join(" ")),
             ["yes"] => self.answer_permission(None, true),
@@ -3447,6 +3443,23 @@ impl App {
             ["no", t] => self.answer_permission(Some(t), false),
             _ => {}
         }
+    }
+
+    /// Break the orchestrator out of its current turn (/interrupt, /stop).
+    /// The turn stops at the next safe point: immediately if it's blocked in
+    /// a tool call, otherwise before the next tool iteration.
+    fn interrupt_orchestrator(&mut self) {
+        let Some(h) = &self.orchestrator else {
+            self.command_result = "no API orchestrator running".to_string();
+            return;
+        };
+        h.interrupt();
+        // A pending proposal is a blocked tool call; clear it so the chat
+        // pane doesn't keep asking for a verdict on a dead question.
+        self.pending_proposal = None;
+        let name = h.name.clone();
+        self.chat_system(format!("interrupt sent to @{}", name));
+        self.command_result = format!("interrupted @{}", name);
     }
 
     /// Approve or refuse the orchestrator's pending kill request.
@@ -4261,18 +4274,7 @@ impl App {
     /// Inject a chat message into a session's PTY and await its READY reply.
     fn send_chat_to_session(&mut self, id: usize, name: String, msg: &str) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
-            // Multi-line messages (pastes) go through bracketed paste so the
-            // target CLI doesn't submit at each embedded newline.
-            let mut bytes = Vec::with_capacity(msg.len() + 13);
-            if msg.contains('\n') {
-                bytes.extend_from_slice(b"\x1b[200~");
-                bytes.extend_from_slice(msg.as_bytes());
-                bytes.extend_from_slice(b"\x1b[201~");
-            } else {
-                bytes.extend_from_slice(msg.as_bytes());
-            }
-            bytes.push(b'\r');
-            s.write_bytes(bytes);
+            s.write_bytes(shape_injected_input(msg));
         }
         // One outstanding reply per session; a new message supersedes it.
         self.chat.pending.retain(|p| p.session_id != id);
@@ -5089,6 +5091,23 @@ fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
 /// separately after a pause so TUIs register a submit, not a pasted newline.
 fn chunk_carries_enter(bytes: &[u8]) -> bool {
     bytes.len() > 1 && matches!(bytes.last(), Some(b'\r') | Some(b'\n'))
+}
+
+/// Shape injected input (chat, orchestrator send_input, initial prompts) for
+/// a session PTY: multi-line messages go through bracketed paste so TUIs
+/// (claude, codex, opencode) don't submit at each embedded newline, and the
+/// trailing '\r' lets the writer task press Enter as its own keystroke.
+fn shape_injected_input(msg: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(msg.len() + 13);
+    if msg.contains('\n') {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(msg.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(msg.as_bytes());
+    }
+    bytes.push(b'\r');
+    bytes
 }
 
 /// Best-effort cut of a screen scrape down to the agent's latest reply:
@@ -6528,10 +6547,10 @@ mod tests {
     fn dead_orchestrator_task_is_noticed_once_and_cleared() {
         let mut app = make_app();
         let (otx, orx) = mpsc::channel(1);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
         drop(orx); // the task is gone
         app.handle_tick();
         assert!(app.orchestrator.is_none());
@@ -6550,10 +6569,10 @@ mod tests {
     async fn orchestrator_restart_replaces_a_dead_handle() {
         let mut app = make_app();
         let (otx, orx) = mpsc::channel(1);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
         drop(orx);
         app.command_input = "orchestrator restart".into();
         app.execute_command();
@@ -6601,10 +6620,10 @@ mod tests {
         let orch = app.spawn_headless_session("agent".into(), None).unwrap();
         app.orchestrator_session_id = None;
         let (otx, mut orx) = mpsc::channel(8);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
 
         // READY is in the default event list (completion notifications)
         app.notify_orchestrator(watched, &SessionState::Ready);
@@ -6634,18 +6653,17 @@ mod tests {
         let mut app = make_app();
         let id = app.spawn_headless_session("worker".into(), None).unwrap();
         let (otx, mut orx) = mpsc::channel(8);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
 
         // Simulate an agent CLI that streamed output and then went quiet:
         // Running with the last output more than 2s ago.
         {
             let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
             s.state = SessionState::Running;
-            s.last_output_at =
-                Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+            s.last_output_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
         }
 
         app.handle_tick();
