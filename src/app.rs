@@ -834,6 +834,19 @@ impl App {
                         s.stats_from_watcher = true;
                     }
                 }
+                // When the command itself names the backend (llama-cli, …),
+                // probe that backend's localhost API for the loaded model's
+                // context window. Sessions that reach a backend indirectly
+                // (opencode → lmstudio/llamacpp) get their probe when the
+                // provider shows up in the DB (SessionProvider event).
+                if let Some(backend) = crate::session::command_base_name(&cmd_str)
+                    .and_then(crate::ctx_probe::backend_for_command)
+                {
+                    crate::ctx_probe::spawn_probe(id, backend, tx.clone());
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                        s.ctx_probe_spawned = true;
+                    }
+                }
                 // A custom command may still be a claude session behind a
                 // wrapper name the classifier can't see through. Watch the
                 // claude projects dir speculatively: if a new JSONL appears
@@ -1225,6 +1238,12 @@ impl App {
             if session.base == crate::session::BaseKind::LocalAgent && !session.stats_from_watcher {
                 if let Some(stats) = self.matcher.parse_tokens(&stripped) {
                     session.accumulate_stats(stats);
+                }
+            }
+            // llama-cli prints "n_ctx = N" during model load
+            if session.base == crate::session::BaseKind::LocalAgent {
+                if let Some(max) = self.matcher.parse_context_max(&stripped) {
+                    session.context_max = max;
                 }
             }
             state_after = Some(session.state.clone());

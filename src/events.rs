@@ -48,6 +48,18 @@ pub enum AppEvent {
         session_id: usize,
         base: crate::session::BaseKind,
     },
+    /// Model provider a watcher discovered for the session (e.g. OpenCode's
+    /// providerID: "lmstudio", "llamacpp", "anthropic", …)
+    SessionProvider {
+        session_id: usize,
+        provider: String,
+    },
+    /// Maximum context window discovered for a local model backend
+    /// (LM Studio / llama-server probe)
+    SessionContextMax {
+        session_id: usize,
+        max: u64,
+    },
     /// Model ID parsed from the session's JSONL log (Claude or Codex)
     SessionModel {
         session_id: usize,

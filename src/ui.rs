@@ -107,6 +107,7 @@ const CUSTOM_COLOR: Color = Color::Cyan;
 const OPENCODE_COLOR: Color = Color::Rgb(80, 200, 120); // green
 const OHMYPI_COLOR: Color = Color::Rgb(200, 120, 255); // purple
 const AIDER_COLOR: Color = Color::Rgb(0, 180, 180); // teal
+const ORCH_COLOR: Color = Color::Rgb(255, 215, 0); // gold
 
 fn kind_color(kind: &SessionKind) -> Color {
     match kind {
@@ -165,7 +166,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
                 && session.waiting_prompt.is_some()
         })
         .count() as u16;
-    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + previews;
+    let orch_row = if app.orchestrator.is_some() || app.orchestrator_session_id.is_some() {
+        1u16
+    } else {
+        0
+    };
+    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + previews + orch_row;
     let status_rows = desired_status_rows.min((body.height / 3).max(4));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -485,6 +491,86 @@ fn model_display(model: Option<&str>) -> String {
     m.chars().take(12).collect()
 }
 
+/// Status-panel row data for the orchestrator agent, whichever flavor runs.
+struct OrchRow {
+    dot: &'static str,
+    dot_style: Style,
+    name: String,
+    model: Option<String>,
+    state: String,
+    state_style: Style,
+    tokens: String,
+    cost: String,
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn orchestrator_row(app: &App) -> Option<OrchRow> {
+    let green = Style::default().fg(Color::Green);
+    let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+
+    if let Some(h) = &app.orchestrator {
+        // API-class: in-process task. Failed when its channel is gone.
+        let alive = !h.tx.is_closed();
+        let busy = app.orchestrator_status.is_some();
+        let stats = &app.orchestrator_stats;
+        let total = stats.input_tokens + stats.output_tokens;
+        return Some(OrchRow {
+            dot: "●",
+            dot_style: if alive { green } else { red },
+            name: h.name.clone(),
+            model: Some(app.config.orchestrator.model.clone()).filter(|m| !m.is_empty()),
+            state: if !alive {
+                "DEAD".into()
+            } else if busy {
+                "BUSY".into()
+            } else {
+                "IDLE".into()
+            },
+            state_style: if !alive {
+                red
+            } else if busy {
+                Style::default().fg(CLAUDE_COLOR)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+            tokens: if total == 0 {
+                "—".into()
+            } else if total >= 1000 {
+                format!("{:.1}k tok", total as f64 / 1000.0)
+            } else {
+                format!("{total} tok")
+            },
+            cost: if stats.total_cost_usd > 0.0 {
+                format!("${:.3}", stats.total_cost_usd)
+            } else {
+                "—".into()
+            },
+        });
+    }
+
+    // CLI-class: a (usually hidden) session drives a real CLI.
+    let sid = app.orchestrator_session_id?;
+    let s = app.sessions.iter().find(|s| s.id == sid)?;
+    let failed = matches!(s.state, SessionState::Error | SessionState::Dead);
+    Some(OrchRow {
+        dot: "●",
+        dot_style: if failed { red } else { green },
+        name: s.name.clone(),
+        model: s.model.clone(),
+        state: s.state.label().to_string(),
+        state_style: if failed {
+            red
+        } else {
+            Style::default().fg(Color::Green)
+        },
+        tokens: s.tokens_display(),
+        cost: s.cost_display(),
+    })
+}
+
 fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let title = match &app.council {
         Some(r) if r.complete => format!(" Status ── council '{}' done ", r.group),
@@ -507,7 +593,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
         let header_spans = vec![
-            Span::styled("  # ", hdr_style),
+            Span::styled("  ⏻ ", hdr_style),
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:<8} ", "Kind"), hdr_style),
             Span::styled("│ ", hdr_style),
@@ -538,7 +624,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let mut row_y = inner.y + 1;
     // Rows (and the returned click rects) cover visible sessions only, in
     // the same order as the session bar slots.
-    for (i, idx) in app.visible_indices().into_iter().enumerate() {
+    for idx in app.visible_indices() {
         let session = &app.sessions[idx];
         if row_y >= inner.y + inner.height {
             break;
@@ -553,9 +639,16 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         row_y += 1;
         row_areas.push(row);
 
-        let num_style = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
+        // Health indicator: red when the agent has failed (Error/Dead),
+        // green once it is connected and healthy again.
+        let (health_dot, health_style) = match session.state {
+            SessionState::Error | SessionState::Dead => (
+                "●",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            SessionState::Starting => ("○", Style::default().fg(Color::Gray)),
+            _ => ("●", Style::default().fg(Color::Green)),
+        };
         let kind_style = Style::default().fg(kind_color(&session.kind));
         let state_style = match session.state {
             SessionState::Waiting => Style::default()
@@ -595,7 +688,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         let all_inactive = !glyphs.is_empty() && glyphs.iter().all(|glyph| !glyph.active);
 
         let spans = vec![
-            Span::styled(format!("  {:1} ", i + 1), num_style),
+            Span::styled(format!("  {health_dot} "), health_style),
             Span::raw("│ "),
             Span::styled(format!("{:<8} ", session.kind.label()), kind_style),
             Span::raw("│ "),
@@ -655,6 +748,53 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
                     row_y += 1;
                 }
             }
+        }
+    }
+
+    // Orchestrator agent row — after the session rows so the returned click
+    // rects still map 1:1 onto visible sessions. Covers both flavors: the
+    // in-process API-class handle and the hidden CLI-class session.
+    let orch = orchestrator_row(app);
+    if let Some(o) = orch {
+        if row_y < inner.y + inner.height {
+            let row = Rect {
+                x: inner.x,
+                y: row_y,
+                width: inner.width,
+                height: 1,
+            };
+            let spans = vec![
+                Span::styled(format!("  {} ", o.dot), o.dot_style),
+                Span::raw("│ "),
+                Span::styled(
+                    format!("{:<8} ", truncate(&o.name, 8)),
+                    Style::default().fg(ORCH_COLOR).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("│ "),
+                Span::styled(
+                    format!("{:<12} ", model_display(o.model.as_deref())),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::raw("│ "),
+                Span::styled(
+                    format!("{:<20} ", "orchestrator"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("│ "),
+                Span::styled(format!("{:<8} ", o.state), o.state_style),
+                Span::raw("│ "),
+                Span::styled(format!("{:>6}  ", ""), Style::default().fg(Color::Gray)),
+                Span::raw("│ "),
+                Span::styled(
+                    format!("{:>8}  ", o.tokens),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw("│ "),
+                Span::styled(format!("{:>8}  ", "—"), Style::default().fg(Color::Magenta)),
+                Span::raw("│ "),
+                Span::styled(format!("{:>7}", o.cost), Style::default().fg(Color::Green)),
+            ];
+            f.render_widget(Paragraph::new(Line::from(spans)), row);
         }
     }
 

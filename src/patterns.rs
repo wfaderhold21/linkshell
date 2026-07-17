@@ -6,6 +6,7 @@ pub struct PatternMatcher {
     shell_ready: Regex,
     local_thinking: Regex,
     local_ready: Regex,
+    local_waiting: Regex,
     // Claude-specific patterns
     claude_thinking: Regex,
     claude_ready: Regex,
@@ -16,6 +17,8 @@ pub struct PatternMatcher {
     // Generic waiting/error
     generic_waiting: Regex,
     generic_error: Regex,
+    // llama.cpp startup line: "n_ctx = 8192"
+    nctx_re: Regex,
     // Token / cost extraction (applied to full screen text)
     cost_re: Regex,
     tokens_in_re: Regex,
@@ -35,6 +38,13 @@ impl PatternMatcher {
             .unwrap(),
             // idle prompt markers used by local agent TUIs and llama-cli
             local_ready: Regex::new(r"^[>❯]\s*$|^\(\S+\)>\s*$").unwrap(),
+            // opencode permission dialog ("△ Permission required" with
+            // Allow once / Allow always / Reject options) and aider's
+            // (Y)es/(N)o confirmation prompts.
+            local_waiting: Regex::new(
+                r"Permission required|Allow once|Allow always|Always allow|\(Y\)es.*\(N\)o",
+            )
+            .unwrap(),
             claude_thinking: Regex::new(r"(Thinking|Processing|Analyzing)\.\.\.|⠋|⠙|⠹|⠸").unwrap(),
             claude_ready: Regex::new(r"^>\s*$|Human:\s*$").unwrap(),
             claude_waiting: Regex::new(
@@ -49,6 +59,8 @@ impl PatternMatcher {
             generic_waiting: Regex::new(r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter").unwrap(),
             generic_error: Regex::new(r"(?i)error:|failed:|panic!|fatal:|command not found")
                 .unwrap(),
+
+            nctx_re: Regex::new(r"\bn_ctx\s*=\s*(\d+)").unwrap(),
 
             // "$0.052" or "~$1.23" or "$12"
             cost_re: Regex::new(r"~?\$\s*(\d+(?:\.\d+)?)").unwrap(),
@@ -114,6 +126,9 @@ impl PatternMatcher {
                 }
             }
             BaseKind::LocalAgent => {
+                if self.local_waiting.is_match(line) {
+                    return Some(SessionState::Waiting);
+                }
                 if self.local_thinking.is_match(line) {
                     return Some(SessionState::Thinking);
                 }
@@ -134,6 +149,17 @@ impl PatternMatcher {
             }
         }
         None
+    }
+
+    /// llama-cli / llama-server print "n_ctx = N" during model load; that's
+    /// the context window the model was actually loaded with.
+    pub fn parse_context_max(&self, line: &str) -> Option<u64> {
+        self.nctx_re
+            .captures(line)?
+            .get(1)?
+            .as_str()
+            .parse::<u64>()
+            .ok()
     }
 
     /// Scan an entire screen's text for token/cost statistics.
@@ -296,6 +322,39 @@ mod tests {
             matcher.infer_state("shall I proceed?", BaseKind::Claude),
             Some(SessionState::Waiting)
         );
+    }
+
+    #[test]
+    fn local_agent_permission_dialogs_are_waiting_even_with_spinner() {
+        let matcher = PatternMatcher::new();
+
+        for line in [
+            "△ Permission required",
+            "  Allow once   Allow always   Reject",
+            "⠙ △ Permission required", // spinner remnant must not win
+            "Add foo.py to the chat? (Y)es/(N)o [Yes]:",
+        ] {
+            assert_eq!(
+                matcher.infer_state(line, BaseKind::LocalAgent),
+                Some(SessionState::Waiting),
+                "{line}"
+            );
+        }
+
+        assert_eq!(
+            matcher.infer_state("⠙ working... esc to interrupt", BaseKind::LocalAgent),
+            Some(SessionState::Thinking)
+        );
+    }
+
+    #[test]
+    fn parse_context_max_reads_llama_nctx_line() {
+        let matcher = PatternMatcher::new();
+        assert_eq!(
+            matcher.parse_context_max("llama_context: n_ctx         = 8192"),
+            Some(8192)
+        );
+        assert_eq!(matcher.parse_context_max("loading model..."), None);
     }
 
     #[test]
