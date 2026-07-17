@@ -22,7 +22,12 @@ pub async fn run_turn(
     history.push(serde_json::json!({"role": "user", "content": user_text}));
     super::trim_history(history, cfg.max_history_turns);
 
-    for _ in 0..cfg.max_tool_iterations {
+    for i in 0..cfg.max_tool_iterations {
+        super::send_status(
+            event_tx,
+            format!("thinking ({}/{})", i + 1, cfg.max_tool_iterations),
+        )
+        .await;
         // System prompt is prepended per request so history stays trimmable.
         let mut messages =
             vec![serde_json::json!({"role": "system", "content": super::system_prompt(cfg)})];
@@ -88,6 +93,7 @@ pub async fn run_turn(
     // Tool-iteration budget exhausted: one final tool-less turn so the model
     // summarizes its partial progress instead of returning a dead-end
     // sentinel. tool_choice "none" hard-blocks further calls.
+    super::send_status(event_tx, "summarizing (budget exhausted)").await;
     history.push(serde_json::json!({"role": "user", "content": super::EXHAUSTION_NUDGE}));
     let mut messages =
         vec![serde_json::json!({"role": "system", "content": super::system_prompt(cfg)})];

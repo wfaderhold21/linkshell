@@ -458,6 +458,9 @@ pub struct App {
     pub pending_kill: Option<PendingKill>,
     /// Token usage of the orchestrator's own API calls
     pub orchestrator_stats: crate::session::TokenStats,
+    /// Live progress of the orchestrator's current turn, plus when it was
+    /// set (drives the chat-pane spinner). None while idle.
+    pub orchestrator_status: Option<(String, std::time::Instant)>,
     /// Per-(session_id, state label) cooldown for proactive orchestrator events
     orch_event_cooldowns: HashMap<(usize, &'static str), std::time::Instant>,
     /// Session behind the most recent permission request surfaced in chat;
@@ -548,6 +551,7 @@ impl App {
             orchestrator_session_id: None,
             pending_kill: None,
             orchestrator_stats: crate::session::TokenStats::default(),
+            orchestrator_status: None,
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
             chat: ChatState::default(),
@@ -2344,6 +2348,15 @@ impl App {
 
     pub fn handle_tick(&mut self) {
         self.check_orchestrator_alive();
+        if self.orchestrator_status.is_some() {
+            if self.orchestrator.is_none() {
+                self.orchestrator_status = None;
+            }
+            // Keep the chat-pane spinner animating while a turn is running.
+            if self.mode == AppMode::Chat {
+                self.needs_redraw = true;
+            }
+        }
         // (session id, state before the tick flipped it to Ready). Routed
         // through on_state_transition below — the single funnel for state
         // changes — so tick-detected completions reach every consumer

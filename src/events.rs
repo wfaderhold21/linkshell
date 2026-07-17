@@ -155,6 +155,10 @@ pub enum AppEvent {
         req: OrchestratorReq,
         response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
     },
+    /// Live progress of the orchestrator's current turn, shown in the chat
+    /// pane ("thinking (3/12)", "running read_output", ...). None clears it
+    /// when the turn ends.
+    OrchestratorStatus(Option<String>),
     /// Token usage from the orchestrator's own API calls
     OrchestratorUsage {
         input: u64,

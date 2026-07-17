@@ -101,6 +101,7 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
                     "orchestrator task started for CLI provider"
                 )),
             };
+            let _ = event_tx.send(AppEvent::OrchestratorStatus(None)).await;
             let text = match result {
                 Ok(text) => text,
                 Err(e) => format!("[{}: error: {}]", cfg.name, e),
@@ -256,12 +257,20 @@ fn openai_tools() -> serde_json::Value {
 
 /// Parse a tool call into a request, dispatch it to the main loop, and wait.
 /// Always returns a JSON string suitable as a tool result.
+/// Announce tool execution in the chat-pane status line.
+async fn send_status(event_tx: &mpsc::Sender<AppEvent>, status: impl Into<String>) {
+    let _ = event_tx
+        .send(AppEvent::OrchestratorStatus(Some(status.into())))
+        .await;
+}
+
 async fn exec_tool(
     cfg: &OrchestratorConfig,
     event_tx: &mpsc::Sender<AppEvent>,
     name: &str,
     args: &serde_json::Value,
 ) -> String {
+    send_status(event_tx, format!("running {}", name)).await;
     // use_skill reads from the skills directory directly — no main-loop trip.
     if name == "use_skill" {
         let Some(skill_name) = args["name"].as_str() else {
@@ -482,6 +491,21 @@ mod tests {
         assert!(a[0]["input_schema"].is_object());
         assert_eq!(o[0]["type"], "function");
         assert!(o[0]["function"]["parameters"].is_object());
+    }
+
+    #[tokio::test]
+    async fn exec_tool_announces_status_before_running() {
+        let cfg = OrchestratorConfig::default();
+        let (tx, mut rx) = mpsc::channel::<AppEvent>(8);
+        // use_skill with no skills dir: fails fast without a main-loop trip,
+        // but the status announcement must still come first.
+        let _ = exec_tool(&cfg, &tx, "use_skill", &serde_json::json!({"name": "x"})).await;
+        match rx.try_recv() {
+            Ok(AppEvent::OrchestratorStatus(Some(s))) => {
+                assert!(s.contains("use_skill"), "status names the tool: {}", s)
+            }
+            other => panic!("expected OrchestratorStatus, got {:?}", other.is_ok()),
+        }
     }
 
     #[test]

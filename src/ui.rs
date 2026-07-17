@@ -1307,6 +1307,16 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
             Style::default().fg(Color::DarkGray),
         )));
     }
+    if let Some((status, since)) = &app.orchestrator_status {
+        // Braille spinner keyed off wall time; handle_tick keeps the pane
+        // redrawing while a turn is in flight.
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame = FRAMES[(since.elapsed().as_millis() / 120) as usize % FRAMES.len()];
+        lines.push(Line::from(Span::styled(
+            format!("{} {}: {}", frame, app.config.orchestrator.name, status),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
 
     // Window: scroll counts lines up from the tail
     let total = lines.len();

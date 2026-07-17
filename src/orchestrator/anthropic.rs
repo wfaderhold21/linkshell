@@ -27,7 +27,12 @@ pub async fn run_turn(
     history.push(serde_json::json!({"role": "user", "content": user_text}));
     super::trim_history(history, cfg.max_history_turns);
 
-    for _ in 0..cfg.max_tool_iterations {
+    for i in 0..cfg.max_tool_iterations {
+        super::send_status(
+            event_tx,
+            format!("thinking ({}/{})", i + 1, cfg.max_tool_iterations),
+        )
+        .await;
         let body = serde_json::json!({
             "model": cfg.model_id(),
             "max_tokens": cfg.max_tokens,
@@ -100,6 +105,7 @@ pub async fn run_turn(
     // rides in the pending tool_results user turn (roles must alternate) and
     // tool_choice "none" hard-blocks further calls; `tools` stays in the body
     // because the API requires definitions while tool blocks are in history.
+    super::send_status(event_tx, "summarizing (budget exhausted)").await;
     if let Some(serde_json::Value::Array(blocks)) =
         history.last_mut().map(|m| &mut m["content"])
     {
