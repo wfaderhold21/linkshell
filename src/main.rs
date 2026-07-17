@@ -627,6 +627,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
 
 fn handle_paste(app: &mut App, text: String) {
     match &app.mode {
+        AppMode::Normal if app.chat_docked == Some(app.focused_pane) => app.chat_paste(&text),
         AppMode::Normal => {
             // Forward to PTY wrapped in bracketed paste sequences so the inner
             // program can distinguish pasted text from typed input.
@@ -690,6 +691,13 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollDownLine => app.scroll_down(3),
                     Action::OpenMenu => app.open_menu(),
                     Action::ToggleChat => app.toggle_chat(),
+                    Action::DockChat => {
+                        if app.chat_docked.is_some() {
+                            app.undock_chat();
+                        } else {
+                            app.dock_chat(None);
+                        }
+                    }
                     Action::ToggleSplit => app.toggle_split(),
                     Action::RotateSplit => app.rotate_split(),
                     Action::FocusNextPane => app.focus_next_pane(),
@@ -706,6 +714,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         let _ = app.event_tx.try_send(AppEvent::Detach);
                     }
                 }
+                return;
+            }
+            // Docked chat pane focused → keys drive the chat input
+            if app.chat_docked == Some(app.focused_pane) {
+                app.chat_key(key);
                 return;
             }
             // Pass through to PTY

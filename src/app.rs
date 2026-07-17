@@ -325,6 +325,12 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
         "Stop logging session output",
         "log stop ",
     ),
+    (
+        "chat dock [left|right|top|bottom]",
+        "Dock the chat as a split pane",
+        "chat dock ",
+    ),
+    ("chat undock", "Close the docked chat pane", "chat undock"),
     ("broadcast toggle", "Toggle broadcast mode", "broadcast"),
     ("search <query>", "Search session output", "search "),
     ("settings", "Open settings menu", "settings"),
@@ -479,6 +485,9 @@ pub struct App {
     /// `/yes` and `/no` without a target answer this one.
     pub last_permission_request: Option<usize>,
     pub chat: ChatState,
+    /// When Some(p), split pane `p` renders the chat instead of a session
+    /// and keyboard input goes to the chat while that pane is focused.
+    pub chat_docked: Option<usize>,
     /// When true, key input is forwarded to all non-dead sessions
     pub broadcast_mode: bool,
     pub settings_state: SettingsState,
@@ -568,6 +577,7 @@ impl App {
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
             chat: ChatState::default(),
+            chat_docked: None,
             broadcast_mode: false,
             settings_state: SettingsState::new_empty(),
             clipboard: None,
@@ -968,6 +978,11 @@ impl App {
     }
 
     pub fn switch_to(&mut self, idx: usize) {
+        // Selecting a session while the chat pane is focused replaces the
+        // chat with that session.
+        if self.chat_docked == Some(self.focused_pane) {
+            self.chat_docked = None;
+        }
         let other = self.focused_pane ^ 1;
         if idx < self.sessions.len()
             && !self.sessions[idx].hidden
@@ -1035,6 +1050,7 @@ impl App {
             }
             LayoutMode::SplitV | LayoutMode::SplitH => {
                 self.last_split = self.layout;
+                self.chat_docked = None;
                 self.panes[0] = self.active_idx();
                 self.panes[1] = None;
                 self.focused_pane = 0;
@@ -2461,7 +2477,7 @@ impl App {
                 self.orchestrator_status = None;
             }
             // Keep the chat-pane spinner animating while a turn is running.
-            if self.mode == AppMode::Chat {
+            if self.mode == AppMode::Chat || self.chat_docked.is_some() {
                 self.needs_redraw = true;
             }
         }
@@ -2600,6 +2616,30 @@ impl App {
                     AppMode::Normal | AppMode::Menu { .. } => {}
                 }
 
+                // Docked chat pane click → focus it, maybe start a transcript
+                // selection.
+                if let Some(pane) = self.chat_docked {
+                    if let Some(area) = self.output_areas.get(pane).copied() {
+                        if rect_hit(area, col, row) {
+                            self.focused_pane = pane;
+                            self.selection = None;
+                            if rect_hit(self.chat_transcript_area, col, row) {
+                                let c = col - self.chat_transcript_area.x;
+                                let r = row - self.chat_transcript_area.y;
+                                self.chat_selection = Some(Selection {
+                                    start_col: c,
+                                    start_row: r,
+                                    end_col: c,
+                                    end_row: r,
+                                });
+                            } else {
+                                self.chat_selection = None;
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 // Session bar click → switch session (slots cover visible
                 // sessions only, so map the slot position to a real index)
                 for (i, slot) in self.session_slot_areas.iter().enumerate() {
@@ -2632,7 +2672,10 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) if matches!(self.mode, AppMode::Chat) => {
+            MouseEventKind::Drag(MouseButton::Left)
+                if matches!(self.mode, AppMode::Chat)
+                    || (self.chat_docked.is_some() && self.chat_selection.is_some()) =>
+            {
                 let area = self.chat_transcript_area;
                 if let Some(sel) = &mut self.chat_selection {
                     sel.end_col = col.saturating_sub(area.x).min(area.width.saturating_sub(1));
@@ -2641,7 +2684,10 @@ impl App {
                         .min(area.height.saturating_sub(1));
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) if matches!(self.mode, AppMode::Chat) => {
+            MouseEventKind::Up(MouseButton::Left)
+                if matches!(self.mode, AppMode::Chat)
+                    || (self.chat_docked.is_some() && self.chat_selection.is_some()) =>
+            {
                 // Finalize transcript selection; auto-copy like the panes
                 if let Some(sel) = &self.chat_selection {
                     let ((mr, mc), (er, ec)) = sel.normalized();
@@ -2653,7 +2699,8 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Right)
-                if matches!(self.mode, AppMode::Chat) && self.chat_selection.is_some() =>
+                if (matches!(self.mode, AppMode::Chat) || self.chat_docked.is_some())
+                    && self.chat_selection.is_some() =>
             {
                 self.copy_chat_selection();
             }
@@ -2686,9 +2733,11 @@ impl App {
                 self.copy_selection();
             }
             MouseEventKind::ScrollUp => {
-                if matches!(self.mode, AppMode::Chat) {
+                if matches!(self.mode, AppMode::Chat) || self.chat_docked.is_some() {
                     if rect_hit(self.chat_area, col, row) {
                         self.chat_scroll_up(3);
+                    } else if !matches!(self.mode, AppMode::Chat) && self.focus_pane_at(col, row) {
+                        self.scroll_up(3);
                     }
                 } else if matches!(self.mode, AppMode::NewSession) {
                     self.new_session_select_kind(-1);
@@ -2699,9 +2748,11 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if matches!(self.mode, AppMode::Chat) {
+                if matches!(self.mode, AppMode::Chat) || self.chat_docked.is_some() {
                     if rect_hit(self.chat_area, col, row) {
                         self.chat_scroll_down(3);
+                    } else if !matches!(self.mode, AppMode::Chat) && self.focus_pane_at(col, row) {
+                        self.scroll_down(3);
                     }
                 } else if matches!(self.mode, AppMode::NewSession) {
                     self.new_session_select_kind(1);
@@ -3363,6 +3414,26 @@ impl App {
                     .unwrap_or_else(|_| "~".to_string());
                 let _ = self.spawn_session(kind, name, cwd);
             }
+            ["chat"] => self.toggle_chat(),
+            ["chat", "dock"] => self.dock_chat(None),
+            ["chat", "dock", side] => match *side {
+                "left" | "right" | "top" | "bottom" => {
+                    self.layout = if matches!(*side, "left" | "right") {
+                        LayoutMode::SplitV
+                    } else {
+                        LayoutMode::SplitH
+                    };
+                    self.last_split = self.layout;
+                    self.dock_chat(Some(usize::from(matches!(*side, "right" | "bottom"))));
+                }
+                other => {
+                    self.command_result = format!(
+                        "chat dock: unknown side '{}' (left|right|top|bottom)",
+                        other
+                    );
+                }
+            },
+            ["chat", "undock"] => self.undock_chat(),
             ["kill"] => self.kill_active_session(),
             ["kill", n] => {
                 if let Ok(num) = n.parse::<usize>() {
@@ -4006,6 +4077,10 @@ pub const MENU: &[(&str, &[&str])] = &[
 
 impl App {
     pub fn toggle_chat(&mut self) {
+        if self.chat_docked.is_some() {
+            self.undock_chat();
+            return;
+        }
         self.chat_selection = None;
         self.mode = if matches!(self.mode, AppMode::Chat) {
             AppMode::Normal
@@ -4014,12 +4089,51 @@ impl App {
         };
     }
 
+    /// Dock the chat into a split pane. `pane` picks the slot (0 = left/top,
+    /// 1 = right/bottom); None docks into the non-focused pane. Opens a split
+    /// if the layout is Single and moves focus to the chat.
+    pub fn dock_chat(&mut self, pane: Option<usize>) {
+        if matches!(self.mode, AppMode::Chat) {
+            self.mode = AppMode::Normal;
+        }
+        if !self.is_split() {
+            self.layout = self.last_split;
+        }
+        let pane = pane.unwrap_or(self.focused_pane ^ 1).min(1);
+        self.chat_docked = Some(pane);
+        self.focused_pane = pane;
+        self.chat_selection = None;
+        self.needs_redraw = true;
+    }
+
+    /// Remove the chat from its split pane. The session behind it (if any)
+    /// becomes visible again; an empty pane collapses the split.
+    pub fn undock_chat(&mut self) {
+        let Some(pane) = self.chat_docked.take() else {
+            return;
+        };
+        self.chat_selection = None;
+        if self.panes[pane].is_none() {
+            self.panes[0] = self.panes[pane ^ 1];
+            self.panes[1] = None;
+            self.last_split = self.layout;
+            self.layout = LayoutMode::Single;
+            self.focused_pane = 0;
+        }
+        self.needs_redraw = true;
+    }
+
     pub fn chat_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
         match key.code {
             KeyCode::Esc => {
                 self.chat_selection = None;
-                self.mode = AppMode::Normal;
+                if self.chat_docked == Some(self.focused_pane) {
+                    // Docked chat: Esc jumps back to the other pane.
+                    self.focus_next_pane();
+                } else {
+                    self.mode = AppMode::Normal;
+                }
             }
             KeyCode::Enter => self.chat_send(),
             KeyCode::Backspace if self.chat.cursor > 0 => {
@@ -4140,7 +4254,13 @@ impl App {
                 self.chat_system(result);
                 self.command_result.clear();
             }
-            self.mode = AppMode::Chat; // stay in the pane
+            // Stay in the chat: Normal keeps the docked pane focused, the
+            // overlay reopens otherwise.
+            self.mode = if self.chat_docked.is_some() {
+                AppMode::Normal
+            } else {
+                AppMode::Chat
+            };
             return;
         }
 
@@ -6030,6 +6150,48 @@ mod tests {
         assert_eq!(app.focused_pane, 0);
         assert_eq!(app.panes, [Some(1), None]);
         assert_eq!(app.active_idx(), Some(1));
+    }
+
+    #[test]
+    fn docking_chat_opens_split_and_undocking_collapses_empty_pane() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+
+        // Dock from Single: opens a split with chat in the other pane, focused.
+        app.dock_chat(None);
+        assert_eq!(app.layout, LayoutMode::SplitV);
+        assert_eq!(app.chat_docked, Some(1));
+        assert_eq!(app.focused_pane, 1);
+
+        // Esc from the chat pane jumps back to the work pane.
+        app.chat_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.focused_pane, 0);
+
+        // Undock: the empty pane collapses back to Single.
+        app.undock_chat();
+        assert_eq!(app.chat_docked, None);
+        assert_eq!(app.layout, LayoutMode::Single);
+        assert_eq!(app.panes, [Some(0), None]);
+    }
+
+    #[test]
+    fn collapsing_split_undocks_chat_and_switching_replaces_docked_chat() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+
+        app.dock_chat(Some(0));
+        assert_eq!(app.chat_docked, Some(0));
+        app.toggle_split();
+        assert_eq!(app.chat_docked, None, "collapsing the split undocks chat");
+
+        app.dock_chat(Some(1));
+        app.switch_to(1);
+        assert_eq!(app.chat_docked, None, "picking a session replaces chat");
+        assert_eq!(app.panes[1], Some(1));
     }
 
     #[test]

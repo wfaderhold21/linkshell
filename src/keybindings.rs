@@ -18,6 +18,7 @@ pub enum Action {
     ScrollDownLine,
     OpenMenu,
     ToggleChat,
+    DockChat,
     ToggleSplit,
     RotateSplit,
     FocusNextPane,
@@ -60,6 +61,7 @@ fn default_keymap() -> Keymap {
     m.insert((ctrl, KeyCode::Char('q')), Action::Quit);
     m.insert((ctrl, KeyCode::Char(' ')), Action::OpenMenu);
     m.insert((alt, KeyCode::Char('t')), Action::ToggleChat);
+    m.insert((alt, KeyCode::Char('g')), Action::DockChat);
     m.insert((alt, KeyCode::Char('\\')), Action::ToggleSplit);
     m.insert((alt, KeyCode::Char('-')), Action::RotateSplit);
     m.insert((alt, KeyCode::Char('o')), Action::FocusNextPane);
@@ -151,6 +153,7 @@ fn parse_action(s: &str) -> Option<Action> {
         "scroll_up_line" => Some(Action::ScrollUpLine),
         "scroll_down_line" => Some(Action::ScrollDownLine),
         "toggle_chat" | "chat" => Some(Action::ToggleChat),
+        "dock_chat" | "chat_dock" => Some(Action::DockChat),
         "open_menu" => Some(Action::OpenMenu),
         "toggle_split" => Some(Action::ToggleSplit),
         "rotate_split" => Some(Action::RotateSplit),
