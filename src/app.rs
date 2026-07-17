@@ -2344,7 +2344,12 @@ impl App {
 
     pub fn handle_tick(&mut self) {
         self.check_orchestrator_alive();
-        let mut tick_ready: Vec<usize> = Vec::new();
+        // (session id, state before the tick flipped it to Ready). Routed
+        // through on_state_transition below — the single funnel for state
+        // changes — so tick-detected completions reach every consumer
+        // (orchestrator events, notifications, pipes, council, ...) instead
+        // of a hand-copied subset that silently drifts.
+        let mut tick_ready: Vec<(usize, SessionState)> = Vec::new();
 
         for session in self.sessions.iter_mut() {
             // Flip Ready → Running when a meaningful volume of bytes arrived this
@@ -2365,8 +2370,9 @@ impl App {
                 if expired {
                     session.ipc_state = false;
                     session.ipc_state_set_at = None;
+                    let before = session.state.clone();
                     session.state = SessionState::Ready;
-                    tick_ready.push(session.id);
+                    tick_ready.push((session.id, before));
                 }
             }
             if !session.ipc_state {
@@ -2380,26 +2386,16 @@ impl App {
                         || (elapsed > Duration::from_secs(30)
                             && session.state == SessionState::Waiting)
                     {
+                        let before = session.state.clone();
                         session.state = SessionState::Ready;
-                        tick_ready.push(session.id);
+                        tick_ready.push((session.id, before));
                     }
                 }
             }
         }
 
-        for id in tick_ready {
-            self.check_pipes(id, &SessionState::Ready);
-            self.check_chat_pending(id, &SessionState::Ready);
-            let council_relays = if let Some(router) = &mut self.council {
-                router.on_state(&self.sessions, id, &SessionState::Ready)
-            } else {
-                vec![]
-            };
-            for (dest, payload) in council_relays {
-                self.handle_pipe_relay(dest, payload);
-            }
-            self.check_ipc_replies(id, &SessionState::Ready);
-            self.flush_pending_relays(id);
+        for (id, before) in tick_ready {
+            self.on_state_transition(id, &before, &SessionState::Ready);
         }
     }
 
@@ -6467,7 +6463,10 @@ mod tests {
             name: "agent".into(),
         });
 
-        // READY is not in the default event list
+        // READY is in the default event list (completion notifications)
+        app.notify_orchestrator(watched, &SessionState::Ready);
+        assert!(orx.try_recv().is_ok());
+        // …but not twice within the cooldown
         app.notify_orchestrator(watched, &SessionState::Ready);
         assert!(orx.try_recv().is_err());
 
@@ -6485,5 +6484,42 @@ mod tests {
         app.orchestrator_session_id = Some(orch);
         app.notify_orchestrator(orch, &SessionState::Waiting);
         assert!(orx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tick_detected_completion_reaches_the_orchestrator() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("worker".into(), None).unwrap();
+        let (otx, mut orx) = mpsc::channel(8);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
+            tx: otx,
+            name: "agent".into(),
+        });
+
+        // Simulate an agent CLI that streamed output and then went quiet:
+        // Running with the last output more than 2s ago.
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            s.state = SessionState::Running;
+            s.last_output_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        }
+
+        app.handle_tick();
+
+        let s = app.sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.state, SessionState::Ready);
+        // The tick-detected transition must reach the orchestrator: this
+        // previously bypassed on_state_transition and never fired.
+        let msg = orx.try_recv();
+        assert!(
+            matches!(
+                msg,
+                Ok(crate::orchestrator::OrchestratorMsg::SessionEvent { ref state, .. })
+                    if state == "READY"
+            ),
+            "expected a ready SessionEvent, got {:?}",
+            msg.is_ok()
+        );
     }
 }

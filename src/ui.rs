@@ -1215,7 +1215,14 @@ fn highlight_line(line: Line<'static>, from: Option<usize>, to: Option<usize>) -
 }
 
 fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
-    let popup = centered_rect(86, 86, area);
+    // Configurable via [chat] width_pct / height_pct (defaults 60×60).
+    // centered_rect takes height in rows, so convert the percentage here —
+    // the old hardcoded (86, 86) passed 86 *rows*, which clamped to full
+    // height on any normal-sized terminal.
+    let width_pct = app.config.chat.width_pct.clamp(20, 95);
+    let height_pct = app.config.chat.height_pct.clamp(20, 95);
+    let height_rows = (area.height as u32 * height_pct as u32 / 100).max(8) as u16;
+    let popup = centered_rect(width_pct, height_rows, area);
     f.render_widget(Clear, popup);
 
     let target = app

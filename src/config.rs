@@ -20,6 +20,7 @@ pub struct Config {
     pub keybindings: KeybindingsConfig,
     pub notifications: NotificationsConfig,
     pub orchestrator: OrchestratorConfig,
+    pub chat: ChatConfig,
     pub profiles: Vec<Profile>,
 }
 
@@ -99,12 +100,38 @@ impl Default for OrchestratorConfig {
             cwd: String::new(),
             hidden: true,
             permission_mode: "accept-edits".to_string(),
-            events: vec!["waiting".into(), "error".into(), "dead".into()],
+            events: vec![
+                "ready".into(),
+                "waiting".into(),
+                "error".into(),
+                "dead".into(),
+            ],
             event_cooldown_secs: 30,
             max_history_turns: 40,
             max_tokens: 4096,
             max_tool_iterations: 12,
             input_wait_timeout_secs: 180,
+        }
+    }
+}
+
+// ── [chat] ────────────────────────────────────────────────────────────────
+
+/// The chat pane overlay (Alt+T).
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// Popup width as a percentage of the terminal width (20–95).
+    pub width_pct: u16,
+    /// Popup height as a percentage of the terminal height (20–95).
+    pub height_pct: u16,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            width_pct: 60,
+            height_pct: 60,
         }
     }
 }
