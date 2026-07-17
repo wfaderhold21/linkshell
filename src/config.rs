@@ -535,6 +535,54 @@ impl Default for PricingConfig {
         //   https://www.anthropic.com/pricing
         //   https://openai.com/api/pricing
         let mut claude = HashMap::new();
+        // cache_write is the 5-minute-TTL rate (1.25x input); the log watcher
+        // prices 1-hour cache writes at 1.6x this (i.e. 2x input), matching
+        // Claude Code's own /cost accounting.
+        claude.insert(
+            "claude-fable".into(),
+            ModelRate {
+                input: 10.00,
+                cache_write: 12.50,
+                cache_read: 1.00,
+                output: 50.00,
+            },
+        );
+        claude.insert(
+            "claude-mythos".into(),
+            ModelRate {
+                input: 10.00,
+                cache_write: 12.50,
+                cache_read: 1.00,
+                output: 50.00,
+            },
+        );
+        // Opus 4.5 and later are $5/$25; older opus (4.0/4.1/3) stays at
+        // $15/$75 via the shorter "claude-opus" prefix below.
+        for m in [
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+        ] {
+            claude.insert(
+                m.into(),
+                ModelRate {
+                    input: 5.00,
+                    cache_write: 6.25,
+                    cache_read: 0.50,
+                    output: 25.00,
+                },
+            );
+        }
+        claude.insert(
+            "claude-haiku-4".into(),
+            ModelRate {
+                input: 1.00,
+                cache_write: 1.25,
+                cache_read: 0.10,
+                output: 5.00,
+            },
+        );
         claude.insert(
             "claude-opus".into(),
             ModelRate {
