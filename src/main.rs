@@ -5,6 +5,7 @@ mod claude_log;
 mod codex_log;
 mod config;
 mod council;
+mod ctx_probe;
 mod doctor;
 mod events;
 mod ipc;
@@ -493,6 +494,28 @@ fn handle_event(app: &mut App, event: AppEvent) {
                 ) {
                     s.base = base;
                 }
+            }
+        }
+        AppEvent::SessionProvider {
+            session_id,
+            provider,
+        } => {
+            // A watcher resolved which backend the session's agent talks to
+            // (e.g. opencode → lmstudio). Start the matching context-size
+            // probe, once; switching providers mid-session keeps the first
+            // probe — rare enough not to juggle probe lifetimes over.
+            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
+                if !s.ctx_probe_spawned {
+                    if let Some(backend) = ctx_probe::backend_for_provider(&provider) {
+                        ctx_probe::spawn_probe(session_id, backend, app.event_tx.clone());
+                        s.ctx_probe_spawned = true;
+                    }
+                }
+            }
+        }
+        AppEvent::SessionContextMax { session_id, max } => {
+            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.context_max = max;
             }
         }
         AppEvent::SessionModel { session_id, model } => {

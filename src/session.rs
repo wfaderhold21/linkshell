@@ -247,6 +247,11 @@ pub struct Session {
     pub stats: TokenStats,
     /// Model ID reported in the CLI's JSONL log, once known.
     pub model: Option<String>,
+    /// Maximum context window in tokens, when discoverable (LM Studio /
+    /// llama-server API probe, or llama-cli's "n_ctx = N" startup line).
+    pub context_max: u64,
+    /// A ctx_probe task is already running for this session.
+    pub ctx_probe_spawned: bool,
     pub pro_sub: bool,
     pub started_at: Instant,
     #[allow(dead_code)] // only read in tests; kept for debugging and future use
@@ -318,6 +323,8 @@ impl Session {
             screen: vt100::Parser::new(rows, cols, 1000),
             stats: TokenStats::default(),
             model: None,
+            context_max: 0,
+            ctx_probe_spawned: false,
             pro_sub: false,
             started_at: Instant::now(),
             last_output_at: None,
@@ -408,13 +415,18 @@ impl Session {
 
     pub fn context_display(&self) -> String {
         let ctx = self.stats.context_tokens;
-        if ctx == 0 {
-            return "—".to_string();
+        let max = self.context_max;
+        fn short(n: u64) -> String {
+            if n >= 1000 {
+                format!("{:.1}k", n as f64 / 1000.0)
+            } else {
+                n.to_string()
+            }
         }
-        if ctx >= 1000 {
-            format!("{:.1}k ctx", ctx as f64 / 1000.0)
-        } else {
-            format!("{} ctx", ctx)
+        match (ctx, max) {
+            (0, 0) => "—".to_string(),
+            (c, 0) => format!("{} ctx", short(c)),
+            (c, m) => format!("{}/{}", short(c), short(m)),
         }
     }
 
@@ -693,6 +705,11 @@ mod tests {
         assert_eq!(shell.tokens_display(), "1.0k tok");
         assert_eq!(shell.context_display(), "1.2k ctx");
         assert_eq!(shell.cost_display(), "$0.123");
+
+        shell.context_max = 32768;
+        assert_eq!(shell.context_display(), "1.2k/32.8k");
+        shell.stats.context_tokens = 0;
+        assert_eq!(shell.context_display(), "0/32.8k");
 
         let mut codex = session(SessionKind::Codex);
         codex.stats.total_cost_usd = 1234.0;

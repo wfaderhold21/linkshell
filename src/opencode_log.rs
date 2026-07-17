@@ -10,7 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::events::AppEvent;
-use crate::session::TokenStats;
+use crate::session::{SessionState, TokenStats};
 
 pub fn db_path() -> Option<PathBuf> {
     let base = std::env::var("XDG_DATA_HOME")
@@ -46,10 +46,15 @@ fn find_session(conn: &Connection, dir: &str, since_ms: i64) -> Option<String> {
 
 /// The session.model column holds JSON like
 /// `{"id":"qwen3.6-28b","providerID":"lmstudio"}`; older rows may be a bare id.
-fn parse_model_column(raw: String) -> Option<String> {
+fn parse_model_column(raw: String) -> Option<(String, Option<String>)> {
     match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(v) => v["id"].as_str().map(str::to_owned),
-        Err(_) if !raw.is_empty() => Some(raw),
+        Ok(v) => v["id"].as_str().map(|id| {
+            (
+                id.to_owned(),
+                v["providerID"].as_str().map(str::to_owned),
+            )
+        }),
+        Err(_) if !raw.is_empty() => Some((raw, None)),
         Err(_) => None,
     }
 }
@@ -62,6 +67,7 @@ struct SessionRow {
     cache_write: u64,
     cost: f64,
     model: Option<String>,
+    provider: Option<String>,
 }
 
 fn read_session_row(conn: &Connection, session_id: &str) -> Option<SessionRow> {
@@ -71,6 +77,9 @@ fn read_session_row(conn: &Connection, session_id: &str) -> Option<SessionRow> {
          FROM session WHERE id = ?1",
         rusqlite::params![session_id],
         |row| {
+            let parsed = row
+                .get::<_, Option<String>>(6)?
+                .and_then(parse_model_column);
             Ok(SessionRow {
                 input: row.get::<_, i64>(0)?.max(0) as u64,
                 output: row.get::<_, i64>(1)?.max(0) as u64,
@@ -78,9 +87,8 @@ fn read_session_row(conn: &Connection, session_id: &str) -> Option<SessionRow> {
                 cache_read: row.get::<_, i64>(3)?.max(0) as u64,
                 cache_write: row.get::<_, i64>(4)?.max(0) as u64,
                 cost: row.get(5)?,
-                model: row
-                    .get::<_, Option<String>>(6)?
-                    .and_then(parse_model_column),
+                provider: parsed.as_ref().and_then(|(_, p)| p.clone()),
+                model: parsed.map(|(id, _)| id),
             })
         },
     )
@@ -123,7 +131,43 @@ fn read_latest_context(conn: &Connection, session_id: &str) -> Option<(u64, Opti
     None
 }
 
-fn read_stats(conn: &Connection, session_id: &str) -> Option<(TokenStats, Option<String>)> {
+/// Session state from the newest message row — authoritative, unlike
+/// terminal patterns, which opencode's constant TUI redraws confuse (idle
+/// screens re-emit spinner/hint text and never go output-quiet, so the
+/// pattern path can park a session on Thinking forever).
+///   newest is a user message            → Thinking (request sent, no reply yet)
+///   assistant without time.completed    → Running  (reply streaming)
+///   assistant with an error recorded    → Error
+///   assistant with time.completed       → Ready
+fn read_latest_state(conn: &Connection, session_id: &str) -> Option<SessionState> {
+    let data: String = conn
+        .query_row(
+            "SELECT data FROM message WHERE session_id = ?1 \
+             ORDER BY time_created DESC, id DESC LIMIT 1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    match v["role"].as_str()? {
+        "user" => Some(SessionState::Thinking),
+        "assistant" => {
+            if !v["error"].is_null() {
+                Some(SessionState::Error)
+            } else if v["time"]["completed"].as_u64().is_some() {
+                Some(SessionState::Ready)
+            } else {
+                Some(SessionState::Running)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn read_stats(
+    conn: &Connection,
+    session_id: &str,
+) -> Option<(TokenStats, Option<String>, Option<String>)> {
     let row = read_session_row(conn, session_id)?;
     let (context_tokens, msg_model) = read_latest_context(conn, session_id).unwrap_or((0, None));
 
@@ -140,7 +184,7 @@ fn read_stats(conn: &Connection, session_id: &str) -> Option<(TokenStats, Option
         context_tokens,
         total_cost_usd: row.cost,
     };
-    Some((stats, msg_model.or(row.model)))
+    Some((stats, msg_model.or(row.model), row.provider))
 }
 
 fn now_ms() -> i64 {
@@ -179,6 +223,9 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
         let mut bound: Option<String> = None;
         let mut last_stats: Option<TokenStats> = None;
         let mut last_model: Option<String> = None;
+        let mut last_provider: Option<String> = None;
+        let mut last_state: Option<SessionState> = None;
+        let mut state_sent_at = std::time::Instant::now();
 
         while !tx.is_closed() {
             std::thread::sleep(Duration::from_millis(1000));
@@ -198,9 +245,50 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
             }
             let Some(id) = bound.as_ref() else { continue };
 
-            let Some((stats, model)) = read_stats(c, id) else {
+            // State first: it must flow even before any tokens are recorded
+            // (read_stats bails on all-zero sessions).
+            // Re-assert an unchanged Ready every 30s: ipc_state overrides
+            // expire (ipc_state_override_timeout_secs, default 60s), and once
+            // one lapses the pattern path could re-park an idle session on
+            // Thinking from TUI redraw noise. Only Ready is refreshed —
+            // re-asserting Running would stomp a pattern-detected Waiting
+            // (permission dialog) that the DB can't see.
+            if let Some(state) = read_latest_state(c, id) {
+                let refresh = state == SessionState::Ready
+                    && state_sent_at.elapsed() > Duration::from_secs(30);
+                if last_state.as_ref() != Some(&state) || refresh {
+                    if tx
+                        .blocking_send(AppEvent::IpcStateOverride {
+                            session_id,
+                            state: state.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_state = Some(state);
+                    state_sent_at = std::time::Instant::now();
+                }
+            }
+
+            let Some((stats, model, provider)) = read_stats(c, id) else {
                 continue;
             };
+
+            if let Some(provider) = provider {
+                if last_provider.as_deref() != Some(provider.as_str()) {
+                    if tx
+                        .blocking_send(AppEvent::SessionProvider {
+                            session_id,
+                            provider: provider.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_provider = Some(provider);
+                }
+            }
 
             if let Some(model) = model {
                 if last_model.as_deref() != Some(model.as_str()) {
@@ -314,7 +402,7 @@ mod tests {
         )
         .unwrap();
 
-        let (stats, model) = read_stats(&conn, "ses_1").unwrap();
+        let (stats, model, _) = read_stats(&conn, "ses_1").unwrap();
         assert_eq!(stats.input_tokens, 1000 + 300 + 100);
         assert_eq!(stats.output_tokens, 200 + 50);
         assert_eq!(stats.context_tokens, 900 + 60 + 10);
@@ -363,20 +451,72 @@ mod tests {
     fn falls_back_to_session_model_when_no_assistant_message() {
         let conn = test_db();
         insert_session(&conn, "ses_1", "/home/u/proj", None, 100);
-        let (stats, model) = read_stats(&conn, "ses_1").unwrap();
+        let (stats, model, provider) = read_stats(&conn, "ses_1").unwrap();
         assert_eq!(stats.context_tokens, 0);
         assert_eq!(model.as_deref(), Some("qwen3.6"));
+        assert_eq!(provider.as_deref(), Some("lmstudio"));
+    }
+
+    #[test]
+    fn latest_message_maps_to_session_state() {
+        let conn = test_db();
+        insert_session(&conn, "ses_1", "/p", None, 100);
+        let insert = |id: &str, t: i64, data: &serde_json::Value| {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, 'ses_1', ?2, ?3)",
+                rusqlite::params![id, t, data.to_string()],
+            )
+            .unwrap();
+        };
+
+        assert_eq!(read_latest_state(&conn, "ses_1"), None);
+
+        insert("m1", 1, &serde_json::json!({"role": "user"}));
+        assert_eq!(
+            read_latest_state(&conn, "ses_1"),
+            Some(SessionState::Thinking)
+        );
+
+        insert(
+            "m2",
+            2,
+            &serde_json::json!({"role": "assistant", "time": {"created": 5}}),
+        );
+        assert_eq!(
+            read_latest_state(&conn, "ses_1"),
+            Some(SessionState::Running)
+        );
+
+        insert(
+            "m3",
+            3,
+            &serde_json::json!({"role": "assistant", "time": {"created": 5, "completed": 9}}),
+        );
+        assert_eq!(
+            read_latest_state(&conn, "ses_1"),
+            Some(SessionState::Ready)
+        );
+
+        insert(
+            "m4",
+            4,
+            &serde_json::json!({"role": "assistant", "error": {"name": "boom"}}),
+        );
+        assert_eq!(
+            read_latest_state(&conn, "ses_1"),
+            Some(SessionState::Error)
+        );
     }
 
     #[test]
     fn parses_model_column_json_and_bare_forms() {
         assert_eq!(
-            parse_model_column(r#"{"id":"qwen3.6","providerID":"lmstudio"}"#.into()).as_deref(),
-            Some("qwen3.6")
+            parse_model_column(r#"{"id":"qwen3.6","providerID":"lmstudio"}"#.into()),
+            Some(("qwen3.6".into(), Some("lmstudio".into())))
         );
         assert_eq!(
-            parse_model_column("plain-model-id".into()).as_deref(),
-            Some("plain-model-id")
+            parse_model_column("plain-model-id".into()),
+            Some(("plain-model-id".into(), None))
         );
         assert!(parse_model_column(String::new()).is_none());
     }
