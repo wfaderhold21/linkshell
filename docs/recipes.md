@@ -48,3 +48,25 @@ system = "Be concise and identify concrete defects."
 Address it from agent chat with `@qwen review this result`. `llama-cli`,
 `ollama`, `aider`, and `opencode` can also run as custom sessions.
 
+
+## Propose mode (trust calibration for local orchestrators)
+
+Run the orchestrator with a leash while you calibrate trust in a new model:
+
+```toml
+[orchestrator]
+enabled = true
+provider = "openai"            # e.g. LM Studio / llama.cpp server
+endpoint = "http://localhost:1234/v1"
+model = "qwen3.6-27b"
+approval = "propose"
+max_tool_iterations = 24       # local models take smaller steps
+```
+
+The agent observes freely (`read_output`, `list_sessions`, `use_skill` are
+auto-approved) but every `start_session` and `send_input` lands in the chat
+pane as a proposal you answer with `/approve` or `/deny [reason]`. Deny
+reasons go back to the model as the tool result, so "wrong session, use 3"
+steers it mid-turn. Your approval history is the eval: once the proposals are
+consistently sensible, flip `approval = "auto"` — or keep the gate and grow
+`auto_approve` tool by tool.

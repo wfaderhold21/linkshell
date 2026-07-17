@@ -230,6 +230,17 @@ pub struct PendingChat {
     pub name: String,
 }
 
+/// A gated orchestrator tool call awaiting /approve or /deny (propose
+/// mode). The orchestrator's task blocks on response_tx; dropping it
+/// unanswered resolves as a denial on the orchestrator side.
+#[derive(Debug)]
+pub struct PendingProposal {
+    pub tool: String,
+    pub detail: String,
+    pub response_tx: Option<tokio::sync::oneshot::Sender<crate::events::ProposalVerdict>>,
+    pub requested_at: std::time::Instant,
+}
+
 /// A kill request from the orchestrator awaiting human confirmation.
 #[derive(Debug, Clone)]
 pub struct PendingKill {
@@ -456,6 +467,8 @@ pub struct App {
     pub orchestrator_session_id: Option<usize>,
     /// Kill request awaiting human /confirm-kill
     pub pending_kill: Option<PendingKill>,
+    /// Propose mode: the orchestrator tool call currently awaiting a verdict.
+    pub pending_proposal: Option<PendingProposal>,
     /// Token usage of the orchestrator's own API calls
     pub orchestrator_stats: crate::session::TokenStats,
     /// Live progress of the orchestrator's current turn, plus when it was
@@ -550,6 +563,7 @@ impl App {
             orchestrator: None,
             orchestrator_session_id: None,
             pending_kill: None,
+            pending_proposal: None,
             orchestrator_stats: crate::session::TokenStats::default(),
             orchestrator_status: None,
             orch_event_cooldowns: HashMap::new(),
@@ -2283,6 +2297,72 @@ impl App {
         serde_json::json!({"status": "pending_user_confirmation", "session_id": session_id})
     }
 
+    /// A gated tool call arrived from the orchestrator (propose mode).
+    pub fn handle_orchestrator_proposal(
+        &mut self,
+        tool: String,
+        detail: String,
+        response_tx: tokio::sync::oneshot::Sender<crate::events::ProposalVerdict>,
+    ) {
+        // The orchestrator blocks per proposal, so two pending at once means
+        // the first was orphaned (e.g. restart); dropping its sender resolves
+        // it as denied on whatever still awaits it.
+        self.pending_proposal = Some(PendingProposal {
+            tool: tool.clone(),
+            detail: detail.clone(),
+            response_tx: Some(response_tx),
+            requested_at: std::time::Instant::now(),
+        });
+        self.chat_system(format!(
+            "agent proposes {}: {} — /approve to run, /deny [reason] to refuse",
+            tool, detail
+        ));
+        if self.mode != AppMode::Chat {
+            self.command_result = format!(
+                "orchestrator proposes {} — open chat (Alt+T) to review",
+                tool
+            );
+            self.mode = AppMode::CommandResult;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Resolve the pending proposal. The verdict unblocks the orchestrator's
+    /// tool call; a deny reason is returned to the model as the tool result.
+    pub fn resolve_pending_proposal(&mut self, approve: bool, reason: String) {
+        let Some(mut p) = self.pending_proposal.take() else {
+            self.command_result = "no pending proposal".to_string();
+            return;
+        };
+        let verdict = if approve {
+            crate::events::ProposalVerdict::Approved
+        } else {
+            crate::events::ProposalVerdict::Denied(reason.clone())
+        };
+        let delivered = p
+            .response_tx
+            .take()
+            .map(|tx| tx.send(verdict).is_ok())
+            .unwrap_or(false);
+        if !delivered {
+            self.chat_system(format!(
+                "proposal for {} had already expired on the agent side",
+                p.tool
+            ));
+            return;
+        }
+        let note = if approve {
+            format!("approved {}: {}", p.tool, p.detail)
+        } else if reason.trim().is_empty() {
+            format!("denied {}", p.tool)
+        } else {
+            format!("denied {} — {}", p.tool, reason)
+        };
+        self.command_result = note.clone();
+        self.chat_system(note);
+        self.needs_redraw = true;
+    }
+
     pub fn handle_orchestrator_usage(&mut self, input: u64, output: u64) {
         self.orchestrator_stats.input_tokens += input;
         self.orchestrator_stats.output_tokens += output;
@@ -2348,6 +2428,22 @@ impl App {
 
     pub fn handle_tick(&mut self) {
         self.check_orchestrator_alive();
+        if let Some(p) = &self.pending_proposal {
+            let expired = p
+                .response_tx
+                .as_ref()
+                .map(|tx| tx.is_closed())
+                .unwrap_or(true);
+            if expired {
+                let tool = p.tool.clone();
+                self.pending_proposal = None;
+                self.chat_system(format!(
+                    "proposal for {} timed out and was denied",
+                    tool
+                ));
+                self.needs_redraw = true;
+            }
+        }
         if self.orchestrator_status.is_some() {
             if self.orchestrator.is_none() {
                 self.orchestrator_status = None;
@@ -3345,6 +3441,8 @@ impl App {
             }
             ["confirm-kill"] => self.resolve_pending_kill(true),
             ["deny-kill"] => self.resolve_pending_kill(false),
+            ["approve"] => self.resolve_pending_proposal(true, String::new()),
+            ["deny", rest @ ..] => self.resolve_pending_proposal(false, rest.join(" ")),
             ["yes"] => self.answer_permission(None, true),
             ["yes", t] => self.answer_permission(Some(t), true),
             ["no"] => self.answer_permission(None, false),
@@ -3908,6 +4006,7 @@ impl App {
 
     /// Parse and dispatch one chat input line:
     ///   /agents           list addressable targets
+    ///   /approve, /deny [reason]   answer a pending orchestrator proposal
     ///   /<command>        run any command-bar command without leaving chat
     ///   @<target> <msg>   address a session (by name or number), a configured
     ///                     local LLM agent, or `all`
@@ -6462,6 +6561,39 @@ mod tests {
         app.execute_command();
         assert_eq!(app.command_result, "orchestrator restarted");
         assert!(app.orchestrator.as_ref().is_some_and(|h| !h.tx.is_closed()));
+    }
+
+    #[test]
+    fn approve_and_deny_resolve_the_pending_proposal() {
+        let mut app = make_app();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.handle_orchestrator_proposal("send_input".into(), "session 2 ← \"ls\"".into(), tx);
+        assert!(app.pending_proposal.is_some());
+        assert!(app
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.text.contains("/approve")));
+
+        app.resolve_pending_proposal(true, String::new());
+        assert!(app.pending_proposal.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::events::ProposalVerdict::Approved)
+        ));
+
+        // Deny with a reason on a fresh proposal.
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        app.handle_orchestrator_proposal("start_session".into(), "claude \"w\"".into(), tx2);
+        app.resolve_pending_proposal(false, "not now".into());
+        match rx2.try_recv() {
+            Ok(crate::events::ProposalVerdict::Denied(reason)) => assert_eq!(reason, "not now"),
+            _ => panic!("expected Denied"),
+        }
+
+        // Nothing pending: friendly no-op.
+        app.resolve_pending_proposal(true, String::new());
+        assert_eq!(app.command_result, "no pending proposal");
     }
 
     #[test]

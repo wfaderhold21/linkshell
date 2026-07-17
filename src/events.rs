@@ -155,6 +155,12 @@ pub enum AppEvent {
         req: OrchestratorReq,
         response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
     },
+    /// Human verdict on a gated orchestrator tool call (propose mode).
+    OrchestratorProposal {
+        tool: String,
+        detail: String,
+        response_tx: tokio::sync::oneshot::Sender<ProposalVerdict>,
+    },
     /// Live progress of the orchestrator's current turn, shown in the chat
     /// pane ("thinking (3/12)", "running read_output", ...). None clears it
     /// when the turn ends.
@@ -232,4 +238,13 @@ pub enum OrchestratorReq {
         session_id: usize,
         reason: String,
     },
+}
+
+/// The human's answer to an orchestrator proposal. A denial can carry a
+/// reason, which is returned to the model as the tool result so it can
+/// course-correct within the same turn.
+#[derive(Debug)]
+pub enum ProposalVerdict {
+    Approved,
+    Denied(String),
 }

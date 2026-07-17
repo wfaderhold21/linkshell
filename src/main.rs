@@ -511,6 +511,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::OrchestratorRequest { req, response_tx } => {
             app.handle_orchestrator_request(req, response_tx);
         }
+        AppEvent::OrchestratorProposal { tool, detail, response_tx } => {
+            app.handle_orchestrator_proposal(tool, detail, response_tx);
+        }
         AppEvent::OrchestratorStatus(status) => {
             app.orchestrator_status = status.map(|s| (s, std::time::Instant::now()));
             app.needs_redraw = true;

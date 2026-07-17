@@ -51,6 +51,26 @@ Methods are `auto`, `osc9`, `notify-send`, `bell`, and `none`.
 - `events` (default `["ready", "waiting", "error", "dead"]`) — session state changes forwarded to the orchestrator agent as `[linkshell event]` messages. `ready` fires when a session finishes (goes quiet); remove it if completion events are too chatty for your workflow.
 - `event_cooldown_secs` (default `30`) — minimum seconds between events for the same (session, state) pair.
 
+## `[orchestrator]` approval (propose mode)
+
+- `approval` (default `"auto"`) — `"auto"` runs the orchestrator's tool calls
+  immediately. `"propose"` holds gated tool calls as proposals: the chat pane
+  shows `⏸ agent proposes send_input: session 2 ← "cargo test"` and the
+  agent's turn blocks until you answer with `/approve` or `/deny [reason]`.
+  A deny reason is returned to the model as the tool result, so it can
+  course-correct within the same turn. From the model's perspective approval
+  is just a slow tool — its context stays coherent, which matters for local
+  models. While a proposal is pending the orchestrator processes nothing
+  else; incoming events coalesce into its next turn.
+- `auto_approve` (default `["list_sessions", "read_output", "use_skill"]`) —
+  tools that skip the gate. The default set is read-only, so routine
+  observation stays fluid and only session-mutating calls (`start_session`,
+  `send_input`) interrupt you. `kill_session` always uses its own
+  `/confirm-kill` flow and is never double-gated.
+- `approval_timeout_secs` (default `600`) — an unanswered proposal resolves
+  as denied ("no response from user") after this long, and the agent's turn
+  continues; a proposal you never saw cannot wedge the orchestrator.
+
 ## `[[profiles]]`
 
 Profiles contain `name`, `[[profiles.sessions]]`, and `[[profiles.pipes]]`.

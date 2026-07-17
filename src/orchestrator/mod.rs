@@ -264,12 +264,88 @@ async fn send_status(event_tx: &mpsc::Sender<AppEvent>, status: impl Into<String
         .await;
 }
 
+/// Compact, human-readable rendering of a gated tool call for the proposal
+/// line — enough to judge the call without reading raw JSON.
+fn proposal_detail(name: &str, args: &serde_json::Value) -> String {
+    fn trunc(s: &str, max: usize) -> String {
+        if s.chars().count() <= max {
+            s.to_string()
+        } else {
+            let cut: String = s.chars().take(max).collect();
+            format!("{}…", cut)
+        }
+    }
+    match name {
+        "send_input" => format!(
+            "session {} ← {:?}",
+            args["session_id"].as_u64().unwrap_or(0),
+            trunc(args["text"].as_str().unwrap_or(""), 80),
+        ),
+        "start_session" => {
+            let cwd = args["cwd"].as_str().unwrap_or("");
+            format!(
+                "{} \"{}\"{}{}",
+                args["kind"].as_str().unwrap_or("?"),
+                args["name"].as_str().unwrap_or("unnamed"),
+                if cwd.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {}", cwd)
+                },
+                args["initial_prompt"]
+                    .as_str()
+                    .map(|p| format!(" — prompt: {:?}", trunc(p, 60)))
+                    .unwrap_or_default(),
+            )
+        }
+        _ => trunc(&args.to_string(), 120),
+    }
+}
+
 async fn exec_tool(
     cfg: &OrchestratorConfig,
     event_tx: &mpsc::Sender<AppEvent>,
     name: &str,
     args: &serde_json::Value,
 ) -> String {
+    // Propose mode: gated tools block here until the human answers in the
+    // chat pane (/approve, /deny [reason]) or the timeout fires. Only the
+    // orchestrator's own tokio task waits — no HTTP request is held open and
+    // the main loop is untouched; from the model's perspective this is just
+    // a slow tool, so its context stays coherent.
+    if cfg.approval_required(name) {
+        let detail = proposal_detail(name, args);
+        send_status(event_tx, format!("proposing {} (awaiting approval)", name)).await;
+        let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+        if event_tx
+            .send(AppEvent::OrchestratorProposal {
+                tool: name.to_string(),
+                detail,
+                response_tx: verdict_tx,
+            })
+            .await
+            .is_err()
+        {
+            return "{\"error\": \"main loop unavailable\"}".to_string();
+        }
+        let timeout = std::time::Duration::from_secs(cfg.approval_timeout_secs.max(1));
+        match tokio::time::timeout(timeout, verdict_rx).await {
+            Ok(Ok(crate::events::ProposalVerdict::Approved)) => {}
+            Ok(Ok(crate::events::ProposalVerdict::Denied(reason))) => {
+                let reason = if reason.trim().is_empty() {
+                    "user denied the request".to_string()
+                } else {
+                    reason
+                };
+                return serde_json::json!({"denied": reason}).to_string();
+            }
+            // Receiver dropped or timed out: treat as a denial the model can
+            // report on, not an error that aborts the turn.
+            Ok(Err(_)) | Err(_) => {
+                return "{\"denied\": \"no response from user (approval timed out)\"}".to_string();
+            }
+        }
+    }
     send_status(event_tx, format!("running {}", name)).await;
     // use_skill reads from the skills directory directly — no main-loop trip.
     if name == "use_skill" {
@@ -389,6 +465,15 @@ matches a skill's description, load it and follow it:\n",
         );
         p.push_str(&list);
     }
+    if cfg.approval == "propose" {
+        p.push_str(
+            "\nSome of your tool calls require the user's approval before they run; \
+they may take a while to return while the user decides. A tool result of \
+{\"denied\": \"...\"} means the user refused that call — do not retry it \
+unchanged. If the denial carries a reason, adjust your approach accordingly \
+and continue; otherwise report what you wanted to do and why.\n",
+        );
+    }
     if !cfg.system.is_empty() {
         p.push_str("\n\n");
         p.push_str(&cfg.system);
@@ -491,6 +576,71 @@ mod tests {
         assert!(a[0]["input_schema"].is_object());
         assert_eq!(o[0]["type"], "function");
         assert!(o[0]["function"]["parameters"].is_object());
+    }
+
+    #[tokio::test]
+    async fn propose_mode_gates_tools_and_returns_deny_reason() {
+        let mut cfg = OrchestratorConfig::default();
+        cfg.approval = "propose".to_string();
+        let (tx, mut rx) = mpsc::channel::<AppEvent>(8);
+
+        let handle = tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                exec_tool(
+                    &cfg,
+                    &tx,
+                    "send_input",
+                    &serde_json::json!({"session_id": 2, "text": "cargo test"}),
+                )
+                .await
+            }
+        });
+
+        // First event: "proposing" status; then the proposal itself.
+        let verdict_tx = loop {
+            match rx.recv().await {
+                Some(AppEvent::OrchestratorProposal {
+                    tool,
+                    detail,
+                    response_tx,
+                }) => {
+                    assert_eq!(tool, "send_input");
+                    assert!(detail.contains("session 2"), "detail: {}", detail);
+                    assert!(detail.contains("cargo test"), "detail: {}", detail);
+                    break response_tx;
+                }
+                Some(_) => continue,
+                None => panic!("channel closed before proposal"),
+            }
+        };
+
+        verdict_tx
+            .send(crate::events::ProposalVerdict::Denied(
+                "wrong session, use 3".into(),
+            ))
+            .unwrap();
+        let result = handle.await.unwrap();
+        assert!(
+            result.contains("denied") && result.contains("wrong session, use 3"),
+            "denial reason reaches the model: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_approve_tools_skip_the_gate() {
+        let mut cfg = OrchestratorConfig::default();
+        cfg.approval = "propose".to_string();
+        assert!(cfg.approval_required("send_input"));
+        assert!(cfg.approval_required("start_session"));
+        assert!(!cfg.approval_required("read_output"));
+        assert!(!cfg.approval_required("list_sessions"));
+        assert!(!cfg.approval_required("use_skill"));
+        // kill_session keeps its dedicated /confirm-kill flow.
+        assert!(!cfg.approval_required("kill_session"));
+        cfg.approval = "auto".to_string();
+        assert!(!cfg.approval_required("send_input"));
     }
 
     #[tokio::test]

@@ -1317,6 +1317,17 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
             Style::default().fg(Color::Yellow),
         )));
     }
+    if let Some(p) = &app.pending_proposal {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "⏸ {} proposes {}: {}  (/approve · /deny [reason])",
+                app.config.orchestrator.name, p.tool, p.detail
+            ),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
 
     // Window: scroll counts lines up from the tail
     let total = lines.len();
