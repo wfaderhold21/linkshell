@@ -1215,7 +1215,14 @@ fn highlight_line(line: Line<'static>, from: Option<usize>, to: Option<usize>) -
 }
 
 fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
-    let popup = centered_rect(86, 86, area);
+    // Configurable via [chat] width_pct / height_pct (defaults 60×60).
+    // centered_rect takes height in rows, so convert the percentage here —
+    // the old hardcoded (86, 86) passed 86 *rows*, which clamped to full
+    // height on any normal-sized terminal.
+    let width_pct = app.config.chat.width_pct.clamp(20, 95);
+    let height_pct = app.config.chat.height_pct.clamp(20, 95);
+    let height_rows = (area.height as u32 * height_pct as u32 / 100).max(8) as u16;
+    let popup = centered_rect(width_pct, height_rows, area);
     f.render_widget(Clear, popup);
 
     let target = app
@@ -1298,6 +1305,27 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
         lines.push(Line::from(Span::styled(
             format!("… awaiting {}", waiting.join(", ")),
             Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some((status, since)) = &app.orchestrator_status {
+        // Braille spinner keyed off wall time; handle_tick keeps the pane
+        // redrawing while a turn is in flight.
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame = FRAMES[(since.elapsed().as_millis() / 120) as usize % FRAMES.len()];
+        lines.push(Line::from(Span::styled(
+            format!("{} {}: {}", frame, app.config.orchestrator.name, status),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(p) = &app.pending_proposal {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "⏸ {} proposes {}: {}  (/approve · /deny [reason])",
+                app.config.orchestrator.name, p.tool, p.detail
+            ),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         )));
     }
 

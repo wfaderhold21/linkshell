@@ -257,6 +257,12 @@ exits or the CLI session ends — a chat notice appears with the restart command
 The orchestrator can never kill a session on its own: a kill request shows up
 in chat and only `/confirm-kill` executes it (`/deny-kill` refuses).
 
+If an API-class orchestrator gets stuck mid-turn — spinning through tool
+iterations or blocked waiting on a session — `/interrupt` (alias `/stop`)
+breaks the turn at the next safe point. Blocked tool calls return
+"interrupted by user" to the model, so its history stays coherent and it
+can be redirected on the next message.
+
 ## Local agent sessions
 
 Sessions running `opencode`, `omp` (oh-my-pi), `pi`, `aider`, `llama-cli`, or

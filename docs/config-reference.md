@@ -41,6 +41,49 @@ Defaults: `enabled = true`, `on_states = ["waiting", "error"]`,
 `method = "auto"`, `min_session_age_secs = 10`, and `debounce_secs = 30`.
 Methods are `auto`, `osc9`, `notify-send`, `bell`, and `none`.
 
+## `[chat]`
+
+- `width_pct` (default `60`) — chat popup width as a percentage of the terminal width (20–95).
+- `height_pct` (default `60`) — chat popup height as a percentage of the terminal height (20–95).
+
+## `[orchestrator]` events
+
+- `events` (default `["ready", "waiting", "error", "dead"]`) — session state changes forwarded to the orchestrator agent as `[linkshell event]` messages. `ready` fires when a session finishes (goes quiet); remove it if completion events are too chatty for your workflow.
+- `event_cooldown_secs` (default `30`) — minimum seconds between events for the same (session, state) pair.
+
+## `[orchestrator]` approval (propose mode)
+
+- `approval` (default `"auto"`) — `"auto"` runs the orchestrator's tool calls
+  immediately. `"propose"` holds gated tool calls as proposals: the chat pane
+  shows `⏸ agent proposes send_input: session 2 ← "cargo test"` and the
+  agent's turn blocks until you answer with `/approve` or `/deny [reason]`.
+  A deny reason is returned to the model as the tool result, so it can
+  course-correct within the same turn. From the model's perspective approval
+  is just a slow tool — its context stays coherent, which matters for local
+  models. While a proposal is pending the orchestrator processes nothing
+  else; incoming events coalesce into its next turn.
+- `auto_approve` (default `["list_sessions", "read_output", "use_skill"]`) —
+  tools that skip the gate. The default set is read-only, so routine
+  observation stays fluid and only session-mutating calls (`start_session`,
+  `send_input`) interrupt you. `kill_session` always uses its own
+  `/confirm-kill` flow and is never double-gated.
+- `approval_timeout_secs` (default `600`) — an unanswered proposal resolves
+  as denied ("no response from user") after this long, and the agent's turn
+  continues; a proposal you never saw cannot wedge the orchestrator.
+
+## `[orchestrator]` limits
+
+- `max_tool_iterations` (default `12`) — tool-call loop budget per turn. When
+  it runs out the agent gets one final tool-free response to wrap up, so the
+  turn lands softly instead of being cut mid-plan. Raise it for local models
+  that take smaller steps per call.
+- `max_history_turns` (default `40`) — conversation turns kept in the agent's
+  context before older ones are dropped.
+- `max_tokens` (default `4096`) — per-response output token cap.
+- `input_wait_timeout_secs` (default `180`) — how long a `send_input` tool
+  call with `wait_ready` waits for the target session to finish before
+  returning.
+
 ## `[[profiles]]`
 
 Profiles contain `name`, `[[profiles.sessions]]`, and `[[profiles.pipes]]`.

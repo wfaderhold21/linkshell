@@ -230,6 +230,16 @@ pub struct PendingChat {
     pub name: String,
 }
 
+/// A gated orchestrator tool call awaiting /approve or /deny (propose
+/// mode). The orchestrator's task blocks on response_tx; dropping it
+/// unanswered resolves as a denial on the orchestrator side.
+#[derive(Debug)]
+pub struct PendingProposal {
+    pub tool: String,
+    pub detail: String,
+    pub response_tx: Option<tokio::sync::oneshot::Sender<crate::events::ProposalVerdict>>,
+}
+
 /// A kill request from the orchestrator awaiting human confirmation.
 #[derive(Debug, Clone)]
 pub struct PendingKill {
@@ -456,8 +466,13 @@ pub struct App {
     pub orchestrator_session_id: Option<usize>,
     /// Kill request awaiting human /confirm-kill
     pub pending_kill: Option<PendingKill>,
+    /// Propose mode: the orchestrator tool call currently awaiting a verdict.
+    pub pending_proposal: Option<PendingProposal>,
     /// Token usage of the orchestrator's own API calls
     pub orchestrator_stats: crate::session::TokenStats,
+    /// Live progress of the orchestrator's current turn, plus when it was
+    /// set (drives the chat-pane spinner). None while idle.
+    pub orchestrator_status: Option<(String, std::time::Instant)>,
     /// Per-(session_id, state label) cooldown for proactive orchestrator events
     orch_event_cooldowns: HashMap<(usize, &'static str), std::time::Instant>,
     /// Session behind the most recent permission request surfaced in chat;
@@ -547,7 +562,9 @@ impl App {
             orchestrator: None,
             orchestrator_session_id: None,
             pending_kill: None,
+            pending_proposal: None,
             orchestrator_stats: crate::session::TokenStats::default(),
+            orchestrator_status: None,
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
             chat: ChatState::default(),
@@ -2177,8 +2194,10 @@ impl App {
                     match self.spawn_session(k, name, cwd) {
                         Ok(()) => {
                             if let Some(prompt) = initial_prompt {
-                                let mut msg = prompt;
-                                msg.push('\r');
+                                // Shaped here (bracketed paste for multi-line)
+                                // because pipe relay forwards it verbatim.
+                                let msg = String::from_utf8(shape_injected_input(&prompt))
+                                    .unwrap_or(prompt);
                                 self.handle_pipe_relay(new_id, msg);
                             }
                             serde_json::json!({"session_id": new_id})
@@ -2205,16 +2224,12 @@ impl App {
                         return;
                     }
                     let line_offset = s.output_lines.len();
-                    let mut input = text;
-                    input.push('\r');
-                    s.write_bytes(input.into_bytes());
+                    s.write_bytes(shape_injected_input(&text));
                     self.pending_ipc_replies
                         .insert(session_id, (response_tx, line_offset));
                     return; // reply arrives via check_ipc_replies on READY
                 }
-                let mut input = text;
-                input.push('\r');
-                s.write_bytes(input.into_bytes());
+                s.write_bytes(shape_injected_input(&text));
                 serde_json::json!({"ok": true})
             }
             OrchestratorReq::PipeAdd {
@@ -2277,6 +2292,71 @@ impl App {
             why
         ));
         serde_json::json!({"status": "pending_user_confirmation", "session_id": session_id})
+    }
+
+    /// A gated tool call arrived from the orchestrator (propose mode).
+    pub fn handle_orchestrator_proposal(
+        &mut self,
+        tool: String,
+        detail: String,
+        response_tx: tokio::sync::oneshot::Sender<crate::events::ProposalVerdict>,
+    ) {
+        // The orchestrator blocks per proposal, so two pending at once means
+        // the first was orphaned (e.g. restart); dropping its sender resolves
+        // it as denied on whatever still awaits it.
+        self.pending_proposal = Some(PendingProposal {
+            tool: tool.clone(),
+            detail: detail.clone(),
+            response_tx: Some(response_tx),
+        });
+        self.chat_system(format!(
+            "agent proposes {}: {} — /approve to run, /deny [reason] to refuse",
+            tool, detail
+        ));
+        if self.mode != AppMode::Chat {
+            self.command_result = format!(
+                "orchestrator proposes {} — open chat (Alt+T) to review",
+                tool
+            );
+            self.mode = AppMode::CommandResult;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Resolve the pending proposal. The verdict unblocks the orchestrator's
+    /// tool call; a deny reason is returned to the model as the tool result.
+    pub fn resolve_pending_proposal(&mut self, approve: bool, reason: String) {
+        let Some(mut p) = self.pending_proposal.take() else {
+            self.command_result = "no pending proposal".to_string();
+            return;
+        };
+        let verdict = if approve {
+            crate::events::ProposalVerdict::Approved
+        } else {
+            crate::events::ProposalVerdict::Denied(reason.clone())
+        };
+        let delivered = p
+            .response_tx
+            .take()
+            .map(|tx| tx.send(verdict).is_ok())
+            .unwrap_or(false);
+        if !delivered {
+            self.chat_system(format!(
+                "proposal for {} had already expired on the agent side",
+                p.tool
+            ));
+            return;
+        }
+        let note = if approve {
+            format!("approved {}: {}", p.tool, p.detail)
+        } else if reason.trim().is_empty() {
+            format!("denied {}", p.tool)
+        } else {
+            format!("denied {} — {}", p.tool, reason)
+        };
+        self.command_result = note.clone();
+        self.chat_system(note);
+        self.needs_redraw = true;
     }
 
     pub fn handle_orchestrator_usage(&mut self, input: u64, output: u64) {
@@ -2344,7 +2424,34 @@ impl App {
 
     pub fn handle_tick(&mut self) {
         self.check_orchestrator_alive();
-        let mut tick_ready: Vec<usize> = Vec::new();
+        if let Some(p) = &self.pending_proposal {
+            let expired = p
+                .response_tx
+                .as_ref()
+                .map(|tx| tx.is_closed())
+                .unwrap_or(true);
+            if expired {
+                let tool = p.tool.clone();
+                self.pending_proposal = None;
+                self.chat_system(format!("proposal for {} timed out and was denied", tool));
+                self.needs_redraw = true;
+            }
+        }
+        if self.orchestrator_status.is_some() {
+            if self.orchestrator.is_none() {
+                self.orchestrator_status = None;
+            }
+            // Keep the chat-pane spinner animating while a turn is running.
+            if self.mode == AppMode::Chat {
+                self.needs_redraw = true;
+            }
+        }
+        // (session id, state before the tick flipped it to Ready). Routed
+        // through on_state_transition below — the single funnel for state
+        // changes — so tick-detected completions reach every consumer
+        // (orchestrator events, notifications, pipes, council, ...) instead
+        // of a hand-copied subset that silently drifts.
+        let mut tick_ready: Vec<(usize, SessionState)> = Vec::new();
 
         for session in self.sessions.iter_mut() {
             // Flip Ready → Running when a meaningful volume of bytes arrived this
@@ -2365,8 +2472,9 @@ impl App {
                 if expired {
                     session.ipc_state = false;
                     session.ipc_state_set_at = None;
+                    let before = session.state.clone();
                     session.state = SessionState::Ready;
-                    tick_ready.push(session.id);
+                    tick_ready.push((session.id, before));
                 }
             }
             if !session.ipc_state {
@@ -2380,26 +2488,16 @@ impl App {
                         || (elapsed > Duration::from_secs(30)
                             && session.state == SessionState::Waiting)
                     {
+                        let before = session.state.clone();
                         session.state = SessionState::Ready;
-                        tick_ready.push(session.id);
+                        tick_ready.push((session.id, before));
                     }
                 }
             }
         }
 
-        for id in tick_ready {
-            self.check_pipes(id, &SessionState::Ready);
-            self.check_chat_pending(id, &SessionState::Ready);
-            let council_relays = if let Some(router) = &mut self.council {
-                router.on_state(&self.sessions, id, &SessionState::Ready)
-            } else {
-                vec![]
-            };
-            for (dest, payload) in council_relays {
-                self.handle_pipe_relay(dest, payload);
-            }
-            self.check_ipc_replies(id, &SessionState::Ready);
-            self.flush_pending_relays(id);
+        for (id, before) in tick_ready {
+            self.on_state_transition(id, &before, &SessionState::Ready);
         }
     }
 
@@ -3336,12 +3434,32 @@ impl App {
             }
             ["confirm-kill"] => self.resolve_pending_kill(true),
             ["deny-kill"] => self.resolve_pending_kill(false),
+            ["interrupt"] | ["stop"] => self.interrupt_orchestrator(),
+            ["approve"] => self.resolve_pending_proposal(true, String::new()),
+            ["deny", rest @ ..] => self.resolve_pending_proposal(false, rest.join(" ")),
             ["yes"] => self.answer_permission(None, true),
             ["yes", t] => self.answer_permission(Some(t), true),
             ["no"] => self.answer_permission(None, false),
             ["no", t] => self.answer_permission(Some(t), false),
             _ => {}
         }
+    }
+
+    /// Break the orchestrator out of its current turn (/interrupt, /stop).
+    /// The turn stops at the next safe point: immediately if it's blocked in
+    /// a tool call, otherwise before the next tool iteration.
+    fn interrupt_orchestrator(&mut self) {
+        let Some(h) = &self.orchestrator else {
+            self.command_result = "no API orchestrator running".to_string();
+            return;
+        };
+        h.interrupt();
+        // A pending proposal is a blocked tool call; clear it so the chat
+        // pane doesn't keep asking for a verdict on a dead question.
+        self.pending_proposal = None;
+        let name = h.name.clone();
+        self.chat_system(format!("interrupt sent to @{}", name));
+        self.command_result = format!("interrupted @{}", name);
     }
 
     /// Approve or refuse the orchestrator's pending kill request.
@@ -3899,6 +4017,7 @@ impl App {
 
     /// Parse and dispatch one chat input line:
     ///   /agents           list addressable targets
+    ///   /approve, /deny [reason]   answer a pending orchestrator proposal
     ///   /<command>        run any command-bar command without leaving chat
     ///   @<target> <msg>   address a session (by name or number), a configured
     ///                     local LLM agent, or `all`
@@ -4155,18 +4274,7 @@ impl App {
     /// Inject a chat message into a session's PTY and await its READY reply.
     fn send_chat_to_session(&mut self, id: usize, name: String, msg: &str) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
-            // Multi-line messages (pastes) go through bracketed paste so the
-            // target CLI doesn't submit at each embedded newline.
-            let mut bytes = Vec::with_capacity(msg.len() + 13);
-            if msg.contains('\n') {
-                bytes.extend_from_slice(b"\x1b[200~");
-                bytes.extend_from_slice(msg.as_bytes());
-                bytes.extend_from_slice(b"\x1b[201~");
-            } else {
-                bytes.extend_from_slice(msg.as_bytes());
-            }
-            bytes.push(b'\r');
-            s.write_bytes(bytes);
+            s.write_bytes(shape_injected_input(msg));
         }
         // One outstanding reply per session; a new message supersedes it.
         self.chat.pending.retain(|p| p.session_id != id);
@@ -4983,6 +5091,23 @@ fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
 /// separately after a pause so TUIs register a submit, not a pasted newline.
 fn chunk_carries_enter(bytes: &[u8]) -> bool {
     bytes.len() > 1 && matches!(bytes.last(), Some(b'\r') | Some(b'\n'))
+}
+
+/// Shape injected input (chat, orchestrator send_input, initial prompts) for
+/// a session PTY: multi-line messages go through bracketed paste so TUIs
+/// (claude, codex, opencode) don't submit at each embedded newline, and the
+/// trailing '\r' lets the writer task press Enter as its own keystroke.
+fn shape_injected_input(msg: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(msg.len() + 13);
+    if msg.contains('\n') {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(msg.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(msg.as_bytes());
+    }
+    bytes.push(b'\r');
+    bytes
 }
 
 /// Best-effort cut of a screen scrape down to the agent's latest reply:
@@ -6422,10 +6547,10 @@ mod tests {
     fn dead_orchestrator_task_is_noticed_once_and_cleared() {
         let mut app = make_app();
         let (otx, orx) = mpsc::channel(1);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
         drop(orx); // the task is gone
         app.handle_tick();
         assert!(app.orchestrator.is_none());
@@ -6444,15 +6569,48 @@ mod tests {
     async fn orchestrator_restart_replaces_a_dead_handle() {
         let mut app = make_app();
         let (otx, orx) = mpsc::channel(1);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
         drop(orx);
         app.command_input = "orchestrator restart".into();
         app.execute_command();
         assert_eq!(app.command_result, "orchestrator restarted");
         assert!(app.orchestrator.as_ref().is_some_and(|h| !h.tx.is_closed()));
+    }
+
+    #[test]
+    fn approve_and_deny_resolve_the_pending_proposal() {
+        let mut app = make_app();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.handle_orchestrator_proposal("send_input".into(), "session 2 ← \"ls\"".into(), tx);
+        assert!(app.pending_proposal.is_some());
+        assert!(app
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.text.contains("/approve")));
+
+        app.resolve_pending_proposal(true, String::new());
+        assert!(app.pending_proposal.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::events::ProposalVerdict::Approved)
+        ));
+
+        // Deny with a reason on a fresh proposal.
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        app.handle_orchestrator_proposal("start_session".into(), "claude \"w\"".into(), tx2);
+        app.resolve_pending_proposal(false, "not now".into());
+        match rx2.try_recv() {
+            Ok(crate::events::ProposalVerdict::Denied(reason)) => assert_eq!(reason, "not now"),
+            _ => panic!("expected Denied"),
+        }
+
+        // Nothing pending: friendly no-op.
+        app.resolve_pending_proposal(true, String::new());
+        assert_eq!(app.command_result, "no pending proposal");
     }
 
     #[test]
@@ -6462,12 +6620,15 @@ mod tests {
         let orch = app.spawn_headless_session("agent".into(), None).unwrap();
         app.orchestrator_session_id = None;
         let (otx, mut orx) = mpsc::channel(8);
-        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle {
-            tx: otx,
-            name: "agent".into(),
-        });
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
 
-        // READY is not in the default event list
+        // READY is in the default event list (completion notifications)
+        app.notify_orchestrator(watched, &SessionState::Ready);
+        assert!(orx.try_recv().is_ok());
+        // …but not twice within the cooldown
         app.notify_orchestrator(watched, &SessionState::Ready);
         assert!(orx.try_recv().is_err());
 
@@ -6485,5 +6646,41 @@ mod tests {
         app.orchestrator_session_id = Some(orch);
         app.notify_orchestrator(orch, &SessionState::Waiting);
         assert!(orx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tick_detected_completion_reaches_the_orchestrator() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("worker".into(), None).unwrap();
+        let (otx, mut orx) = mpsc::channel(8);
+        app.orchestrator = Some(crate::orchestrator::OrchestratorHandle::detached(
+            otx,
+            "agent".into(),
+        ));
+
+        // Simulate an agent CLI that streamed output and then went quiet:
+        // Running with the last output more than 2s ago.
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            s.state = SessionState::Running;
+            s.last_output_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        }
+
+        app.handle_tick();
+
+        let s = app.sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.state, SessionState::Ready);
+        // The tick-detected transition must reach the orchestrator: this
+        // previously bypassed on_state_transition and never fired.
+        let msg = orx.try_recv();
+        assert!(
+            matches!(
+                msg,
+                Ok(crate::orchestrator::OrchestratorMsg::SessionEvent { ref state, .. })
+                    if state == "READY"
+            ),
+            "expected a ready SessionEvent, got {:?}",
+            msg.is_ok()
+        );
     }
 }

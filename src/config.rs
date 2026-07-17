@@ -20,6 +20,7 @@ pub struct Config {
     pub keybindings: KeybindingsConfig,
     pub notifications: NotificationsConfig,
     pub orchestrator: OrchestratorConfig,
+    pub chat: ChatConfig,
     pub profiles: Vec<Profile>,
 }
 
@@ -78,6 +79,18 @@ pub struct OrchestratorConfig {
     pub events: Vec<String>,
     /// Minimum seconds between events for the same (session, state).
     pub event_cooldown_secs: u64,
+    /// "auto" (default): tools run immediately. "propose": tool calls not in
+    /// auto_approve are held as proposals in the chat pane until /approve or
+    /// /deny; the model's turn blocks on the verdict, so its context stays
+    /// coherent — from the model's perspective approval is just a slow tool.
+    pub approval: String,
+    /// Tools that skip the propose gate. Defaults to the read-only set.
+    /// kill_session always uses its own /confirm-kill flow and is never
+    /// double-gated here.
+    pub auto_approve: Vec<String>,
+    /// Propose mode: seconds before an unanswered proposal resolves as
+    /// denied ("no response from user") and the turn continues.
+    pub approval_timeout_secs: u64,
     pub max_history_turns: usize,
     pub max_tokens: u32,
     pub max_tool_iterations: usize,
@@ -99,12 +112,45 @@ impl Default for OrchestratorConfig {
             cwd: String::new(),
             hidden: true,
             permission_mode: "accept-edits".to_string(),
-            events: vec!["waiting".into(), "error".into(), "dead".into()],
+            events: vec![
+                "ready".into(),
+                "waiting".into(),
+                "error".into(),
+                "dead".into(),
+            ],
             event_cooldown_secs: 30,
+            approval: "auto".to_string(),
+            auto_approve: vec![
+                "list_sessions".into(),
+                "read_output".into(),
+                "use_skill".into(),
+            ],
+            approval_timeout_secs: 600,
             max_history_turns: 40,
             max_tokens: 4096,
             max_tool_iterations: 12,
             input_wait_timeout_secs: 180,
+        }
+    }
+}
+
+// ── [chat] ────────────────────────────────────────────────────────────────
+
+/// The chat pane overlay (Alt+T).
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// Popup width as a percentage of the terminal width (20–95).
+    pub width_pct: u16,
+    /// Popup height as a percentage of the terminal height (20–95).
+    pub height_pct: u16,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            width_pct: 60,
+            height_pct: 60,
         }
     }
 }
@@ -121,6 +167,18 @@ pub enum OrchestratorClass {
 }
 
 impl OrchestratorConfig {
+    /// True if this tool call must be approved by the human before running.
+    pub fn approval_required(&self, tool: &str) -> bool {
+        if self.approval != "propose" {
+            return false;
+        }
+        // kill_session has its own confirmation flow (/confirm-kill).
+        if tool == "kill_session" {
+            return false;
+        }
+        !self.auto_approve.iter().any(|t| t == tool)
+    }
+
     pub fn class(&self) -> anyhow::Result<OrchestratorClass> {
         use OrchestratorClass::*;
         Ok(match self.provider.as_str() {
