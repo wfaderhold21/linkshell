@@ -3435,6 +3435,7 @@ impl App {
             ["confirm-kill"] => self.resolve_pending_kill(true),
             ["deny-kill"] => self.resolve_pending_kill(false),
             ["interrupt"] | ["stop"] => self.interrupt_orchestrator(),
+            ["reset"] | ["orchestrator", "reset"] => self.reset_orchestrator(),
             ["approve"] => self.resolve_pending_proposal(true, String::new()),
             ["deny", rest @ ..] => self.resolve_pending_proposal(false, rest.join(" ")),
             ["yes"] => self.answer_permission(None, true),
@@ -3460,6 +3461,54 @@ impl App {
         let name = h.name.clone();
         self.chat_system(format!("interrupt sent to @{}", name));
         self.command_result = format!("interrupted @{}", name);
+    }
+
+    /// Clear the orchestrator's conversation context (/reset). Keeps the task
+    /// and its token totals; only the history is dropped, so a context that
+    /// filled up with monitoring noise starts fresh. If the agent task is
+    /// dead (channel closed), falls back to a full restart so /reset always
+    /// leaves a working orchestrator behind.
+    fn reset_orchestrator(&mut self) {
+        if let Some(h) = &self.orchestrator {
+            match h.tx.try_send(crate::orchestrator::OrchestratorMsg::Reset) {
+                Ok(()) => {
+                    let name = h.name.clone();
+                    self.chat_system(format!("@{} context reset", name));
+                    self.command_result = format!("reset @{}", name);
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Queue full but the task is alive: an interrupt frees it,
+                    // and the reset discards whatever was queued anyway.
+                    h.interrupt();
+                    if h.tx
+                        .try_send(crate::orchestrator::OrchestratorMsg::Reset)
+                        .is_ok()
+                    {
+                        let name = h.name.clone();
+                        self.chat_system(format!("@{} interrupted and context reset", name));
+                        self.command_result = format!("reset @{}", name);
+                        return;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            }
+            // Task is gone (or hopelessly wedged): rebuild it.
+            self.orchestrator = None;
+        }
+        // No live API orchestrator — restart whichever flavor is configured.
+        if let Some(orch_id) = self.orchestrator_session_id.take() {
+            if let Some(idx) = self.sessions.iter().position(|s| s.id == orch_id) {
+                self.remove_session(idx);
+            }
+        }
+        self.command_result = match self.start_orchestrator() {
+            Ok(()) => {
+                self.chat_system("orchestrator restarted with fresh context");
+                "orchestrator reset (restarted)".to_string()
+            }
+            Err(e) => format!("orchestrator: {}", e),
+        };
     }
 
     /// Approve or refuse the orchestrator's pending kill request.
