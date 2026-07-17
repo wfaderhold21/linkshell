@@ -238,7 +238,6 @@ pub struct PendingProposal {
     pub tool: String,
     pub detail: String,
     pub response_tx: Option<tokio::sync::oneshot::Sender<crate::events::ProposalVerdict>>,
-    pub requested_at: std::time::Instant,
 }
 
 /// A kill request from the orchestrator awaiting human confirmation.
@@ -2311,7 +2310,6 @@ impl App {
             tool: tool.clone(),
             detail: detail.clone(),
             response_tx: Some(response_tx),
-            requested_at: std::time::Instant::now(),
         });
         self.chat_system(format!(
             "agent proposes {}: {} — /approve to run, /deny [reason] to refuse",

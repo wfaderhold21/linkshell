@@ -71,6 +71,19 @@ Methods are `auto`, `osc9`, `notify-send`, `bell`, and `none`.
   as denied ("no response from user") after this long, and the agent's turn
   continues; a proposal you never saw cannot wedge the orchestrator.
 
+## `[orchestrator]` limits
+
+- `max_tool_iterations` (default `12`) — tool-call loop budget per turn. When
+  it runs out the agent gets one final tool-free response to wrap up, so the
+  turn lands softly instead of being cut mid-plan. Raise it for local models
+  that take smaller steps per call.
+- `max_history_turns` (default `40`) — conversation turns kept in the agent's
+  context before older ones are dropped.
+- `max_tokens` (default `4096`) — per-response output token cap.
+- `input_wait_timeout_secs` (default `180`) — how long a `send_input` tool
+  call with `wait_ready` waits for the target session to finish before
+  returning.
+
 ## `[[profiles]]`
 
 Profiles contain `name`, `[[profiles.sessions]]`, and `[[profiles.pipes]]`.
