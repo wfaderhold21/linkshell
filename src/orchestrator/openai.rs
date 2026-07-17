@@ -11,6 +11,7 @@ pub async fn run_turn(
     history: &mut Vec<serde_json::Value>,
     user_text: &str,
     event_tx: &mpsc::Sender<AppEvent>,
+    interrupt: &mut super::Interrupt,
 ) -> anyhow::Result<String> {
     let endpoint = cfg.endpoint_url();
     if endpoint.is_empty() {
@@ -23,6 +24,9 @@ pub async fn run_turn(
     super::trim_history(history, cfg.max_history_turns);
 
     for i in 0..cfg.max_tool_iterations {
+        if interrupt.hit() {
+            return Ok(super::INTERRUPTED_NOTE.to_string());
+        }
         super::send_status(
             event_tx,
             format!("thinking ({}/{})", i + 1, cfg.max_tool_iterations),
@@ -74,6 +78,9 @@ pub async fn run_turn(
         if tool_calls.is_empty() {
             return Ok(message["content"].as_str().unwrap_or("").to_string());
         }
+        // Every tool call gets a tool message even when interrupted, so the
+        // history stays valid for the next turn.
+        let mut interrupted = false;
         for call in &tool_calls {
             let name = call["function"]["name"].as_str().unwrap_or("");
             // `arguments` is a JSON-encoded string per the OpenAI spec.
@@ -81,12 +88,25 @@ pub async fn run_turn(
                 .as_str()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
-            let result = super::exec_tool(cfg, event_tx, name, &args).await;
+            let result = if interrupted {
+                super::INTERRUPTED_RESULT.to_string()
+            } else {
+                tokio::select! {
+                    r = super::exec_tool(cfg, event_tx, name, &args) => r,
+                    _ = interrupt.wait() => {
+                        interrupted = true;
+                        super::INTERRUPTED_RESULT.to_string()
+                    }
+                }
+            };
             history.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call["id"],
                 "content": result,
             }));
+        }
+        if interrupted {
+            return Ok(super::INTERRUPTED_NOTE.to_string());
         }
     }
 

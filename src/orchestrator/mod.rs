@@ -20,7 +20,57 @@ use tokio::sync::mpsc;
 pub struct OrchestratorHandle {
     pub tx: mpsc::Sender<OrchestratorMsg>,
     pub name: String,
+    /// Generation counter bumped by /interrupt; the turn loop snapshots it
+    /// at turn start and breaks at the next safe point once it changes.
+    interrupt_tx: tokio::sync::watch::Sender<u64>,
 }
+
+impl OrchestratorHandle {
+    /// Build a handle around an existing channel (tests); the interrupt
+    /// signal goes nowhere.
+    #[cfg(test)]
+    pub fn detached(tx: mpsc::Sender<OrchestratorMsg>, name: String) -> Self {
+        let (interrupt_tx, _) = tokio::sync::watch::channel(0u64);
+        Self {
+            tx,
+            name,
+            interrupt_tx,
+        }
+    }
+
+    /// Ask the current turn to stop at its next safe point (between tool
+    /// iterations, or immediately if it's blocked inside a tool call).
+    pub fn interrupt(&self) {
+        self.interrupt_tx.send_modify(|g| *g += 1);
+    }
+}
+
+/// Per-turn view of the interrupt counter. Checked only at points where
+/// breaking leaves the conversation history API-valid (every tool_use
+/// answered by a tool_result).
+pub struct Interrupt {
+    rx: tokio::sync::watch::Receiver<u64>,
+    start: u64,
+}
+
+impl Interrupt {
+    fn hit(&self) -> bool {
+        *self.rx.borrow() != self.start
+    }
+
+    /// Resolves when the user interrupts; pends forever otherwise.
+    async fn wait(&mut self) {
+        let start = self.start;
+        if self.rx.wait_for(|g| *g != start).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Tool result injected for calls cut short by /interrupt.
+const INTERRUPTED_RESULT: &str = "{\"error\": \"interrupted by user\"}";
+/// Turn text surfaced in the chat pane after an interrupt.
+const INTERRUPTED_NOTE: &str = "[turn interrupted]";
 
 pub enum OrchestratorMsg {
     /// A chat message from the user addressed to the orchestrator.
@@ -73,6 +123,7 @@ impl OrchestratorMsg {
 /// Spawn the orchestrator task. Only valid for API-class providers.
 pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> OrchestratorHandle {
     let (tx, mut rx) = mpsc::channel::<OrchestratorMsg>(64);
+    let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
     let name = cfg.name.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
@@ -90,12 +141,34 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
             }
             let user_text = parts.join("\n\n");
 
+            // Snapshot at turn start so an /interrupt sent while idle
+            // doesn't cancel the next turn.
+            let mut interrupt = Interrupt {
+                rx: interrupt_rx.clone(),
+                start: *interrupt_rx.borrow(),
+            };
             let result = match cfg.class() {
                 Ok(OrchestratorClass::Api(ApiProvider::Anthropic)) => {
-                    anthropic::run_turn(&cfg, &client, &mut history, &user_text, &event_tx).await
+                    anthropic::run_turn(
+                        &cfg,
+                        &client,
+                        &mut history,
+                        &user_text,
+                        &event_tx,
+                        &mut interrupt,
+                    )
+                    .await
                 }
                 Ok(OrchestratorClass::Api(ApiProvider::OpenAi)) => {
-                    openai::run_turn(&cfg, &client, &mut history, &user_text, &event_tx).await
+                    openai::run_turn(
+                        &cfg,
+                        &client,
+                        &mut history,
+                        &user_text,
+                        &event_tx,
+                        &mut interrupt,
+                    )
+                    .await
                 }
                 _ => Err(anyhow::anyhow!(
                     "orchestrator task started for CLI provider"
@@ -118,7 +191,11 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
             }
         }
     });
-    OrchestratorHandle { tx, name }
+    OrchestratorHandle {
+        tx,
+        name,
+        interrupt_tx,
+    }
 }
 
 // ── Tools ──────────────────────────────────────────────────────────────────
@@ -718,6 +795,42 @@ mod tests {
         });
     }
 
+    /// An Interrupt that never fires (the dropped sender closes the channel,
+    /// which `wait` treats as "pend forever").
+    fn test_interrupt() -> Interrupt {
+        let (_tx, rx) = tokio::sync::watch::channel(0u64);
+        Interrupt { rx, start: 0 }
+    }
+
+    #[tokio::test]
+    async fn interrupt_breaks_the_turn_before_the_next_iteration() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let mut interrupt = Interrupt { rx, start: 0 };
+        tx.send(1).unwrap(); // user hit /interrupt
+
+        let cfg = OrchestratorConfig {
+            provider: "anthropic".into(),
+            endpoint: "http://127.0.0.1:1".into(), // must never be contacted
+            api_key: "test-key".into(),
+            ..Default::default()
+        };
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(32);
+        let client = reqwest::Client::new();
+        let mut history = Vec::new();
+        let text = anthropic::run_turn(
+            &cfg,
+            &client,
+            &mut history,
+            "do something",
+            &event_tx,
+            &mut interrupt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, INTERRUPTED_NOTE);
+        assert_eq!(history.len(), 1); // just the user turn; no API call made
+    }
+
     #[tokio::test]
     async fn openai_loop_executes_tools_and_returns_final_text() {
         let endpoint = mock_http(vec![
@@ -747,9 +860,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let mut history = Vec::new();
-        let text = openai::run_turn(&cfg, &client, &mut history, "what's running?", &event_tx)
-            .await
-            .unwrap();
+        let mut interrupt = test_interrupt();
+        let text = openai::run_turn(
+            &cfg,
+            &client,
+            &mut history,
+            "what's running?",
+            &event_tx,
+            &mut interrupt,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, "one session running");
         assert!(saw_list.load(std::sync::atomic::Ordering::SeqCst));
         // user, assistant(tool_calls), tool result, final assistant
@@ -788,9 +909,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let mut history = Vec::new();
-        let text = anthropic::run_turn(&cfg, &client, &mut history, "what's running?", &event_tx)
-            .await
-            .unwrap();
+        let mut interrupt = test_interrupt();
+        let text = anthropic::run_turn(
+            &cfg,
+            &client,
+            &mut history,
+            "what's running?",
+            &event_tx,
+            &mut interrupt,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, "one session running");
         assert!(saw_list.load(std::sync::atomic::Ordering::SeqCst));
         // user, assistant(thinking+tool_use), tool_result user, final assistant

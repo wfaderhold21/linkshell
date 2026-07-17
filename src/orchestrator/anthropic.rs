@@ -13,6 +13,7 @@ pub async fn run_turn(
     history: &mut Vec<serde_json::Value>,
     user_text: &str,
     event_tx: &mpsc::Sender<AppEvent>,
+    interrupt: &mut super::Interrupt,
 ) -> anyhow::Result<String> {
     let auth = cfg.resolve_anthropic_auth().ok_or_else(|| {
         anyhow::anyhow!(
@@ -28,6 +29,9 @@ pub async fn run_turn(
     super::trim_history(history, cfg.max_history_turns);
 
     for i in 0..cfg.max_tool_iterations {
+        if interrupt.hit() {
+            return Ok(super::INTERRUPTED_NOTE.to_string());
+        }
         super::send_status(
             event_tx,
             format!("thinking ({}/{})", i + 1, cfg.max_tool_iterations),
@@ -84,11 +88,24 @@ pub async fn run_turn(
             return Ok(text);
         }
 
+        // Every tool_use must get a tool_result even when interrupted, or
+        // the history is rejected on the next turn.
+        let mut interrupted = false;
         let mut results: Vec<serde_json::Value> = Vec::new();
         if let Some(blocks) = content.as_array() {
             for b in blocks.iter().filter(|b| b["type"] == "tool_use") {
                 let name = b["name"].as_str().unwrap_or("");
-                let result = super::exec_tool(cfg, event_tx, name, &b["input"]).await;
+                let result = if interrupted {
+                    super::INTERRUPTED_RESULT.to_string()
+                } else {
+                    tokio::select! {
+                        r = super::exec_tool(cfg, event_tx, name, &b["input"]) => r,
+                        _ = interrupt.wait() => {
+                            interrupted = true;
+                            super::INTERRUPTED_RESULT.to_string()
+                        }
+                    }
+                };
                 results.push(serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": b["id"],
@@ -97,6 +114,9 @@ pub async fn run_turn(
             }
         }
         history.push(serde_json::json!({"role": "user", "content": results}));
+        if interrupted {
+            return Ok(super::INTERRUPTED_NOTE.to_string());
+        }
     }
 
     // Tool-iteration budget exhausted with the model still mid-task: give it
@@ -106,9 +126,7 @@ pub async fn run_turn(
     // tool_choice "none" hard-blocks further calls; `tools` stays in the body
     // because the API requires definitions while tool blocks are in history.
     super::send_status(event_tx, "summarizing (budget exhausted)").await;
-    if let Some(serde_json::Value::Array(blocks)) =
-        history.last_mut().map(|m| &mut m["content"])
-    {
+    if let Some(serde_json::Value::Array(blocks)) = history.last_mut().map(|m| &mut m["content"]) {
         blocks.push(serde_json::json!({"type": "text", "text": super::EXHAUSTION_NUDGE}));
     }
     let body = serde_json::json!({
@@ -157,6 +175,9 @@ pub async fn run_turn(
     Ok(if summary.is_empty() {
         "[tool iteration limit reached]".to_string()
     } else {
-        format!("{}\n\n[tool iteration limit reached — partial progress above]", summary)
+        format!(
+            "{}\n\n[tool iteration limit reached — partial progress above]",
+            summary
+        )
     })
 }
