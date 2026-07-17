@@ -43,7 +43,23 @@ fn jsonl_files(dir: &Path) -> HashSet<PathBuf> {
         .collect()
 }
 
-/// Wait for a JSONL file to appear in `dir` that wasn't in `existing`.
+/// Process-wide registry of JSONL files already claimed by a watcher.
+/// Multiple claude sessions in the same cwd (orchestrator + workers, or a
+/// detecting watcher racing a native one) each wait for "a new file in this
+/// dir" — without claiming, two watchers can attach to the same file and
+/// report the same usage into two sessions, inflating the totals.
+pub(crate) fn claim_jsonl(path: &Path) -> bool {
+    static CLAIMED: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    CLAIMED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf())
+}
+
+/// Wait for a JSONL file to appear in `dir` that wasn't in `existing` and
+/// isn't already claimed by another session's watcher.
 /// Claude only creates the session file when the user submits their first
 /// prompt, which can be arbitrarily long after the session spawns — so there
 /// is no deadline here; poll until the file appears or the app shuts down.
@@ -54,7 +70,7 @@ async fn wait_for_new_jsonl(
 ) -> Option<PathBuf> {
     loop {
         for path in jsonl_files(dir) {
-            if !existing.contains(&path) {
+            if !existing.contains(&path) && claim_jsonl(&path) {
                 return Some(path);
             }
         }
@@ -68,6 +84,10 @@ async fn wait_for_new_jsonl(
 struct RawUsage {
     input: u64,
     cache_write: u64,
+    /// Portion of `cache_write` written with the 1-hour TTL (billed at 2x
+    /// input instead of 1.25x). Claude Code uses 1h cache by default, so this
+    /// is usually all of `cache_write` when the breakdown is present.
+    cache_write_1h: u64,
     cache_read: u64,
     output: u64,
     model: String,
@@ -84,9 +104,17 @@ fn parse_usage_from_value(v: &serde_json::Value) -> Option<RawUsage> {
         .to_string();
     let usage = v["message"]["usage"].as_object()?;
     let get = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_write = get("cache_creation_input_tokens");
+    let cache_write_1h = usage
+        .get("cache_creation")
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(cache_write);
     let raw = RawUsage {
         input: get("input_tokens"),
-        cache_write: get("cache_creation_input_tokens"),
+        cache_write,
+        cache_write_1h,
         cache_read: get("cache_read_input_tokens"),
         output: get("output_tokens"),
         model,
@@ -114,8 +142,13 @@ fn usage_key(v: &serde_json::Value) -> Option<String> {
 
 fn compute_cost(raw: &RawUsage, config: &Config) -> f64 {
     let rate = config.pricing.claude_rate(&raw.model);
+    // Configured cache_write is the 5-minute-TTL rate (1.25x input). 1-hour
+    // cache writes bill at 2x input = 1.6x the 5m rate; Claude Code uses the
+    // 1h TTL by default, so without this the cost undercounts vs /cost.
+    let cw_5m = raw.cache_write - raw.cache_write_1h;
     (raw.input as f64 / 1_000_000.0) * rate.input
-        + (raw.cache_write as f64 / 1_000_000.0) * rate.cache_write
+        + (cw_5m as f64 / 1_000_000.0) * rate.cache_write
+        + (raw.cache_write_1h as f64 / 1_000_000.0) * rate.cache_write * 1.6
         + (raw.cache_read as f64 / 1_000_000.0) * rate.cache_read
         + (raw.output as f64 / 1_000_000.0) * rate.output
 }
@@ -417,6 +450,7 @@ mod tests {
         let raw = RawUsage {
             input: 1_000_000,
             cache_write: 1_000_000,
+            cache_write_1h: 0,
             cache_read: 1_000_000,
             output: 1_000_000,
             model: "claude-haiku-test".into(),
@@ -426,6 +460,47 @@ mod tests {
         let cost = compute_cost(&raw, &Config::default());
 
         assert!((cost - 5.88).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_cost_matches_claude_code_for_fable_with_1h_cache() {
+        // Real numbers from a `claude -p --output-format json` run: Claude Code
+        // reported costUSD 0.306436 for this usage (1h cache writes at 2x).
+        let raw = RawUsage {
+            input: 2291,
+            cache_write: 13377,
+            cache_write_1h: 13377,
+            cache_read: 10986,
+            output: 100,
+            model: "claude-fable-5".into(),
+            service_tier: None,
+        };
+
+        let cost = compute_cost(&raw, &Config::default());
+
+        assert!((cost - 0.306436).abs() < 1e-9, "cost = {}", cost);
+    }
+
+    #[test]
+    fn parse_usage_reads_1h_cache_breakdown() {
+        let v = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "usage": {
+                    "input_tokens": 5,
+                    "cache_creation_input_tokens": 100,
+                    "output_tokens": 1,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 70,
+                        "ephemeral_5m_input_tokens": 30
+                    }
+                }
+            }
+        });
+        let raw = parse_usage_from_value(&v).unwrap();
+        assert_eq!(raw.cache_write, 100);
+        assert_eq!(raw.cache_write_1h, 70);
     }
 
     #[test]
@@ -467,6 +542,13 @@ mod tests {
             parse_state(&serde_json::json!({"type": "system", "subtype": "turn_duration"})),
             None
         );
+    }
+
+    #[test]
+    fn claim_jsonl_admits_each_file_exactly_once() {
+        let p = PathBuf::from("/tmp/linkshell-test-claim-unique-xyz.jsonl");
+        assert!(claim_jsonl(&p));
+        assert!(!claim_jsonl(&p));
     }
 
     #[test]

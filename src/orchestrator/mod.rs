@@ -86,6 +86,9 @@ pub enum OrchestratorMsg {
     },
     /// Out-of-band note (kill approved/denied, etc.).
     SystemNote(String),
+    /// Drop the conversation history (/reset). Anything queued before the
+    /// reset is discarded with it; messages after it start the fresh context.
+    Reset,
 }
 
 impl OrchestratorMsg {
@@ -112,11 +115,39 @@ impl OrchestratorMsg {
                 )
             }
             OrchestratorMsg::SystemNote(note) => format!("[linkshell] {}", note),
+            OrchestratorMsg::Reset => String::new(),
         }
     }
 
     fn is_user_chat(&self) -> bool {
         matches!(self, OrchestratorMsg::UserChat(_))
+    }
+}
+
+/// Fold a queued batch of messages into one user turn. A Reset anywhere in
+/// the batch wipes the conversation history and everything queued before it;
+/// messages after the reset start the fresh context. Returns None text when
+/// the batch was a pure reset with nothing left to say to the model.
+fn coalesce_batch(
+    msgs: &[OrchestratorMsg],
+    history: &mut Vec<serde_json::Value>,
+) -> (Option<String>, bool) {
+    let mut parts = Vec::new();
+    let mut any_user = false;
+    for m in msgs {
+        if matches!(m, OrchestratorMsg::Reset) {
+            history.clear();
+            parts.clear();
+            any_user = false;
+        } else {
+            any_user |= m.is_user_chat();
+            parts.push(m.render());
+        }
+    }
+    if parts.is_empty() {
+        (None, any_user)
+    } else {
+        (Some(parts.join("\n\n")), any_user)
     }
 }
 
@@ -133,13 +164,15 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
         while let Some(first) = rx.recv().await {
             // Coalesce whatever queued up while we were idle or mid-turn into
             // a single user turn — an event storm becomes one API call.
-            let mut parts = vec![first.render()];
-            let mut any_user = first.is_user_chat();
+            let mut msgs = vec![first];
             while let Ok(next) = rx.try_recv() {
-                any_user |= next.is_user_chat();
-                parts.push(next.render());
+                msgs.push(next);
             }
-            let user_text = parts.join("\n\n");
+            let (user_text, any_user) = coalesce_batch(&msgs, &mut history);
+            let Some(user_text) = user_text else {
+                // Pure reset, nothing to say to the model.
+                continue;
+            };
 
             // Snapshot at turn start so an /interrupt sent while idle
             // doesn't cancel the next turn.
@@ -737,6 +770,42 @@ mod tests {
             }
             other => panic!("expected OrchestratorStatus, got {:?}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn reset_clears_history_and_discards_earlier_queued_messages() {
+        let mut history = vec![
+            serde_json::json!({"role": "user", "content": "old"}),
+            serde_json::json!({"role": "assistant", "content": "old reply"}),
+        ];
+        // Stale note queued before the reset is discarded with the history;
+        // the message after the reset starts the fresh context.
+        let msgs = vec![
+            OrchestratorMsg::SystemNote("stale".into()),
+            OrchestratorMsg::Reset,
+            OrchestratorMsg::UserChat("two".into()),
+        ];
+        let (text, any_user) = coalesce_batch(&msgs, &mut history);
+        assert_eq!(text.as_deref(), Some("two"));
+        assert!(any_user);
+        assert!(history.is_empty());
+
+        // Pure reset: history wiped, nothing to send.
+        let mut history = vec![serde_json::json!({"role": "user", "content": "old"})];
+        let (text, _) = coalesce_batch(&[OrchestratorMsg::Reset], &mut history);
+        assert!(text.is_none());
+        assert!(history.is_empty());
+
+        // No reset: plain coalescing.
+        let mut history = vec![serde_json::json!({"role": "user", "content": "kept"})];
+        let msgs = vec![
+            OrchestratorMsg::UserChat("a".into()),
+            OrchestratorMsg::SystemNote("b".into()),
+        ];
+        let (text, any_user) = coalesce_batch(&msgs, &mut history);
+        assert_eq!(text.as_deref(), Some("a\n\n[linkshell] b"));
+        assert!(any_user);
+        assert_eq!(history.len(), 1);
     }
 
     #[test]

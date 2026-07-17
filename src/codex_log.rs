@@ -75,7 +75,13 @@ async fn wait_for_new_rollout(
 
         for path in candidates {
             match rollout_cwd(&path) {
-                Some(path_cwd) if path_cwd == cwd => return Some(path),
+                // Claim so two codex sessions in the same cwd don't both tail
+                // the same rollout and double-report its usage.
+                Some(path_cwd) if path_cwd == cwd => {
+                    if crate::claude_log::claim_jsonl(&path) {
+                        return Some(path);
+                    }
+                }
                 Some(_) => {}
                 None => {
                     // Codex creates the file before all early metadata is flushed.

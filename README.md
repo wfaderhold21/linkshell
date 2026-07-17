@@ -250,7 +250,7 @@ call a `use_skill` tool, CLI-class orchestrators get the file paths in their
 briefing and read them directly.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
-`:orchestrator start|stop|restart|status|show|hide` manages it at runtime
+`:orchestrator start|stop|restart|reset|status|show|hide` manages it at runtime
 (also usable from chat as `/orchestrator …`). If the agent dies — its task
 exits or the CLI session ends — a chat notice appears with the restart command.
 
@@ -262,6 +262,11 @@ iterations or blocked waiting on a session — `/interrupt` (alias `/stop`)
 breaks the turn at the next safe point. Blocked tool calls return
 "interrupted by user" to the model, so its history stays coherent and it
 can be redirected on the next message.
+
+`/reset` clears an API-class orchestrator's conversation context in place —
+useful when the context has filled up with monitoring events — while keeping
+the task and its token totals. If the agent task has died, `/reset` falls back
+to a full restart, so it always leaves a working orchestrator behind.
 
 ## Local agent sessions
 
