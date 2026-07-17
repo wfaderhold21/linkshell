@@ -657,7 +657,10 @@ mod tests {
 
     #[tokio::test]
     async fn propose_mode_gates_tools_and_returns_deny_reason() {
-        let cfg = OrchestratorConfig { approval: "propose".to_string(), ..Default::default() };
+        let cfg = OrchestratorConfig {
+            approval: "propose".to_string(),
+            ..Default::default()
+        };
         let (tx, mut rx) = mpsc::channel::<AppEvent>(8);
 
         let handle = tokio::spawn({
@@ -706,7 +709,10 @@ mod tests {
 
     #[tokio::test]
     async fn auto_approve_tools_skip_the_gate() {
-        let mut cfg = OrchestratorConfig { approval: "propose".to_string(), ..Default::default() };
+        let mut cfg = OrchestratorConfig {
+            approval: "propose".to_string(),
+            ..Default::default()
+        };
         assert!(cfg.approval_required("send_input"));
         assert!(cfg.approval_required("start_session"));
         assert!(!cfg.approval_required("read_output"));
