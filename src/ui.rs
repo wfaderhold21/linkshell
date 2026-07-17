@@ -182,9 +182,17 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         ])
         .split(body);
 
+    let mut chat_area = Rect::default();
+    let mut chat_layout = ChatLayout::default();
+
     let output_areas = split_output_areas(chunks[0], app.layout);
     for (pane_idx, area) in output_areas.iter().copied().enumerate() {
-        draw_pane_output(f, app, area, pane_idx, pane_idx == app.focused_pane);
+        if app.chat_docked == Some(pane_idx) && output_areas.len() > 1 {
+            chat_layout = draw_chat_in(f, app, area, pane_idx == app.focused_pane);
+            chat_area = chat_layout.area;
+        } else {
+            draw_pane_output(f, app, area, pane_idx, pane_idx == app.focused_pane);
+        }
     }
     let slot_areas = draw_session_bar(f, app, chunks[1]);
     let status_row_areas = draw_status_panel(f, app, chunks[2]);
@@ -195,8 +203,6 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let mut file_browser_area = Rect::default();
     let mut command_bar_area = Rect::default();
     let mut help_area = Rect::default();
-    let mut chat_area = Rect::default();
-    let mut chat_layout = ChatLayout::default();
 
     match &app.mode {
         AppMode::NewSession => {
@@ -1149,6 +1155,11 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
         ("alt-x", "Kill active session"),
         ("alt-c", "Open command bar"),
         ("alt-t", "Toggle agent chat pane"),
+        ("alt-g", "Dock/undock chat as a split pane"),
+        (
+            "alt-\\ / alt-- / alt-o",
+            "Toggle / rotate / switch split panes",
+        ),
         ("alt-shift-pgup/pgdn", "Scroll output (any session)"),
         ("alt-h", "Show this help"),
         ("ctrl-space", "Toggle menu bar"),
@@ -1363,6 +1374,12 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
     let height_pct = app.config.chat.height_pct.clamp(20, 95);
     let height_rows = (area.height as u32 * height_pct as u32 / 100).max(8) as u16;
     let popup = centered_rect(width_pct, height_rows, area);
+    draw_chat_in(f, app, popup, true)
+}
+
+/// Render the chat into an exact rect — used by both the centered overlay
+/// and the docked split pane. `focused` drives the border colour.
+fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> ChatLayout {
     f.render_widget(Clear, popup);
 
     let target = app
@@ -1377,7 +1394,11 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
             target
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
