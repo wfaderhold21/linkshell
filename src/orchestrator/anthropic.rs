@@ -27,7 +27,6 @@ pub async fn run_turn(
     history.push(serde_json::json!({"role": "user", "content": user_text}));
     super::trim_history(history, cfg.max_history_turns);
 
-    let mut final_text = String::new();
     for _ in 0..cfg.max_tool_iterations {
         let body = serde_json::json!({
             "model": cfg.model_id(),
@@ -64,7 +63,7 @@ pub async fn run_turn(
         // Replay assistant content verbatim (keeps thinking blocks intact).
         history.push(serde_json::json!({"role": "assistant", "content": content}));
 
-        final_text = content
+        let text = content
             .as_array()
             .map(|blocks| {
                 blocks
@@ -77,7 +76,7 @@ pub async fn run_turn(
             .unwrap_or_default();
 
         if resp["stop_reason"] != "tool_use" {
-            return Ok(final_text);
+            return Ok(text);
         }
 
         let mut results: Vec<serde_json::Value> = Vec::new();
@@ -94,10 +93,64 @@ pub async fn run_turn(
         }
         history.push(serde_json::json!({"role": "user", "content": results}));
     }
-    // Tool-iteration budget exhausted; whatever text we have is the answer.
-    Ok(if final_text.is_empty() {
+
+    // Tool-iteration budget exhausted with the model still mid-task: give it
+    // one final tool-less turn to summarize its progress, so partial work
+    // reaches the user instead of "[tool iteration limit reached]". The nudge
+    // rides in the pending tool_results user turn (roles must alternate) and
+    // tool_choice "none" hard-blocks further calls; `tools` stays in the body
+    // because the API requires definitions while tool blocks are in history.
+    if let Some(serde_json::Value::Array(blocks)) =
+        history.last_mut().map(|m| &mut m["content"])
+    {
+        blocks.push(serde_json::json!({"type": "text", "text": super::EXHAUSTION_NUDGE}));
+    }
+    let body = serde_json::json!({
+        "model": cfg.model_id(),
+        "max_tokens": cfg.max_tokens,
+        "system": system,
+        "tools": tools,
+        "tool_choice": {"type": "none"},
+        "messages": history,
+    });
+    let resp: serde_json::Value = auth
+        .apply(client.post(&url))
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(
+            cfg.input_wait_timeout_secs + 120,
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+    if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
+        anyhow::bail!(
+            "api error: {}",
+            err["message"].as_str().unwrap_or("unknown")
+        );
+    }
+    let input = resp["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output = resp["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let _ = event_tx
+        .send(AppEvent::OrchestratorUsage { input, output })
+        .await;
+    let content = resp["content"].clone();
+    history.push(serde_json::json!({"role": "assistant", "content": content}));
+    let summary = content
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    Ok(if summary.is_empty() {
         "[tool iteration limit reached]".to_string()
     } else {
-        final_text
+        format!("{}\n\n[tool iteration limit reached — partial progress above]", summary)
     })
 }

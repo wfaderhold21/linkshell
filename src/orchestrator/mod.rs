@@ -224,6 +224,14 @@ fn tool_specs() -> Vec<(&'static str, &'static str, serde_json::Value)> {
 }
 
 /// Anthropic `tools` array shape.
+/// Injected as a final user-turn note when the tool-iteration budget runs
+/// out: forces a text answer so partial progress reaches the user instead of
+/// a dead-end sentinel. The final request also sets tool_choice to none, so
+/// the model cannot spend the landing turn on another tool call.
+const EXHAUSTION_NUDGE: &str = "[linkshell] Tool iteration budget for this turn is exhausted. \
+Do not call any more tools. Summarize what you did, what you learned from the tool results \
+above, and what (if anything) remains to be done.";
+
 fn anthropic_tools() -> serde_json::Value {
     tool_specs()
         .into_iter()

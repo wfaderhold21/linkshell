@@ -84,5 +84,52 @@ pub async fn run_turn(
             }));
         }
     }
-    Ok("[tool iteration limit reached]".to_string())
+
+    // Tool-iteration budget exhausted: one final tool-less turn so the model
+    // summarizes its partial progress instead of returning a dead-end
+    // sentinel. tool_choice "none" hard-blocks further calls.
+    history.push(serde_json::json!({"role": "user", "content": super::EXHAUSTION_NUDGE}));
+    let mut messages =
+        vec![serde_json::json!({"role": "system", "content": super::system_prompt(cfg)})];
+    messages.extend(history.iter().cloned());
+    let body = serde_json::json!({
+        "model": cfg.model_id(),
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "none",
+    });
+    let mut req = client
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(
+            cfg.input_wait_timeout_secs + 120,
+        ));
+    if let Some(key) = cfg.resolve_api_key() {
+        req = req.bearer_auth(key);
+    }
+    let resp: serde_json::Value = req.send().await?.json().await?;
+    if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
+        anyhow::bail!(
+            "api error: {}",
+            err["message"].as_str().unwrap_or("unknown")
+        );
+    }
+    let input = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let _ = event_tx
+        .send(AppEvent::OrchestratorUsage { input, output })
+        .await;
+    let message = resp["choices"][0]["message"].clone();
+    let summary = message["content"].as_str().unwrap_or("").to_string();
+    if !message.is_null() {
+        history.push(message);
+    }
+    Ok(if summary.is_empty() {
+        "[tool iteration limit reached]".to_string()
+    } else {
+        format!(
+            "{}\n\n[tool iteration limit reached — partial progress above]",
+            summary
+        )
+    })
 }
