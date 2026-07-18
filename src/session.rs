@@ -235,6 +235,12 @@ pub struct Session {
     /// session switching. Still fully alive (PTY, state inference, IPC);
     /// used for the CLI-class orchestrator so it lives behind the chat pane.
     pub hidden: bool,
+    /// OS process id of the PTY child, once known. Used for pause/resume
+    /// (SIGSTOP/SIGCONT on the child's process group).
+    pub child_pid: Option<u32>,
+    /// Process is stopped with SIGSTOP. The session stays alive (PTY, screen,
+    /// stats) but produces no output and consumes no CPU until resumed.
+    pub paused: bool,
     /// When true, state was set by IPC and should not be auto-reverted by the tick timeout.
     /// Cleared when pattern matching updates the state from PTY output.
     pub ipc_state: bool,
@@ -317,6 +323,8 @@ impl Session {
             headless: false,
             is_orchestrator: false,
             hidden: false,
+            child_pid: None,
+            paused: false,
             ipc_state: false,
             ipc_state_set_at: None,
             group: None,
@@ -381,6 +389,38 @@ impl Session {
         let start = lines.len().saturating_sub(n);
         lines.drain(..start);
         lines
+    }
+
+    /// State text for display and reporting: paused sessions read PAUSED
+    /// regardless of the frozen underlying state.
+    pub fn state_label(&self) -> &str {
+        if self.paused && self.state != SessionState::Dead {
+            "PAUSED"
+        } else {
+            self.state.label()
+        }
+    }
+
+    /// Pause (SIGSTOP) or resume (SIGCONT) the session's process. Signals the
+    /// child's process group so grandchildren (the CLI's own subprocesses)
+    /// stop too; falls back to the child alone if group signalling fails.
+    pub fn set_paused(&mut self, pause: bool) -> Result<(), String> {
+        if self.state == SessionState::Dead {
+            return Err("session is dead".to_string());
+        }
+        let Some(pid) = self.child_pid else {
+            return Err("no process id known for this session".to_string());
+        };
+        if self.paused == pause {
+            return Ok(());
+        }
+        let sig = if pause { libc::SIGSTOP } else { libc::SIGCONT };
+        let ok = unsafe { libc::kill(-(pid as i32), sig) == 0 || libc::kill(pid as i32, sig) == 0 };
+        if !ok {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        self.paused = pause;
+        Ok(())
     }
 
     pub fn elapsed_secs(&self) -> u64 {

@@ -37,6 +37,11 @@ pub enum AppEvent {
     SessionDied {
         session_id: usize,
     },
+    /// OS process id of a newly spawned session's PTY child (for pause/resume)
+    SessionPid {
+        session_id: usize,
+        pid: u32,
+    },
     /// Authoritative cumulative token stats read from ~/.claude project JSONL
     SessionStats {
         session_id: usize,
@@ -244,6 +249,11 @@ pub enum OrchestratorReq {
     PipeRemove {
         source: usize,
         dest: Option<usize>,
+    },
+    /// Pause (SIGSTOP) or resume (SIGCONT) a session's process.
+    SetPaused {
+        session_id: usize,
+        paused: bool,
     },
     /// Files a kill request; the reply is always pending-confirmation.
     RequestKill {
