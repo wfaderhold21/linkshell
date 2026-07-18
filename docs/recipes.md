@@ -70,3 +70,13 @@ reasons go back to the model as the tool result, so "wrong session, use 3"
 steers it mid-turn. Your approval history is the eval: once the proposals are
 consistently sensible, flip `approval = "auto"` — or keep the gate and grow
 `auto_approve` tool by tool.
+
+## Agent memory
+
+The orchestrator remembers across restarts through
+`~/.config/linkshell/memory.md` (created automatically). Tell it things worth
+keeping — "remember that the UCC build needs `--with-ucx=$HOME/ucx`" — and it
+files a dated bullet via its `remember` tool; every future turn starts with
+the file's contents in its prompt. It works best kept short: prune stale
+bullets by hand, or `/deny` nothing — just edit the file, it is plain
+markdown.

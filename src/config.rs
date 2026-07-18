@@ -63,6 +63,12 @@ pub struct OrchestratorConfig {
     /// the file paths in their briefing. Empty = ~/.config/linkshell/skills
     /// when that directory exists.
     pub skills_dir: String,
+    /// Persistent agent memory: one markdown file injected into the
+    /// orchestrator's prompt every turn and appended to by its `remember`
+    /// tool. The whole file goes in verbatim — keep it concise; entries the
+    /// agent adds are dated bullets you can prune by hand. Empty =
+    /// ~/.config/linkshell/memory.md (created on first orchestrator start).
+    pub memory_file: String,
     /// CLI class: working directory for the orchestrator session.
     pub cwd: String,
     /// CLI class: keep the orchestrator session out of the session bar and
@@ -109,6 +115,7 @@ impl Default for OrchestratorConfig {
             auth_token: String::new(),
             system: String::new(),
             skills_dir: String::new(),
+            memory_file: String::new(),
             cwd: String::new(),
             hidden: true,
             permission_mode: "accept-edits".to_string(),
@@ -124,6 +131,8 @@ impl Default for OrchestratorConfig {
                 "list_sessions".into(),
                 "read_output".into(),
                 "use_skill".into(),
+                // Writes only to the agent's own memory file.
+                "remember".into(),
             ],
             approval_timeout_secs: 600,
             max_history_turns: 40,
@@ -212,21 +221,51 @@ impl OrchestratorConfig {
     }
 
     /// Effective skills directory: the configured path (with `~` expansion),
-    /// or the default ~/.config/linkshell/skills when it exists.
+    /// or the default ~/.config/linkshell/skills when it exists
+    /// (ensure_agent_files creates it when the orchestrator starts).
     pub fn skills_path(&self) -> Option<std::path::PathBuf> {
         if !self.skills_dir.is_empty() {
-            let dir = if self.skills_dir == "~" || self.skills_dir.starts_with("~/") {
-                match std::env::var("HOME") {
-                    Ok(home) => format!("{}{}", home, &self.skills_dir[1..]),
-                    Err(_) => self.skills_dir.clone(),
-                }
-            } else {
-                self.skills_dir.clone()
-            };
-            return Some(std::path::PathBuf::from(dir));
+            return Some(std::path::PathBuf::from(expand_tilde(&self.skills_dir)));
         }
         let default = config_path()?.parent()?.join("skills");
         default.is_dir().then_some(default)
+    }
+
+    /// Effective memory file: the configured path (with `~` expansion), or
+    /// the default ~/.config/linkshell/memory.md. Unlike skills_path this
+    /// returns the default even before the file exists, so the `remember`
+    /// tool and the scaffolding know where to write.
+    pub fn memory_path(&self) -> Option<std::path::PathBuf> {
+        if !self.memory_file.is_empty() {
+            return Some(std::path::PathBuf::from(expand_tilde(&self.memory_file)));
+        }
+        Some(config_path()?.parent()?.join("memory.md"))
+    }
+
+    /// Create the default agent locations so they work out of the box:
+    /// the skills directory, and a memory.md seeded with a short template
+    /// explaining the contract. Idempotent and best-effort; called when an
+    /// orchestrator starts.
+    pub fn ensure_agent_files(&self) {
+        if self.skills_dir.is_empty() {
+            if let Some(dir) = config_path().and_then(|p| p.parent().map(|d| d.join("skills"))) {
+                let _ = std::fs::create_dir_all(dir);
+            }
+        }
+        if let Some(path) = self.memory_path() {
+            if !path.exists() {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(
+                    &path,
+                    "# Agent memory\n\n\
+                     Durable notes the orchestrator carries between sessions. The whole file\n\
+                     is injected into its prompt every turn, so keep it concise — prune freely.\n\
+                     The agent appends dated bullets below via its `remember` tool.\n",
+                );
+            }
+        }
     }
 
     /// Effective model id (API class).
@@ -746,6 +785,16 @@ pub struct KeybindingsConfig {
 // ── Load ──────────────────────────────────────────────────────────────────
 
 /// Location of the user config file: ~/.config/linkshell/config.toml
+/// Expand a leading `~`/`~/` to $HOME; other paths pass through unchanged.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
 pub fn config_path() -> Option<std::path::PathBuf> {
     std::env::var("HOME").ok().map(|h| {
         std::path::PathBuf::from(h)

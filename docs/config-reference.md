@@ -51,6 +51,23 @@ Methods are `auto`, `osc9`, `notify-send`, `bell`, and `none`.
 - `events` (default `["ready", "waiting", "error", "dead"]`) — session state changes forwarded to the orchestrator agent as `[linkshell event]` messages. `ready` fires when a session finishes (goes quiet); remove it if completion events are too chatty for your workflow.
 - `event_cooldown_secs` (default `30`) — minimum seconds between events for the same (session, state) pair.
 
+## `[orchestrator]` agent memory and skills
+
+Both live under `~/.config/linkshell/` by default and are created
+automatically the first time an orchestrator starts — no configuration
+needed. Override the locations with `skills_dir` and `memory_file` (both
+accept `~`).
+
+- **Skills** (`~/.config/linkshell/skills/`) — one `.md` file per skill;
+  the name + description go in the prompt, the body loads on demand via
+  `use_skill` (API class) or by path (CLI class).
+- **Memory** (`~/.config/linkshell/memory.md`) — durable notes injected
+  into the orchestrator's prompt verbatim every turn. The agent appends
+  dated bullets with its `remember` tool; you curate the file by hand.
+  Keeping it concise is on you: past 8 KiB it is truncated in the prompt
+  and the agent is told to ask you to prune. `remember` is in the default
+  `auto_approve` set (it writes only to this file).
+
 ## `[orchestrator]` approval (propose mode)
 
 - `approval` (default `"auto"`) — `"auto"` runs the orchestrator's tool calls
