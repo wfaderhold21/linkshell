@@ -851,12 +851,14 @@ mod tests {
         let file = dir.join("memory.md");
         let _ = std::fs::remove_file(&file);
 
-        let mut cfg = OrchestratorConfig::default();
-        cfg.memory_file = file.to_string_lossy().to_string();
+        let cfg = OrchestratorConfig {
+            memory_file: file.to_string_lossy().to_string(),
+            approval: "propose".to_string(),
+            ..Default::default()
+        };
         let (tx, _rx) = mpsc::channel::<AppEvent>(8);
 
         // remember is auto-approved even in propose mode.
-        cfg.approval = "propose".to_string();
         assert!(!cfg.approval_required("remember"));
 
         let out = exec_tool(
