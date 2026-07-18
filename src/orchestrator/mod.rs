@@ -320,6 +320,28 @@ fn tool_specs() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             }),
         ),
         (
+            "pause_session",
+            "Pause a session's process (SIGSTOP). The session stays alive with its full context but uses no CPU until resumed — use this when sessions compete for limited system resources and one should yield.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "integer"}
+                },
+                "required": ["session_id"]
+            }),
+        ),
+        (
+            "resume_session",
+            "Resume a previously paused session (SIGCONT).",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "integer"}
+                },
+                "required": ["session_id"]
+            }),
+        ),
+        (
             "request_kill",
             "Ask the user for permission to kill a session. This never kills directly — the user must approve with /confirm-kill.",
             serde_json::json!({
@@ -508,6 +530,14 @@ async fn exec_tool(
             source,
             dest: sid("dest"),
         }),
+        "pause_session" => sid("session_id").map(|session_id| OrchestratorReq::SetPaused {
+            session_id,
+            paused: true,
+        }),
+        "resume_session" => sid("session_id").map(|session_id| OrchestratorReq::SetPaused {
+            session_id,
+            paused: false,
+        }),
         "request_kill" => sid("session_id").map(|session_id| OrchestratorReq::RequestKill {
             session_id,
             reason: args["reason"].as_str().unwrap_or("").to_string(),
@@ -559,7 +589,9 @@ type into them, and wire pipes between them. Tool session_id arguments take the 
 the user, call sessions by their display number or name.\n\
 \n\
 You cannot kill sessions. request_kill only files a request the user must approve \
-with /confirm-kill.\n\
+with /confirm-kill. You can however pause_session/resume_session: pausing stops a \
+session's process (SIGSTOP) without losing its context — its state shows PAUSED — \
+which is the right lever when concurrent sessions contend for limited CPU or RAM.\n\
 \n\
 Messages starting with [linkshell event] are automatic notifications that a session \
 changed state; investigate briefly (read_output) and tell the user in one or two \

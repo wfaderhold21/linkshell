@@ -250,9 +250,12 @@ call a `use_skill` tool, CLI-class orchestrators get the file paths in their
 briefing and read them directly.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
-`:orchestrator start|stop|restart|reset|status|show|hide` manages it at runtime
-(also usable from chat as `/orchestrator …`). If the agent dies — its task
-exits or the CLI session ends — a chat notice appears with the restart command.
+`:orchestrator start|stop|restart|reset|pause|resume|status|show|hide` manages it
+at runtime (also usable from chat as `/orchestrator …`). If the agent dies — its
+task exits or the CLI session ends — a chat notice appears with the restart
+command. `pause` keeps the orchestrator's context but drops incoming chat and
+session events until `resume` (CLI-class orchestrators are also SIGSTOPped),
+unlike `stop`, which discards its conversation.
 
 The orchestrator can never kill a session on its own: a kill request shows up
 in chat and only `/confirm-kill` executes it (`/deny-kill` refuses).
@@ -314,6 +317,8 @@ new <cmd> [name]      Start a single-word command as a session
 new custom <cmd...>   Start a full command line (spaces, env prefixes) as a session
 kill                  Kill the active session
 kill <n>              Kill session by number
+pause [n]             Pause a session's process (SIGSTOP) — keeps its context, frees CPU
+resume [n]            Resume a paused session (SIGCONT)
 council <file.toml>   Launch a multi-agent council
 council status        Show council round / completion state
 council stop          Detach the council router (sessions keep running)

@@ -336,6 +336,11 @@ async fn run_server() -> anyhow::Result<()> {
         }
 
         if app.should_quit {
+            // Stopped children can't see the PTY-close SIGHUP; continue them
+            // so they exit instead of lingering as stopped orphans.
+            for s in app.sessions.iter_mut() {
+                let _ = s.set_paused(false);
+            }
             break;
         }
 
@@ -480,6 +485,11 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::SessionDied { session_id } => {
             app.handle_session_died(session_id);
+        }
+        AppEvent::SessionPid { session_id, pid } => {
+            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.child_pid = Some(pid);
+            }
         }
         AppEvent::SessionStats { session_id, stats } => {
             app.handle_session_stats(session_id, stats);

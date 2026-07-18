@@ -287,6 +287,16 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
     ),
     ("kill <session>", "Stop a session", "kill "),
     (
+        "pause [session]",
+        "Pause a session's process (SIGSTOP)",
+        "pause ",
+    ),
+    (
+        "resume [session]",
+        "Resume a paused session (SIGCONT)",
+        "resume ",
+    ),
+    (
         "yes [session]",
         "Approve a pending permission prompt",
         "yes ",
@@ -470,6 +480,10 @@ pub struct App {
     pub orchestrator: Option<crate::orchestrator::OrchestratorHandle>,
     /// Session id of the CLI-class orchestrator (Class B providers)
     pub orchestrator_session_id: Option<usize>,
+    /// Orchestrator is paused: incoming chat and session events are dropped
+    /// (not queued — a backlog would overwhelm it on resume). For the
+    /// CLI-class flavor the hidden session's process is also SIGSTOPped.
+    pub orchestrator_paused: bool,
     /// Kill request awaiting human /confirm-kill
     pub pending_kill: Option<PendingKill>,
     /// Propose mode: the orchestrator tool call currently awaiting a verdict.
@@ -570,6 +584,7 @@ impl App {
             council: None,
             orchestrator: None,
             orchestrator_session_id: None,
+            orchestrator_paused: false,
             pending_kill: None,
             pending_proposal: None,
             orchestrator_stats: crate::session::TokenStats::default(),
@@ -946,6 +961,26 @@ impl App {
         Ok(id)
     }
 
+    /// `pause [n]` / `resume [n]` from the command bar. `n` is the 1-based
+    /// session-bar number; no argument targets the active session.
+    fn set_paused_command(&mut self, display_num: Option<usize>, pause: bool) {
+        let idx = match display_num {
+            Some(n) => n.checked_sub(1).and_then(|p| self.visible_to_idx(p)),
+            None => self.active_idx(),
+        };
+        let verb = if pause { "pause" } else { "resume" };
+        let Some(idx) = idx else {
+            self.command_result = format!("{}: no such session", verb);
+            return;
+        };
+        let session = &mut self.sessions[idx];
+        let name = session.name.clone();
+        self.command_result = match session.set_paused(pause) {
+            Ok(()) => format!("{}d \"{}\"", verb, name),
+            Err(e) => format!("{} \"{}\": {}", verb, name, e),
+        };
+    }
+
     pub fn kill_active_session(&mut self) {
         if let Some(idx) = self.active_idx() {
             self.remove_session(idx);
@@ -956,6 +991,9 @@ impl App {
         if idx >= self.sessions.len() {
             return;
         }
+        // A stopped process can't react to the PTY closing; continue it first
+        // so it actually dies instead of lingering as a stopped orphan.
+        let _ = self.sessions[idx].set_paused(false);
         // Drop the PTY write channel so the background task exits
         self.sessions[idx].pty_writer = None;
         self.sessions.remove(idx);
@@ -1310,6 +1348,11 @@ impl App {
         }
         if self.orchestrator_session_id == Some(session_id) {
             self.surface_orchestrator_prompt(session_id, new_state);
+            return;
+        }
+        // Paused: drop events outright. Queueing them would bury the
+        // orchestrator under a stale backlog the moment it resumes.
+        if self.orchestrator_paused {
             return;
         }
         let state_key: &'static str = match new_state {
@@ -2109,6 +2152,7 @@ impl App {
         if self.orchestrator.is_some() || self.orchestrator_session_id.is_some() {
             anyhow::bail!("orchestrator already running");
         }
+        self.orchestrator_paused = false;
         let cfg = self.config.orchestrator.clone();
         match cfg.class()? {
             crate::config::OrchestratorClass::Api(_) => {
@@ -2186,7 +2230,8 @@ impl App {
                     "display":        display,
                     "name":           s.name,
                     "kind":           s.kind.label(),
-                    "state":          s.state.label(),
+                    "state":          s.state_label(),
+                    "paused":         s.paused,
                     "waiting_prompt": s.waiting_prompt,
                     "group":          s.group,
                     "hidden":         s.hidden,
@@ -2280,6 +2325,19 @@ impl App {
             OrchestratorReq::PipeRemove { source, dest } => {
                 self.handle_ipc_pipe_remove(source, dest);
                 serde_json::json!({"ok": true})
+            }
+            OrchestratorReq::SetPaused { session_id, paused } => {
+                if self.orchestrator_session_id == Some(session_id) {
+                    serde_json::json!({"error": "the orchestrator cannot pause itself"})
+                } else {
+                    match self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        Some(s) => match s.set_paused(paused) {
+                            Ok(()) => serde_json::json!({"ok": true, "paused": paused}),
+                            Err(e) => serde_json::json!({"error": e}),
+                        },
+                        None => serde_json::json!({"error": "session not found"}),
+                    }
+                }
             }
             OrchestratorReq::RequestKill { session_id, reason } => {
                 self.file_kill_request(session_id, reason)
@@ -2494,6 +2552,12 @@ impl App {
             // is always well above that threshold.
             let bytes = session.bytes_since_last_tick;
             session.bytes_since_last_tick = 0;
+            // A paused process emits nothing; freeze its state instead of
+            // letting the idle timeout drift it to Ready (which would fire
+            // on-ready pipes against a stopped session).
+            if session.paused {
+                continue;
+            }
             if !session.ipc_state && session.state == SessionState::Ready && bytes > 80 {
                 session.state = SessionState::Running;
             }
@@ -3442,6 +3506,10 @@ impl App {
                     }
                 }
             }
+            ["pause"] => self.set_paused_command(None, true),
+            ["pause", n] => self.set_paused_command(n.parse::<usize>().ok(), true),
+            ["resume"] => self.set_paused_command(None, false),
+            ["resume", n] => self.set_paused_command(n.parse::<usize>().ok(), false),
             ["quit"] | ["q"] => self.should_quit = true,
             ["orchestrator", "start"] => {
                 self.command_result = match self.start_orchestrator() {
@@ -3449,6 +3517,8 @@ impl App {
                     Err(e) => format!("orchestrator: {}", e),
                 };
             }
+            ["orchestrator", "pause"] => self.set_orchestrator_paused(true),
+            ["orchestrator", "resume"] => self.set_orchestrator_paused(false),
             ["orchestrator", "restart"] => {
                 // Tear down whichever flavor is running, then start fresh.
                 self.orchestrator = None;
@@ -3463,6 +3533,7 @@ impl App {
                 };
             }
             ["orchestrator", "stop"] => {
+                self.orchestrator_paused = false;
                 self.command_result = if self.orchestrator.take().is_some() {
                     // Dropping the handle closes the channel; the task exits.
                     "orchestrator stopped".to_string()
@@ -3503,19 +3574,26 @@ impl App {
                 };
             }
             ["orchestrator"] | ["orchestrator", "status"] => {
+                let paused_tag = if self.orchestrator_paused {
+                    " [paused]"
+                } else {
+                    ""
+                };
                 self.command_result = if let Some(h) = &self.orchestrator {
                     format!(
-                        "orchestrator @{} ({}) — {} in / {} out tokens",
+                        "orchestrator @{} ({}){} — {} in / {} out tokens",
                         h.name,
                         self.config.orchestrator.provider,
+                        paused_tag,
                         self.orchestrator_stats.input_tokens,
                         self.orchestrator_stats.output_tokens
                     )
                 } else if let Some(orch_id) = self.orchestrator_session_id {
                     format!(
-                        "orchestrator session {} ({})",
+                        "orchestrator session {} ({}){}",
                         orch_id + 1,
-                        self.config.orchestrator.provider
+                        self.config.orchestrator.provider,
+                        paused_tag
                     )
                 } else {
                     "orchestrator is not running (enable [orchestrator] in linkshell.toml)"
@@ -3649,6 +3727,9 @@ impl App {
 
     /// Deliver a system note to whichever orchestrator flavor is running.
     fn notify_orchestrator_note(&mut self, note: String) {
+        if self.orchestrator_paused {
+            return;
+        }
         if let Some(handle) = &self.orchestrator {
             let dead = matches!(
                 handle
@@ -3677,6 +3758,36 @@ impl App {
 
     /// Detect a silently-died orchestrator task even when nobody is talking
     /// to it. Called every tick; cheap (one atomic load).
+    /// :orchestrator pause / resume. While paused, incoming chat and session
+    /// events are dropped rather than queued, so nothing piles up for the
+    /// orchestrator to wade through on resume. The CLI-class flavor also
+    /// SIGSTOPs the hidden session so the CLI process itself yields the CPU.
+    fn set_orchestrator_paused(&mut self, pause: bool) {
+        if self.orchestrator.is_none() && self.orchestrator_session_id.is_none() {
+            self.command_result = "orchestrator is not running".to_string();
+            return;
+        }
+        if let Some(orch_id) = self.orchestrator_session_id {
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == orch_id) {
+                if let Err(e) = s.set_paused(pause) {
+                    self.command_result = format!(
+                        "orchestrator {}: {}",
+                        if pause { "pause" } else { "resume" },
+                        e
+                    );
+                    return;
+                }
+            }
+        }
+        self.orchestrator_paused = pause;
+        self.command_result = if pause {
+            "orchestrator paused — chat and events are dropped until /orchestrator resume"
+                .to_string()
+        } else {
+            "orchestrator resumed".to_string()
+        };
+    }
+
     fn check_orchestrator_alive(&mut self) {
         if self.orchestrator.as_ref().is_some_and(|h| h.tx.is_closed()) {
             self.orchestrator_gone();
@@ -4325,6 +4436,10 @@ impl App {
         // The resident orchestrator agent (API class; the CLI class is a
         // session and resolves through the session-name path below).
         if let Some(handle) = self.orchestrator.as_ref().filter(|h| h.name == target) {
+            if self.orchestrator_paused {
+                self.chat_system("orchestrator is paused — /orchestrator resume to talk to it");
+                return;
+            }
             let send = handle
                 .tx
                 .try_send(crate::orchestrator::OrchestratorMsg::UserChat(msg.clone()));
@@ -4462,6 +4577,12 @@ impl App {
     /// Inject a chat message into a session's PTY and await its READY reply.
     fn send_chat_to_session(&mut self, id: usize, name: String, msg: &str) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+            if s.paused {
+                // A stopped process would only see this on resume; refuse
+                // instead of silently queueing it in the PTY.
+                self.chat_system(format!("\"{}\" is paused — resume it first", name));
+                return;
+            }
             s.write_bytes(shape_injected_input(msg));
         }
         // One outstanding reply per session; a new message supersedes it.
@@ -5082,6 +5203,9 @@ async fn run_pty(
         }
         command.spawn(&pts)?
     };
+    if let Some(pid) = _child.id() {
+        let _ = tx.send(AppEvent::SessionPid { session_id, pid }).await;
+    }
 
     let (read_half, mut write_half) = pty.into_split();
 

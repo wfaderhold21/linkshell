@@ -452,14 +452,18 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             .border_style(border_style);
 
         // State dot inside slot
-        let state_dot = match session.state {
-            SessionState::Waiting => Span::styled("⚡", Style::default().fg(Color::Yellow)),
-            SessionState::Error => Span::styled("✗", Style::default().fg(Color::Red)),
-            SessionState::Thinking => Span::styled("…", Style::default().fg(CLAUDE_COLOR)),
-            SessionState::Running => Span::styled("▶", Style::default().fg(Color::Green)),
-            SessionState::Ready => Span::styled("●", Style::default().fg(Color::Green)),
-            SessionState::Dead => Span::styled("✗", Style::default().fg(Color::DarkGray)),
-            SessionState::Starting => Span::styled("○", Style::default().fg(Color::Gray)),
+        let state_dot = if session.paused {
+            Span::styled("⏸", Style::default().fg(Color::DarkGray))
+        } else {
+            match session.state {
+                SessionState::Waiting => Span::styled("⚡", Style::default().fg(Color::Yellow)),
+                SessionState::Error => Span::styled("✗", Style::default().fg(Color::Red)),
+                SessionState::Thinking => Span::styled("…", Style::default().fg(CLAUDE_COLOR)),
+                SessionState::Running => Span::styled("▶", Style::default().fg(Color::Green)),
+                SessionState::Ready => Span::styled("●", Style::default().fg(Color::Green)),
+                SessionState::Dead => Span::styled("✗", Style::default().fg(Color::DarkGray)),
+                SessionState::Starting => Span::styled("○", Style::default().fg(Color::Gray)),
+            }
         };
 
         let para = Paragraph::new(Line::from(vec![state_dot]))
@@ -530,6 +534,8 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
             model: Some(app.config.orchestrator.model.clone()).filter(|m| !m.is_empty()),
             state: if !alive {
                 "DEAD".into()
+            } else if app.orchestrator_paused {
+                "PAUSED".into()
             } else if busy {
                 "BUSY".into()
             } else {
@@ -537,6 +543,10 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
             },
             state_style: if !alive {
                 red
+            } else if app.orchestrator_paused {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else if busy {
                 Style::default().fg(CLAUDE_COLOR)
             } else {
@@ -566,9 +576,13 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
         dot_style: if failed { red } else { green },
         name: s.name.clone(),
         model: s.model.clone(),
-        state: s.state.label().to_string(),
+        state: s.state_label().to_string(),
         state_style: if failed {
             red
+        } else if s.paused {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Green)
         },
@@ -656,16 +670,22 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             _ => ("●", Style::default().fg(Color::Green)),
         };
         let kind_style = Style::default().fg(kind_color(&session.kind));
-        let state_style = match session.state {
-            SessionState::Waiting => Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            SessionState::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            SessionState::Thinking => Style::default().fg(CLAUDE_COLOR),
-            SessionState::Running => Style::default().fg(Color::Green),
-            SessionState::Ready => Style::default().fg(Color::DarkGray),
-            SessionState::Dead => Style::default().fg(Color::DarkGray),
-            SessionState::Starting => Style::default().fg(Color::Gray),
+        let state_style = if session.paused {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            match session.state {
+                SessionState::Waiting => Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                SessionState::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                SessionState::Thinking => Style::default().fg(CLAUDE_COLOR),
+                SessionState::Running => Style::default().fg(Color::Green),
+                SessionState::Ready => Style::default().fg(Color::DarkGray),
+                SessionState::Dead => Style::default().fg(Color::DarkGray),
+                SessionState::Starting => Style::default().fg(Color::Gray),
+            }
         };
 
         let tokens = session.tokens_display();
@@ -714,7 +734,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
                 }
             }),
             Span::raw("│ "),
-            Span::styled(format!("{:<8} ", session.state.label()), state_style),
+            Span::styled(format!("{:<8} ", session.state_label()), state_style),
             Span::raw("│ "),
             Span::styled(
                 format!("{:>6}  ", elapsed),
