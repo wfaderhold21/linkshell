@@ -153,6 +153,7 @@ fn coalesce_batch(
 
 /// Spawn the orchestrator task. Only valid for API-class providers.
 pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> OrchestratorHandle {
+    cfg.ensure_agent_files();
     let (tx, mut rx) = mpsc::channel::<OrchestratorMsg>(64);
     let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
     let name = cfg.name.clone();
@@ -317,6 +318,17 @@ fn tool_specs() -> Vec<(&'static str, &'static str, serde_json::Value)> {
                     "name": {"type": "string"}
                 },
                 "required": ["name"]
+            }),
+        ),
+        (
+            "remember",
+            "Append one short durable note to your persistent memory file (shown in your instructions each turn). Use it for facts worth carrying across sessions: project layout, user preferences, recurring commands. One sentence per note; the user prunes the file by hand.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"}
+                },
+                "required": ["text"]
             }),
         ),
         (
@@ -492,6 +504,36 @@ async fn exec_tool(
             Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
         };
     }
+    // remember appends to the memory file directly — no main-loop trip.
+    if name == "remember" {
+        let Some(text) = args["text"].as_str().filter(|t| !t.trim().is_empty()) else {
+            return "{\"error\": \"missing required arguments\"}".to_string();
+        };
+        let Some(path) = cfg.memory_path() else {
+            return "{\"error\": \"no memory file available\"}".to_string();
+        };
+        cfg.ensure_agent_files();
+        let entry = format!("- ({}) {}\n", today_utc(), text.trim().replace('\n', " "));
+        use std::io::Write;
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(entry.as_bytes()));
+        return match result {
+            Ok(()) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let mut reply = serde_json::json!({"remembered": text.trim(), "file_bytes": size});
+                if size > 8 * 1024 {
+                    reply["warning"] = serde_json::json!(
+                        "memory file exceeds 8 KiB and will be truncated in your prompt — suggest the user prune it"
+                    );
+                }
+                reply.to_string()
+            }
+            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+        };
+    }
 
     let sid = |key: &str| args[key].as_u64().map(|v| v as usize);
     let req = match name {
@@ -620,11 +662,19 @@ and continue; otherwise report what you wanted to do and why.\n",
         p.push_str("\n\n");
         p.push_str(&cfg.system);
     }
+    // Memory goes last: it is the only part of the system prompt that
+    // mutates mid-conversation (remember writes), so keeping everything
+    // above it byte-stable lets prompt prefix caches (Anthropic caching,
+    // llama.cpp prefix cache) re-serve the static bulk after each write.
+    if let Some(memory) = memory_section(cfg) {
+        p.push_str(&memory);
+    }
     p
 }
 
 /// Briefing typed into a CLI-class orchestrator session once it is READY.
 pub fn cli_briefing(cfg: &OrchestratorConfig) -> String {
+    cfg.ensure_agent_files();
     let mut p = String::from(
         "You are the resident orchestrator agent for this linkshell instance, a terminal \
 multiplexer running AI coding sessions. Your job: keep track of every session, act on \
@@ -652,11 +702,75 @@ description, read the file and follow it:\n",
         );
         p.push_str(&list);
     }
+    if let Some(path) = cfg.memory_path() {
+        p.push_str(&format!(
+            "\nPersistent memory: {} — read it now; it carries durable notes from \
+previous sessions. When you learn something durable (project layout, user \
+preferences, recurring commands), append a short dated bullet there. Keep it \
+concise; the user prunes it by hand.\n",
+            path.display()
+        ));
+    }
     if !cfg.system.is_empty() {
         p.push_str("\n\n");
         p.push_str(&cfg.system);
     }
     p
+}
+
+/// Memory block for the API-class system prompt: the memory file verbatim,
+/// or None when it is missing/empty. Injected every turn — the size guard
+/// keeps a bloated file from eating the context and makes the bloat visible
+/// so the user knows to prune.
+fn memory_section(cfg: &OrchestratorConfig) -> Option<String> {
+    const MAX_BYTES: usize = 8 * 1024;
+    let path = cfg.memory_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let (body, truncated) = if content.len() > MAX_BYTES {
+        let mut end = MAX_BYTES;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&content[..end], true)
+    } else {
+        (content.as_str(), false)
+    };
+    let mut section = format!(
+        "\n\nMemory — durable notes from previous sessions, kept in {} (the user \
+curates this file; treat entries as possibly stale). Use the `remember` tool \
+to add short dated notes when you learn something durable:\n{}",
+        path.display(),
+        body
+    );
+    if truncated {
+        section.push_str(
+            "\n[memory truncated at 8 KiB — tell the user their memory.md needs pruning]\n",
+        );
+    }
+    Some(section)
+}
+
+/// UTC date as YYYY-MM-DD without a date dependency (civil-from-days,
+/// Howard Hinnant's algorithm).
+fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
 /// Skills list for a prompt, or None when no skills are configured/present.
@@ -718,6 +832,61 @@ mod tests {
         assert!(a[0]["input_schema"].is_object());
         assert_eq!(o[0]["type"], "function");
         assert!(o[0]["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn today_utc_is_a_plausible_iso_date() {
+        let d = today_utc();
+        assert_eq!(d.len(), 10, "{}", d);
+        assert_eq!(&d[4..5], "-");
+        assert_eq!(&d[7..8], "-");
+        let year: i32 = d[..4].parse().unwrap();
+        assert!((2024..2100).contains(&year), "{}", d);
+    }
+
+    #[tokio::test]
+    async fn remember_appends_dated_note_and_memory_section_injects_it() {
+        let dir = std::env::temp_dir().join(format!("ls-mem-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("memory.md");
+        let _ = std::fs::remove_file(&file);
+
+        let cfg = OrchestratorConfig {
+            memory_file: file.to_string_lossy().to_string(),
+            approval: "propose".to_string(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel::<AppEvent>(8);
+
+        // remember is auto-approved even in propose mode.
+        assert!(!cfg.approval_required("remember"));
+
+        let out = exec_tool(
+            &cfg,
+            &tx,
+            "remember",
+            &serde_json::json!({"text": "user prefers rebase\nover merge"}),
+        )
+        .await;
+        assert!(out.contains("remembered"), "{}", out);
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("user prefers rebase over merge"),
+            "newlines collapse to one line: {}",
+            content
+        );
+        assert!(content.contains(&format!("({})", today_utc())));
+
+        let section = memory_section(&cfg).expect("non-empty memory injects");
+        assert!(section.contains("user prefers rebase over merge"));
+        assert!(section.contains("remember"));
+
+        // Empty file: no section.
+        std::fs::write(&file, "   \n").unwrap();
+        assert!(memory_section(&cfg).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
