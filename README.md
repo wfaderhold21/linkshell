@@ -30,6 +30,9 @@ tmux doesn't know your Claude session is blocked waiting on you. It doesn't know
 ## Features
 
 - **Up to 8 sessions** — Claude, Codex, shell, or any custom command
+- **Detach & reattach** — tmux-style client/server split; quit the client and sessions keep running (`alt-d` to detach, `linkshell` or `linkshell -r` to reattach)
+- **Split panes** — view two sessions side by side (`alt-\` to split, `alt--` to rotate, `alt-o` to switch focus)
+- **Startup profiles** — save a layout of sessions and pipes with `profile save <name>`, relaunch it with `--profile <name>`
 - **Aliased identities** — env-prefixed commands (`CLAUDE_CONFIG_DIR=~/w claude`) and configured wrapper aliases get full Claude/Codex treatment, each with its own config home
 - **Local agents & LLMs** — opencode, oh-my-pi, pi, aider, and llama.cpp sessions get agent-style state inference; llama.cpp/Ollama/vLLM/LM Studio endpoints are chat-addressable via `[agents.*]`
 - **Agent chat pane** (`alt-t`) — talk to any session or local LLM by name, run commands with `/`, and orchestrate everything without leaving the pane
@@ -83,6 +86,14 @@ linkshell --profile ucc-dev                 # launch a named session profile
 ```
 
 Then create your first session with `alt-n`.
+
+Linkshell runs as a client/server pair, like tmux: the first `linkshell`
+starts a background server that owns the sessions, and the foreground TUI is
+a client attached to it. `alt-d` detaches — sessions keep running — and
+running `linkshell` (or `linkshell -r`) again reattaches to the live server.
+
+If something looks wrong (missing logs, stale socket, nested multiplexer,
+limited terminal colors), run `linkshell doctor` for a diagnostic report.
 
 ## Aliased Claude / Codex sessions
 
@@ -213,6 +224,7 @@ name = "agent"            # chat target: @agent ...
 # system = "extra instructions"
 # skills_dir = "~/.config/linkshell/skills"  # *.md skill files; defaults to
 #                                            # this path when the dir exists
+# memory_file = "~/.config/linkshell/memory.md"  # persistent notes (default)
 # hidden = true             # CLI class: keep the agent out of the session bar
 # permission_mode = "accept-edits"  # CLI class: start with safe auto-approval
 #                                   # flags (claude: --permission-mode acceptEdits,
@@ -248,6 +260,13 @@ skill name, and the description comes from a `description:` line in leading
 into the prompt; the full text is loaded on demand — API-class orchestrators
 call a `use_skill` tool, CLI-class orchestrators get the file paths in their
 briefing and read them directly.
+
+**Memory** persists across restarts. The orchestrator carries a small notes
+file — `~/.config/linkshell/memory.md` by default, or `memory_file` — that is
+injected into its prompt each turn and appended to via a `remember` tool
+(project layout, user preferences, recurring commands; one sentence per note).
+You curate the file by hand; it is scaffolded automatically on first start.
+See [docs/orchestrator-memory.md](docs/orchestrator-memory.md) for details.
 
 In chat, unaddressed messages default to the orchestrator when one is running.
 `:orchestrator start|stop|restart|reset|pause|resume|status|show|hide` manages it
@@ -296,12 +315,18 @@ returns you to the live tail.
 | `alt-t` | Toggle agent chat pane |
 | `alt-h` | Toggle help |
 | `alt-x` | Kill active session |
+| `alt-d` | Detach (sessions keep running) |
+| `alt-\` | Toggle split pane |
+| `alt--` | Rotate split layout |
+| `alt-o` | Focus next pane |
+| `alt-b` | Toggle broadcast input to all sessions |
+| `alt-g` | Dock the chat pane |
 | `alt-1` … `alt-8` | Switch to session by number |
 | `alt-←` / `alt-→` | Cycle sessions |
-| `ctrl-q` | Quit |
+| `ctrl-q` | Quit (shuts down the server and all sessions; use `alt-d` to leave them running) |
 | `esc` | Dismiss overlay |
-| `PageUp` / `PageDown` | Scroll output (20 lines) |
-| `Shift-↑` / `Shift-↓` | Scroll output (3 lines) |
+| `alt-shift-PageUp/PageDown` | Scroll output (page) |
+| `alt-shift-↑` / `alt-shift-↓` | Scroll output (line) |
 
 All other input is passed through to the active session's PTY.
 
@@ -323,6 +348,7 @@ council <file.toml>   Launch a multi-agent council
 council status        Show council round / completion state
 council stop          Detach the council router (sessions keep running)
 restart [n]           Respawn a session with the same command, name, and cwd
+profile save <name>   Save the current sessions and pipes as a startup profile
 grant <n> <tier>      Set a session's IPC capabilities (operator|worker|council)
 config path           Show the config file location
 config edit           Open the config in $EDITOR (as a session)
@@ -332,7 +358,8 @@ pipe <src> <dst> [--extract=last-block|last-n=N|diff] [--summarize=N] [--on=read
 pipe fire [src] [dst] Manually fire a pipe with trigger=manual
 unpipe <src> [dst]    Remove pipe(s) from src
 pipes                 Inspect, pause, fire, or delete configured pipes
-quit                  Exit linkshell
+detach                Detach the client; the server and sessions keep running
+quit                  Exit linkshell (shuts down the server and all sessions)
 ```
 
 ## New Session Dialog
