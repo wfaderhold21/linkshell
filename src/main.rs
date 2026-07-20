@@ -463,13 +463,24 @@ fn handle_event(app: &mut App, event: AppEvent) {
         }
         AppEvent::Tick => app.handle_tick(),
         AppEvent::SessionBytes { session_id, data } => {
-            app.handle_session_bytes(session_id, data);
+            // High-frequency path: full-screen TUIs stream bytes continuously.
+            // Only flag a redraw when a visible session's frame actually
+            // changed, and return early to skip the blanket needs_redraw below.
+            if app.handle_session_bytes(session_id, data) {
+                app.needs_redraw = true;
+            }
+            return;
         }
         AppEvent::SessionOutput { session_id, line } => {
             app.handle_session_output(session_id, line);
         }
         AppEvent::SessionCurrentLine { session_id, text } => {
-            app.handle_session_current_line(session_id, text);
+            // ~20ms-per-session heartbeat: only a state change warrants a
+            // redraw. Skip the blanket needs_redraw below.
+            if app.handle_session_current_line(session_id, text) {
+                app.needs_redraw = true;
+            }
+            return;
         }
         AppEvent::SessionWriter {
             session_id,

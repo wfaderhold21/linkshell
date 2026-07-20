@@ -633,6 +633,17 @@ impl App {
         self.sessions.iter().filter(|s| !s.hidden).count()
     }
 
+    /// Whether the given session's screen is currently rendered in a pane.
+    /// Screen-changing output for an off-screen session needs no redraw — its
+    /// vt100 buffer is updated regardless, and any state change routes through
+    /// its own event. `panes` holds indices into `sessions`, not session ids.
+    fn session_is_visible(&self, session_id: usize) -> bool {
+        let Some(idx) = self.sessions.iter().position(|s| s.id == session_id) else {
+            return false;
+        };
+        self.panes.contains(&Some(idx))
+    }
+
     pub fn apply_profile(&mut self, profile: &config::Profile) -> anyhow::Result<()> {
         let mut ids = HashMap::new();
         for profile_session in &profile.sessions {
@@ -1234,14 +1245,20 @@ impl App {
         self.handle_pane_resize([(rows, cols), self.pane_sizes[1]]);
     }
 
-    pub fn handle_session_bytes(&mut self, session_id: usize, data: Vec<u8>) {
+    /// Returns whether this output warrants a redraw: only when the byte chunk
+    /// actually changed a *visible* session's screen. Full-screen TUIs (opencode
+    /// especially) repaint continuously with byte-identical frames — gating on
+    /// real change keeps the 60 fps render loop off the CPU while idle.
+    pub fn handle_session_bytes(&mut self, session_id: usize, data: Vec<u8>) -> bool {
+        let mut changed = false;
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            session.process_bytes(&data);
+            changed = session.process_bytes(&data);
         }
         // While the user is scrolled up, hold their position (tmux-style)
         // instead of yanking to the tail on every output burst — full-screen
         // TUIs redraw constantly, which previously made scrollback unusable
         // for them. Typing returns to the live view (see clear_scroll).
+        changed && self.session_is_visible(session_id)
     }
 
     pub fn handle_session_output(&mut self, session_id: usize, line: String) {
@@ -1591,7 +1608,12 @@ impl App {
         self.pipe_tasks.insert(key, handle);
     }
 
-    pub fn handle_session_current_line(&mut self, session_id: usize, text: String) {
+    /// Returns whether the state changed. The partial-line text itself is not
+    /// displayed from here — the vt100 screen (fed via `SessionBytes`) already
+    /// carries it — so a redraw is only warranted when state inference flips
+    /// the session. This event fires every ~20ms per session as a heartbeat, so
+    /// gating on real change is what keeps idle sessions off the render loop.
+    pub fn handle_session_current_line(&mut self, session_id: usize, text: String) -> bool {
         let mut state_before = None;
         let mut state_after = None;
 
@@ -1625,8 +1647,10 @@ impl App {
         if let (Some(before), Some(after)) = (state_before, state_after) {
             if before != after {
                 self.on_state_transition(session_id, &before, &after);
+                return true;
             }
         }
+        false
     }
 
     pub fn handle_session_stats(&mut self, session_id: usize, stats: crate::session::TokenStats) {

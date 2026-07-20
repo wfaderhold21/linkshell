@@ -287,6 +287,11 @@ pub struct Session {
     pub stats_from_watcher: bool,
     /// Optional path to log session output lines to disk.
     pub log_path: Option<std::path::PathBuf>,
+    /// Hash of the last rendered screen contents, used by `process_bytes` to
+    /// tell whether a byte chunk actually changed the visible frame. Full-screen
+    /// TUIs (opencode especially) repaint continuously with byte-identical
+    /// frames; suppressing redraws for those keeps the render loop off the CPU.
+    last_screen_hash: u64,
 }
 
 impl Session {
@@ -346,12 +351,25 @@ impl Session {
             base,
             log_path: None,
             stats_from_watcher: false,
+            last_screen_hash: 0,
         }
     }
 
-    pub fn process_bytes(&mut self, data: &[u8]) {
+    /// Feed raw PTY bytes into the vt100 screen. Returns `true` if the visible
+    /// frame changed as a result — callers use this to skip redundant redraws
+    /// for full-screen TUIs that repaint with byte-identical output.
+    pub fn process_bytes(&mut self, data: &[u8]) -> bool {
+        use std::hash::{Hash, Hasher};
         self.bytes_since_last_tick += data.len();
         self.screen.process(data);
+        // contents_formatted is exactly what the display path renders from, so
+        // an unchanged hash means the next frame would be pixel-identical.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.screen.screen().contents_formatted().hash(&mut hasher);
+        let hash = hasher.finish();
+        let changed = hash != self.last_screen_hash;
+        self.last_screen_hash = hash;
+        changed
     }
 
     pub fn resize_screen(&mut self, rows: u16, cols: u16) {
@@ -715,6 +733,18 @@ mod tests {
 
         assert_eq!(s.bytes_since_last_tick, 5);
         assert_eq!(s.screen.screen().contents().trim(), "hello");
+    }
+
+    #[test]
+    fn process_bytes_reports_screen_change_only_on_visible_difference() {
+        let mut s = session(SessionKind::Shell);
+
+        // First paint changes the (blank) screen.
+        assert!(s.process_bytes(b"hello"));
+        // Re-emitting an identical frame (as full-screen TUIs do) is a no-op.
+        assert!(!s.process_bytes(b"\x1b[1;1Hhello"));
+        // Actual new content changes the frame again.
+        assert!(s.process_bytes(b" world"));
     }
 
     #[test]
