@@ -247,7 +247,11 @@ async fn tail(
                 total_cost_usd: acc_cost,
                 context_tokens,
             };
-            if tx.send(AppEvent::SessionStats { session_id, stats }).await.is_err() {
+            if tx
+                .send(AppEvent::SessionStats { session_id, stats })
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -489,7 +493,11 @@ mod tests {
         assert_eq!(stats3.output_tokens, 12_000);
 
         let naive_sum_input = stats1.input_tokens + _stats2.input_tokens + stats3.input_tokens;
-        assert!(naive_sum_input > stats3.input_tokens, "naive sum ({}) exceeds correct total", naive_sum_input);
+        assert!(
+            naive_sum_input > stats3.input_tokens,
+            "naive sum ({}) exceeds correct total",
+            naive_sum_input
+        );
     }
 
     #[test]

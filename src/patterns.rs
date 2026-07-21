@@ -324,10 +324,7 @@ mod tests {
 
         // Codex discussing an error file is just Running, not Error
         assert_eq!(
-            matcher.infer_state(
-                "fixed the error in ucp_tag_send.c",
-                BaseKind::Codex
-            ),
+            matcher.infer_state("fixed the error in ucp_tag_send.c", BaseKind::Codex),
             Some(SessionState::Running)
         );
 

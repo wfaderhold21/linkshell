@@ -369,24 +369,30 @@ impl Session {
 
         // Capture top-line snapshot BEFORE processing, if this session kind
         // supports alt-screen scrollback capture and we're on the alternate screen.
-        let prev_top = if self.kind.captures_alt_scrollback()
-            && self.screen.screen().alternate_screen()
-        {
-            self.screen.screen().contents().lines().next().map(|s| {
-                s.trim_end().trim_end_matches('\t').to_string()
-            })
-        } else {
-            None
-        };
+        let prev_top =
+            if self.kind.captures_alt_scrollback() && self.screen.screen().alternate_screen() {
+                self.screen
+                    .screen()
+                    .contents()
+                    .lines()
+                    .next()
+                    .map(|s| s.trim_end().trim_end_matches('\t').to_string())
+            } else {
+                None
+            };
 
         self.bytes_since_last_tick += data.len();
         self.screen.process(data);
 
         // After processing, check if content scrolled (top row changed)
         if let Some(ref prev) = prev_top {
-            let current_top: Option<String> = self.screen.screen().contents().lines().next().map(|s| {
-                s.trim_end().trim_end_matches('\t').to_string()
-            });
+            let current_top: Option<String> = self
+                .screen
+                .screen()
+                .contents()
+                .lines()
+                .next()
+                .map(|s| s.trim_end().trim_end_matches('\t').to_string());
 
             // If the top line changed, content scrolled upward. The old top row
             // was pushed off-screen — capture it for scrollback.
@@ -400,7 +406,7 @@ impl Session {
                 }
             } else {
                 // Screen is now empty (left alternate screen?), capture the old top
-                if !prev.is_empty() && !self.output_lines.back().is_some_and(|last| *last == *prev) {
+                if !prev.is_empty() && self.output_lines.back().is_none_or(|last| *last != *prev) {
                     self.push_output_line(prev.clone());
                 }
             }
@@ -1011,7 +1017,15 @@ mod tests {
 
     #[test]
     fn alt_screen_scrolled_lines_captured_in_output_lines() {
-        let mut s = Session::new(1, "codex".into(), SessionKind::Codex, "/tmp".into(), 5, 80, 100);
+        let mut s = Session::new(
+            1,
+            "codex".into(),
+            SessionKind::Codex,
+            "/tmp".into(),
+            5,
+            80,
+            100,
+        );
         s.process_bytes(b"\x1b[?1049h\x1b[HLine A\r\nLine B\r\nLine C\r\nLine D\r\nLine E");
         assert!(s.output_lines.is_empty());
 
@@ -1030,7 +1044,15 @@ mod tests {
 
     #[test]
     fn alt_screen_scrollback_deduplicates_identical_repaint() {
-        let mut s = Session::new(0, "codex".into(), SessionKind::Codex, "/tmp".into(), 3, 80, 100);
+        let mut s = Session::new(
+            0,
+            "codex".into(),
+            SessionKind::Codex,
+            "/tmp".into(),
+            3,
+            80,
+            100,
+        );
         s.process_bytes(b"\x1b[?1049h\x1b[HHeader\r\nBody 1\r\nFooter");
 
         // Repaint with same top line (TUI re-rendering) — should NOT add to output_lines
@@ -1040,7 +1062,15 @@ mod tests {
 
     #[test]
     fn shell_session_no_alt_scrollback() {
-        let mut s = Session::new(0, "shell".into(), SessionKind::Shell, "/tmp".into(), 3, 80, 100);
+        let mut s = Session::new(
+            0,
+            "shell".into(),
+            SessionKind::Shell,
+            "/tmp".into(),
+            3,
+            80,
+            100,
+        );
         s.process_bytes(b"hello world\n");
         assert!(s.output_lines.is_empty());
     }
