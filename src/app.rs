@@ -1408,8 +1408,10 @@ impl App {
         let name = s.name.clone();
         let kind = s.kind.label().to_string();
         let waiting_prompt = s.waiting_prompt.clone();
-        let tail = pipe::extract_from_session(&self.sessions, session_id, &ExtractMode::LastN(15))
-            .unwrap_or_default();
+        let tail_n = self.config.orchestrator.event_tail_lines.max(1);
+        let tail =
+            pipe::extract_from_session(&self.sessions, session_id, &ExtractMode::LastN(tail_n))
+                .unwrap_or_default();
 
         if let Some(h) = &self.orchestrator {
             // try_send: a wedged orchestrator must never block the main loop.
@@ -2061,6 +2063,20 @@ impl App {
                     }
                 })
                 .unwrap_or_default();
+            // Cap the reply so a chatty session can't dump its whole
+            // transcript into the orchestrator's context in one tool result.
+            let max = self.config.orchestrator.wait_ready_max_lines;
+            let lines = if max > 0 && lines.len() > max {
+                let total = lines.len();
+                let mut kept: Vec<String> = lines[total - max..].to_vec();
+                kept.insert(
+                    0,
+                    format!("[truncated: showing last {} of {} lines]", max, total),
+                );
+                kept
+            } else {
+                lines
+            };
             let _ = resp_tx.send(serde_json::json!({
                 "session_id": session_id,
                 "lines": lines,

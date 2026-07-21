@@ -21,7 +21,7 @@ pub async fn run_turn(
     let tools = super::openai_tools();
 
     history.push(serde_json::json!({"role": "user", "content": user_text}));
-    super::trim_history(history, cfg.max_history_turns);
+    super::compact_history(history, cfg);
 
     for i in 0..cfg.max_tool_iterations {
         if interrupt.hit() {

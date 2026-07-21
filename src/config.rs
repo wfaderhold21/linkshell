@@ -101,6 +101,21 @@ pub struct OrchestratorConfig {
     pub max_tokens: u32,
     pub max_tool_iterations: usize,
     pub input_wait_timeout_secs: u64,
+    /// Soft token budget for the conversation history, estimated at ~4
+    /// chars/token. When the estimate exceeds this, oldest turns are dropped
+    /// even if max_history_turns hasn't been reached. 0 disables.
+    pub max_context_tokens: usize,
+    /// How many recent user turns keep their tool results verbatim. Tool
+    /// results older than this are replaced with a short elision stub (the
+    /// model can re-run the tool if it still needs the data). 0 disables.
+    pub tool_result_keep_turns: usize,
+    /// Lines of session output inlined into a [linkshell event]
+    /// notification. The orchestrator can always read_output for more.
+    pub event_tail_lines: usize,
+    /// Cap on lines returned by send_input wait_ready / `input --wait`.
+    /// Longer replies are truncated to the last N lines with a marker.
+    /// 0 disables.
+    pub wait_ready_max_lines: usize,
 }
 
 impl Default for OrchestratorConfig {
@@ -139,6 +154,10 @@ impl Default for OrchestratorConfig {
             max_tokens: 4096,
             max_tool_iterations: 12,
             input_wait_timeout_secs: 180,
+            max_context_tokens: 60_000,
+            tool_result_keep_turns: 3,
+            event_tail_lines: 5,
+            wait_ready_max_lines: 80,
         }
     }
 }
