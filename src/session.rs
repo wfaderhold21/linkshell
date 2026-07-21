@@ -92,6 +92,12 @@ impl SessionKind {
                 .unwrap_or(false)
     }
 
+    /// True for TUI-based agent sessions whose transcript is useful as scrollback.
+    /// Full-repaint dashboards (htop, btop) would spew garbage if enabled here.
+    pub fn captures_alt_scrollback(&self) -> bool {
+        matches!(self, SessionKind::Claude | SessionKind::Codex)
+    }
+
     pub(crate) fn custom_base_name_pub(&self) -> Option<&str> {
         self.custom_base_name()
     }
@@ -360,8 +366,51 @@ impl Session {
     /// for full-screen TUIs that repaint with byte-identical output.
     pub fn process_bytes(&mut self, data: &[u8]) -> bool {
         use std::hash::{Hash, Hasher};
+
+        // Capture top-line snapshot BEFORE processing, if this session kind
+        // supports alt-screen scrollback capture and we're on the alternate screen.
+        let prev_top =
+            if self.kind.captures_alt_scrollback() && self.screen.screen().alternate_screen() {
+                self.screen
+                    .screen()
+                    .contents()
+                    .lines()
+                    .next()
+                    .map(|s| s.trim_end().trim_end_matches('\t').to_string())
+            } else {
+                None
+            };
+
         self.bytes_since_last_tick += data.len();
         self.screen.process(data);
+
+        // After processing, check if content scrolled (top row changed)
+        if let Some(ref prev) = prev_top {
+            let current_top: Option<String> = self
+                .screen
+                .screen()
+                .contents()
+                .lines()
+                .next()
+                .map(|s| s.trim_end().trim_end_matches('\t').to_string());
+
+            // If the top line changed, content scrolled upward. The old top row
+            // was pushed off-screen — capture it for scrollback.
+            if let Some(cur) = current_top {
+                if cur != *prev && !prev.is_empty() {
+                    // Dedupe: skip if identical to last appended line
+                    let dominated = self.output_lines.back().is_some_and(|last| *last == *prev);
+                    if !dominated {
+                        self.push_output_line(prev.clone());
+                    }
+                }
+            } else {
+                // Screen is now empty (left alternate screen?), capture the old top
+                if !prev.is_empty() && self.output_lines.back().is_none_or(|last| *last != *prev) {
+                    self.push_output_line(prev.clone());
+                }
+            }
+        }
         // contents_formatted is exactly what the display path renders from, so
         // an unchanged hash means the next frame would be pixel-identical.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -964,5 +1013,65 @@ mod tests {
                 kind.label()
             );
         }
+    }
+
+    #[test]
+    fn alt_screen_scrolled_lines_captured_in_output_lines() {
+        let mut s = Session::new(
+            1,
+            "codex".into(),
+            SessionKind::Codex,
+            "/tmp".into(),
+            5,
+            80,
+            100,
+        );
+        s.process_bytes(b"\x1b[?1049h\x1b[HLine A\r\nLine B\r\nLine C\r\nLine D\r\nLine E");
+        assert!(s.output_lines.is_empty());
+
+        // Scroll up by 1: Line A leaves the top, everything shifts up
+        s.process_bytes(b"\x1b[1S");
+
+        assert_eq!(s.output_lines.len(), 1);
+        assert_eq!(s.output_lines.front().unwrap(), "Line A");
+
+        // Scroll up by 1 more: Line B leaves the top
+        s.process_bytes(b"\x1b[1S");
+
+        assert_eq!(s.output_lines.len(), 2);
+        assert_eq!(s.output_lines.get(1).unwrap(), "Line B");
+    }
+
+    #[test]
+    fn alt_screen_scrollback_deduplicates_identical_repaint() {
+        let mut s = Session::new(
+            0,
+            "codex".into(),
+            SessionKind::Codex,
+            "/tmp".into(),
+            3,
+            80,
+            100,
+        );
+        s.process_bytes(b"\x1b[?1049h\x1b[HHeader\r\nBody 1\r\nFooter");
+
+        // Repaint with same top line (TUI re-rendering) — should NOT add to output_lines
+        s.process_bytes(b"\x1b[HHeader\r\nBody 1\r\nFooter");
+        assert!(s.output_lines.is_empty());
+    }
+
+    #[test]
+    fn shell_session_no_alt_scrollback() {
+        let mut s = Session::new(
+            0,
+            "shell".into(),
+            SessionKind::Shell,
+            "/tmp".into(),
+            3,
+            80,
+            100,
+        );
+        s.process_bytes(b"hello world\n");
+        assert!(s.output_lines.is_empty());
     }
 }

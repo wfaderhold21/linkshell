@@ -139,8 +139,9 @@ fn parse_token_count(v: &serde_json::Value, model: &str, config: &Config) -> Opt
         + (cached_input_tokens as f64 / 1_000_000.0) * rate.cache_read
         + (output_tokens as f64 / 1_000_000.0) * rate.output;
 
+    let fresh_input = input_tokens.saturating_sub(cached_input_tokens);
     Some(TokenStats {
-        input_tokens,
+        input_tokens: fresh_input,
         output_tokens,
         context_tokens,
         total_cost_usd,
@@ -155,6 +156,10 @@ async fn tail(
 ) {
     let mut offset: u64 = 0;
     let mut model = "unknown".to_string();
+    let mut acc_input: u64 = 0;
+    let mut acc_output: u64 = 0;
+    let mut acc_cost: f64 = 0.0;
+    let mut context_tokens: u64 = 0;
 
     // Scan the first 20 lines (session_meta / first turn_context) for the model.
     if let Ok(content) = tokio::fs::read_to_string(path).await {
@@ -180,6 +185,8 @@ async fn tail(
         if tx.is_closed() {
             break;
         }
+
+        let mut new_stats = false;
 
         if let Ok(file) = tokio::fs::File::open(path).await {
             let mut file = file;
@@ -220,18 +227,32 @@ async fn tail(
                                 }
                             }
                             if let Some(stats) = parse_token_count(&v, &model, config) {
-                                if tx
-                                    .send(AppEvent::SessionStats { session_id, stats })
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
+                                acc_input = stats.input_tokens;
+                                acc_output = stats.output_tokens;
+                                acc_cost = stats.total_cost_usd;
+                                context_tokens = stats.context_tokens;
+                                new_stats = true;
                             }
                         }
                         Err(_) => break,
                     }
                 }
+            }
+        }
+
+        if new_stats {
+            let stats = TokenStats {
+                input_tokens: acc_input,
+                output_tokens: acc_output,
+                total_cost_usd: acc_cost,
+                context_tokens,
+            };
+            if tx
+                .send(AppEvent::SessionStats { session_id, stats })
+                .await
+                .is_err()
+            {
+                return;
             }
         }
 
@@ -299,7 +320,7 @@ mod tests {
 
         let config = crate::config::Config::default();
         let stats = parse_token_count(&v, "unknown", &config).unwrap();
-        assert_eq!(stats.input_tokens, 99975);
+        assert_eq!(stats.input_tokens, 41223); // fresh input: 99975 - 58752 cached
         assert_eq!(stats.output_tokens, 1358);
         assert_eq!(stats.context_tokens, 31619);
         // "unknown" model rate is 0.0, so cost should be 0.
@@ -434,5 +455,63 @@ mod tests {
     fn sessions_dir_prefers_per_session_codex_home() {
         let dir = sessions_dir(Some("/opt/codex-personal")).unwrap();
         assert_eq!(dir, PathBuf::from("/opt/codex-personal/sessions"));
+    }
+
+    fn make_codex_token_event(input: u64, cached: u64, output: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input,
+                        "cached_input_tokens": cached,
+                        "output_tokens": output
+                    },
+                    "last_token_usage": {
+                        "input_tokens": input - cached
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn cumulative_token_counts_not_inflated_by_naive_sum() {
+        let entry1 = make_codex_token_event(10_000, 2_000, 3_000);
+        let entry2 = make_codex_token_event(30_000, 8_000, 8_000);
+        let entry3 = make_codex_token_event(50_000, 15_000, 12_000);
+
+        let config = Config::default();
+
+        let stats1 = parse_token_count(&entry1, "gpt-5", &config).unwrap();
+        let _stats2 = parse_token_count(&entry2, "gpt-5", &config).unwrap();
+        let stats3 = parse_token_count(&entry3, "gpt-5", &config).unwrap();
+
+        assert_eq!(stats1.input_tokens, 8_000); // 10k - 2k cached = 8k fresh
+        assert_eq!(stats3.input_tokens, 35_000); // 50k - 15k cached = 35k fresh
+        assert_eq!(stats3.output_tokens, 12_000);
+
+        let naive_sum_input = stats1.input_tokens + _stats2.input_tokens + stats3.input_tokens;
+        assert!(
+            naive_sum_input > stats3.input_tokens,
+            "naive sum ({}) exceeds correct total",
+            naive_sum_input
+        );
+    }
+
+    #[test]
+    fn cached_input_excluded_from_fresh_input_count() {
+        let v = make_codex_token_event(100_000, 60_000, 5_000);
+        let config = Config::default();
+        let stats = parse_token_count(&v, "gpt-5.4-mini", &config).unwrap();
+
+        assert_eq!(stats.input_tokens, 40_000); // only fresh (non-cached) input
+        assert_eq!(stats.output_tokens, 5_000);
+        assert!(stats.total_cost_usd > 0.0); // cost still includes cache pricing
+
+        let v2 = make_codex_token_event(10_000, 0, 500);
+        let stats2 = parse_token_count(&v2, "gpt-5.4-mini", &config).unwrap();
+        assert_eq!(stats2.input_tokens, 10_000);
     }
 }
