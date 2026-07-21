@@ -4,6 +4,32 @@ use crate::config::OrchestratorConfig;
 use crate::events::AppEvent;
 use tokio::sync::mpsc;
 
+/// Clone the history for one request, attaching an ephemeral cache_control
+/// breakpoint to the final content block of the last message. The stored
+/// history is left untouched (trim_history relies on plain-string user
+/// turns), and the last message at request time is always a user message
+/// (fresh user text or tool_results), both of which accept cache_control.
+fn messages_with_cache_breakpoint(history: &[serde_json::Value]) -> serde_json::Value {
+    let mut msgs: Vec<serde_json::Value> = history.to_vec();
+    if let Some(last) = msgs.last_mut() {
+        let ce = serde_json::json!({"type": "ephemeral"});
+        let content = last["content"].take();
+        last["content"] = match content {
+            serde_json::Value::String(text) => {
+                serde_json::json!([{"type": "text", "text": text, "cache_control": ce}])
+            }
+            serde_json::Value::Array(mut blocks) => {
+                if let Some(b) = blocks.last_mut() {
+                    b["cache_control"] = ce;
+                }
+                serde_json::Value::Array(blocks)
+            }
+            other => other,
+        };
+    }
+    serde_json::Value::Array(msgs)
+}
+
 /// Run one conversation turn: append the user text, loop through tool calls,
 /// return the final assistant text. History uses the Messages API shape and
 /// assistant content (including thinking blocks) is replayed verbatim.
@@ -22,11 +48,22 @@ pub async fn run_turn(
         )
     })?;
     let url = format!("{}/v1/messages", cfg.endpoint_url().trim_end_matches('/'));
-    let tools = super::anthropic_tools();
-    let system = super::system_prompt(cfg);
+    // Prompt caching: mark the static prefix (tools + system) once, and put
+    // a moving breakpoint on the last message of each request so the 12
+    // iterations of a busy turn re-serve the shared history prefix instead
+    // of re-billing it in full every call.
+    let mut tools = super::anthropic_tools();
+    if let Some(last) = tools.as_array_mut().and_then(|a| a.last_mut()) {
+        last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    }
+    let system = serde_json::json!([{
+        "type": "text",
+        "text": super::system_prompt(cfg),
+        "cache_control": {"type": "ephemeral"}
+    }]);
 
     history.push(serde_json::json!({"role": "user", "content": user_text}));
-    super::trim_history(history, cfg.max_history_turns);
+    super::compact_history(history, cfg);
 
     for i in 0..cfg.max_tool_iterations {
         if interrupt.hit() {
@@ -42,7 +79,7 @@ pub async fn run_turn(
             "max_tokens": cfg.max_tokens,
             "system": system,
             "tools": tools,
-            "messages": history,
+            "messages": messages_with_cache_breakpoint(history),
         });
         let resp: serde_json::Value = auth
             .apply(client.post(&url))
@@ -135,7 +172,7 @@ pub async fn run_turn(
         "system": system,
         "tools": tools,
         "tool_choice": {"type": "none"},
-        "messages": history,
+        "messages": messages_with_cache_breakpoint(history),
     });
     let resp: serde_json::Value = auth
         .apply(client.post(&url))

@@ -783,6 +783,98 @@ fn skills_section(cfg: &OrchestratorConfig, with_paths: bool) -> Option<String> 
     Some(skills::skill_list(&list, with_paths))
 }
 
+/// Stub text substituted for aged-out tool results.
+const ELIDED_RESULT: &str =
+    "[elided to save context — re-run the tool if this result is still needed]";
+
+/// Count plain user-text turns (the boundaries trim_history cuts at).
+fn user_turns(history: &[serde_json::Value]) -> usize {
+    history
+        .iter()
+        .filter(|m| m["role"] == "user" && m["content"].is_string())
+        .count()
+}
+
+/// Rough token estimate for the serialized history (~4 chars/token).
+fn estimate_tokens(history: &[serde_json::Value]) -> usize {
+    history
+        .iter()
+        .map(|m| m.to_string().chars().count())
+        .sum::<usize>()
+        / 4
+}
+
+/// Replace tool results older than the last `keep_turns` plain user turns
+/// with a short stub. Structure stays API-valid for both providers: the
+/// anthropic shape keeps its tool_result blocks (ids intact) with stubbed
+/// content, the openai shape keeps its role:"tool" messages likewise.
+fn age_tool_results(history: &mut [serde_json::Value], keep_turns: usize) {
+    if keep_turns == 0 {
+        return;
+    }
+    // Index of the keep_turns-th plain user turn from the end; everything
+    // before it is "old".
+    let mut seen = 0;
+    let mut boundary = 0;
+    for (i, m) in history.iter().enumerate().rev() {
+        if m["role"] == "user" && m["content"].is_string() {
+            seen += 1;
+            if seen == keep_turns {
+                boundary = i;
+                break;
+            }
+        }
+    }
+    if seen < keep_turns {
+        return; // whole history is within the keep window
+    }
+    for m in history[..boundary].iter_mut() {
+        // OpenAI shape: {"role": "tool", "content": "..."}
+        if m["role"] == "tool" {
+            if m["content"]
+                .as_str()
+                .is_some_and(|s| s.len() > ELIDED_RESULT.len())
+            {
+                m["content"] = serde_json::json!(ELIDED_RESULT);
+            }
+            continue;
+        }
+        // Anthropic shape: user message whose content is an array of
+        // tool_result blocks.
+        if m["role"] == "user" {
+            if let Some(blocks) = m["content"].as_array_mut() {
+                for b in blocks.iter_mut().filter(|b| b["type"] == "tool_result") {
+                    let long = match &b["content"] {
+                        serde_json::Value::String(s) => s.len() > ELIDED_RESULT.len(),
+                        v => v.to_string().len() > ELIDED_RESULT.len(),
+                    };
+                    if long {
+                        b["content"] = serde_json::json!(ELIDED_RESULT);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Full history compaction pass, run once per turn before hitting the API:
+/// age old tool results, apply the turn cap, then drop oldest turns until
+/// the token estimate fits the budget (always keeping the latest turn).
+pub(crate) fn compact_history(history: &mut Vec<serde_json::Value>, cfg: &OrchestratorConfig) {
+    age_tool_results(history, cfg.tool_result_keep_turns);
+    trim_history(history, cfg.max_history_turns);
+    if cfg.max_context_tokens == 0 {
+        return;
+    }
+    while estimate_tokens(history) > cfg.max_context_tokens {
+        let turns = user_turns(history);
+        if turns <= 1 {
+            break; // never drop the turn we're about to answer
+        }
+        trim_history(history, turns - 1);
+    }
+}
+
 /// Trim provider history in place, dropping oldest turns but only cutting at
 /// plain user-text boundaries so tool_use/tool_result pairs stay intact.
 fn trim_history(history: &mut Vec<serde_json::Value>, max_turns: usize) {
@@ -1007,6 +1099,79 @@ mod tests {
         assert_eq!(text.as_deref(), Some("a\n\n[linkshell] b"));
         assert!(any_user);
         assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn aging_stubs_only_old_tool_results() {
+        let big = "x".repeat(500);
+        let mut h = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "tool_use", "id": "a"}]}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": big.clone()}]}),
+            serde_json::json!({"role": "assistant", "content": "reply"}),
+            serde_json::json!({"role": "user", "content": "two"}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "tool_use", "id": "b"}]}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b", "content": big.clone()}]}),
+        ];
+        age_tool_results(&mut h, 1);
+        // Old result stubbed, id preserved
+        assert_eq!(h[2]["content"][0]["content"], ELIDED_RESULT);
+        assert_eq!(h[2]["content"][0]["tool_use_id"], "a");
+        // Result within the keep window untouched
+        assert_eq!(h[6]["content"][0]["content"], big);
+        // keep_turns larger than history: no-op
+        let before = h.clone();
+        age_tool_results(&mut h, 10);
+        assert_eq!(h, before);
+    }
+
+    #[test]
+    fn aging_stubs_openai_tool_messages() {
+        let big = "y".repeat(500);
+        let mut h = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "tool", "content": big}),
+            serde_json::json!({"role": "user", "content": "two"}),
+        ];
+        age_tool_results(&mut h, 1);
+        assert_eq!(h[1]["content"], ELIDED_RESULT);
+    }
+
+    #[test]
+    fn budget_trim_drops_oldest_turns_but_keeps_the_last() {
+        let big = "z".repeat(4000); // ~1000 tokens per turn
+        let mut h: Vec<serde_json::Value> = (0..10)
+            .flat_map(|i| {
+                vec![
+                    serde_json::json!({"role": "user", "content": format!("{} {}", i, big)}),
+                    serde_json::json!({"role": "assistant", "content": "ok"}),
+                ]
+            })
+            .collect();
+        let cfg = OrchestratorConfig {
+            max_history_turns: 40,
+            max_context_tokens: 3000,
+            tool_result_keep_turns: 0,
+            ..Default::default()
+        };
+        compact_history(&mut h, &cfg);
+        let turns = user_turns(&h);
+        assert!(turns < 10, "should have dropped turns, kept {}", turns);
+        assert!(turns >= 1, "must keep at least the latest turn");
+        // Latest turn survives
+        assert!(h
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|s| s.starts_with("9 "))));
+        // Budget disabled: only the turn cap applies
+        let mut h2 = vec![serde_json::json!({"role": "user", "content": "u".repeat(100000)})];
+        let cfg2 = OrchestratorConfig {
+            max_context_tokens: 0,
+            ..Default::default()
+        };
+        compact_history(&mut h2, &cfg2);
+        assert_eq!(h2.len(), 1);
     }
 
     #[test]
