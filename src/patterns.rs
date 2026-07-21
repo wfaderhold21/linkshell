@@ -57,7 +57,9 @@ impl PatternMatcher {
             )
             .unwrap(),
             generic_waiting: Regex::new(r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter").unwrap(),
-            generic_error: Regex::new(r"(?i)error:|failed:|panic!|fatal:|command not found")
+            generic_error: Regex::new(
+                r"(?i)^error[:\[]|^failed[:\[]|^panic!|^[Ff]atal:|command not found",
+            )
                 .unwrap(),
 
             nctx_re: Regex::new(r"\bn_ctx\s*=\s*(\d+)").unwrap(),
@@ -96,7 +98,9 @@ impl PatternMatcher {
         if self.generic_waiting.is_match(line) {
             return Some(SessionState::Waiting);
         }
-        if self.generic_error.is_match(line) {
+        // Generic error detection only for shell/custom sessions — agents
+        // report ERROR via process exit, JSONL records, or IPC.
+        if matches!(base, BaseKind::Other) && self.generic_error.is_match(line) {
             return Some(SessionState::Error);
         }
         match base {
@@ -294,16 +298,50 @@ mod tests {
     fn generic_waiting_and_error_take_precedence_for_all_session_kinds() {
         let matcher = PatternMatcher::new();
 
+        // Generic waiting applies to all kinds
         for base in [BaseKind::Claude, BaseKind::Codex, BaseKind::Other] {
             assert_eq!(
                 matcher.infer_state("Press Enter to continue", base),
                 Some(SessionState::Waiting)
             );
-            assert_eq!(
-                matcher.infer_state("fatal: command not found", base),
-                Some(SessionState::Error)
-            );
         }
+
+        // Generic error detection only applies to Other (shell/custom)
+        assert_eq!(
+            matcher.infer_state("fatal: command not found", BaseKind::Other),
+            Some(SessionState::Error)
+        );
+
+        // Agents do NOT trigger Error from screen-scraped "error" text
+        assert_ne!(
+            matcher.infer_state("fatal: command not found", BaseKind::Claude),
+            Some(SessionState::Error)
+        );
+        assert_ne!(
+            matcher.infer_state("fatal: command not found", BaseKind::Codex),
+            Some(SessionState::Error)
+        );
+
+        // Codex discussing an error file is just Running, not Error
+        assert_eq!(
+            matcher.infer_state(
+                "fixed the error in ucp_tag_send.c",
+                BaseKind::Codex
+            ),
+            Some(SessionState::Running)
+        );
+
+        // Shell session: anchored "Error:" at start of line -> Error
+        assert_eq!(
+            matcher.infer_state("Error: connection refused", BaseKind::Other),
+            Some(SessionState::Error)
+        );
+
+        // Shell session: bare "error" mid-line does NOT match
+        assert_ne!(
+            matcher.infer_state("no error here", BaseKind::Other),
+            Some(SessionState::Error)
+        );
     }
 
     #[test]
