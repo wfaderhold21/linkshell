@@ -300,6 +300,23 @@ pub struct Session {
     last_screen_hash: u64,
 }
 
+/// Compact human count for status columns: 999, 42.3k, 999.9k, 1.23M, 99.9M,
+/// 999M. Always ≤ 6 chars.
+pub fn fmt_count(n: u64) -> String {
+    let f = n as f64;
+    if n < 1_000 {
+        n.to_string()
+    } else if f < 999_950.0 {
+        format!("{:.1}k", f / 1_000.0)
+    } else if f < 9_995_000.0 {
+        format!("{:.2}M", f / 1_000_000.0)
+    } else if f < 99_950_000.0 {
+        format!("{:.1}M", f / 1_000_000.0)
+    } else {
+        format!("{:.0}M", f / 1_000_000.0)
+    }
+}
+
 impl Session {
     pub fn new(
         id: usize,
@@ -521,19 +538,10 @@ impl Session {
     }
 
     pub fn context_display(&self) -> String {
-        let ctx = self.stats.context_tokens;
-        let max = self.context_max;
-        fn short(n: u64) -> String {
-            if n >= 1000 {
-                format!("{:.1}k", n as f64 / 1000.0)
-            } else {
-                n.to_string()
-            }
-        }
-        match (ctx, max) {
+        match (self.stats.context_tokens, self.context_max) {
             (0, 0) => "—".to_string(),
-            (c, 0) => format!("{} ctx", short(c)),
-            (c, m) => format!("{}/{}", short(c), short(m)),
+            (c, 0) => fmt_count(c),
+            (c, m) => format!("{}/{}", fmt_count(c), fmt_count(m)),
         }
     }
 
@@ -541,10 +549,8 @@ impl Session {
         let total = self.stats.input_tokens + self.stats.output_tokens;
         if total == 0 {
             "—".to_string()
-        } else if total >= 1000 {
-            format!("{:.1}k tok", total as f64 / 1000.0)
         } else {
-            format!("{} tok", total)
+            fmt_count(total)
         }
     }
 
@@ -664,6 +670,36 @@ pub fn extract_waiting_prompt(lines: &VecDeque<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_count_tiers_and_width() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1.0k");
+        assert_eq!(fmt_count(42_340), "42.3k");
+        assert_eq!(fmt_count(999_900), "999.9k");
+        // The 1000k boundary rolls over to M instead of "1000.0k".
+        assert_eq!(fmt_count(999_950), "1.00M");
+        assert_eq!(fmt_count(1_234_000), "1.23M");
+        assert_eq!(fmt_count(12_340_000), "12.3M");
+        assert_eq!(fmt_count(123_400_000), "123M");
+        for n in [
+            0,
+            999,
+            1_000,
+            999_949,
+            999_950,
+            9_994_999,
+            99_949_999,
+            u32::MAX as u64,
+        ] {
+            assert!(
+                fmt_count(n).chars().count() <= 6,
+                "{} too wide",
+                fmt_count(n)
+            );
+        }
+    }
 
     #[test]
     fn waiting_prompt_prefers_recent_question_and_ignores_box_drawing() {
@@ -821,8 +857,8 @@ mod tests {
         shell.stats.output_tokens = 1;
         shell.stats.context_tokens = 1250;
         shell.stats.total_cost_usd = 0.1234;
-        assert_eq!(shell.tokens_display(), "1.0k tok");
-        assert_eq!(shell.context_display(), "1.2k ctx");
+        assert_eq!(shell.tokens_display(), "1.0k");
+        assert_eq!(shell.context_display(), "1.2k");
         assert_eq!(shell.cost_display(), "$0.123");
 
         shell.context_max = 32768;
