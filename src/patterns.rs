@@ -47,8 +47,14 @@ impl PatternMatcher {
             .unwrap(),
             claude_thinking: Regex::new(r"(Thinking|Processing|Analyzing)\.\.\.|⠋|⠙|⠹|⠸").unwrap(),
             claude_ready: Regex::new(r"^>\s*$|Human:\s*$").unwrap(),
+            // Modern Claude Code renders permission prompts and questions as
+            // numbered option menus ("Do you want to proceed?" with a
+            // ❯-selected "1. Yes" / "2. Yes, and don't ask again" / "3. No"
+            // list) — none of which the legacy y/n markers match. The ❯
+            // selector before a numbered item is required so ordinary
+            // numbered lists in Claude's prose don't read as dialogs.
             claude_waiting: Regex::new(
-                r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?|proceed\?",
+                r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?|proceed\?|^\s*❯\s*\d+\.\s|(?i)^\s*do you want\b|(?i)don't ask again",
             )
             .unwrap(),
             codex_ready: Regex::new(r"codex>\s*$|>\s*$").unwrap(),
@@ -105,11 +111,15 @@ impl PatternMatcher {
         }
         match base {
             BaseKind::Claude => {
-                if self.claude_thinking.is_match(line) {
-                    return Some(SessionState::Thinking);
-                }
+                // Waiting before thinking, like every other kind: a dialog
+                // line that also carries a spinner glyph must read as
+                // WAITING, and dialogs are the transition the orchestrator
+                // and the user most need to hear about.
                 if self.claude_waiting.is_match(line) {
                     return Some(SessionState::Waiting);
+                }
+                if self.claude_thinking.is_match(line) {
+                    return Some(SessionState::Thinking);
                 }
                 if self.claude_ready.is_match(line) {
                     return Some(SessionState::Ready);
@@ -356,6 +366,24 @@ mod tests {
         assert_eq!(
             matcher.infer_state("shall I proceed?", BaseKind::Claude),
             Some(SessionState::Waiting)
+        );
+        // Modern Claude Code dialogs: header + ❯-selected numbered options.
+        for line in [
+            "Do you want to make this edit to main.rs?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don't ask again this session",
+            "⠙ Do you want to proceed?", // spinner glyph must not win
+        ] {
+            assert_eq!(
+                matcher.infer_state(line, BaseKind::Claude),
+                Some(SessionState::Waiting),
+                "{line}"
+            );
+        }
+        // Ordinary numbered lists in prose stay non-waiting.
+        assert_eq!(
+            matcher.infer_state("1. First, refactor the parser", BaseKind::Claude),
+            Some(SessionState::Running)
         );
     }
 
