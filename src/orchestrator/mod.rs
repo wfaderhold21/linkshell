@@ -131,23 +131,36 @@ impl OrchestratorMsg {
 fn coalesce_batch(
     msgs: &[OrchestratorMsg],
     history: &mut Vec<serde_json::Value>,
-) -> (Option<String>, bool) {
+) -> (Option<String>, bool, bool) {
     let mut parts = Vec::new();
     let mut any_user = false;
+    let mut any_actionable = false;
     for m in msgs {
         if matches!(m, OrchestratorMsg::Reset) {
             history.clear();
             parts.clear();
             any_user = false;
+            any_actionable = false;
         } else {
             any_user |= m.is_user_chat();
+            // WAITING / ERROR / DEAD events (and system notes) must always
+            // produce a visible report; only pure informational batches
+            // (e.g. READY transitions) may be answered with a silent `ok`.
+            any_actionable |= match m {
+                OrchestratorMsg::SessionEvent { state, .. } => {
+                    let s = state.trim_end_matches('!');
+                    !matches!(s, "READY" | "STARTING" | "THINKING" | "RUNNING")
+                }
+                OrchestratorMsg::SystemNote(_) => true,
+                _ => false,
+            };
             parts.push(m.render());
         }
     }
     if parts.is_empty() {
-        (None, any_user)
+        (None, any_user, any_actionable)
     } else {
-        (Some(parts.join("\n\n")), any_user)
+        (Some(parts.join("\n\n")), any_user, any_actionable)
     }
 }
 
@@ -169,7 +182,7 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
             while let Ok(next) = rx.try_recv() {
                 msgs.push(next);
             }
-            let (user_text, any_user) = coalesce_batch(&msgs, &mut history);
+            let (user_text, any_user, any_actionable) = coalesce_batch(&msgs, &mut history);
             let Some(user_text) = user_text else {
                 // Pure reset, nothing to say to the model.
                 continue;
@@ -213,12 +226,21 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
                 Ok(text) => text,
                 Err(e) => format!("[{}: error: {}]", cfg.name, e),
             };
-            // Always answer a human; stay quiet only if an event turn produced
-            // nothing, or the bare `ok` the system prompt designates as the
-            // "nothing to report" acknowledgment for informational events.
+            // Always answer a human. The bare `ok` acknowledgment is only a
+            // valid no-op for purely informational batches; small models
+            // over-apply it, so for actionable events (WAITING/ERROR/DEAD)
+            // an `ok` or empty reply is replaced with the raw event text —
+            // the user must hear about a blocked session even when the
+            // model under-delivers.
+            let trimmed = text.trim();
             let noop_ack =
-                text.trim().eq_ignore_ascii_case("ok") || text.trim().eq_ignore_ascii_case("ok.");
-            if any_user || (!text.trim().is_empty() && !noop_ack) {
+                trimmed.eq_ignore_ascii_case("ok") || trimmed.eq_ignore_ascii_case("ok.");
+            let text = if any_actionable && (noop_ack || trimmed.is_empty()) {
+                user_text.clone()
+            } else {
+                text
+            };
+            if any_user || any_actionable || (!text.trim().is_empty() && !noop_ack) {
                 let _ = event_tx
                     .send(AppEvent::ChatReply {
                         from: cfg.name.clone(),
@@ -639,11 +661,12 @@ session's process (SIGSTOP) without losing its context — its state shows PAUSE
 which is the right lever when concurrent sessions contend for limited CPU or RAM.\n\
 \n\
 Messages starting with [linkshell event] are automatic notifications that a session \
-changed state. For WAITING, ERROR, and DEAD events: investigate briefly (read_output) \
-and tell the user in one or two sentences what happened, what it needs, and what you \
-suggest. For purely informational events that require no action from you or the user \
-(a session simply became READY/idle and nothing depends on it), do NOT call any tools \
-and reply with exactly `ok` — that reply is suppressed and never shown to the user. \
+changed state. For WAITING, ERROR, and DEAD events you MUST report: investigate \
+briefly (read_output) and tell the user in one or two sentences what happened, what \
+it needs, and what you suggest — never answer these with just `ok`. Only when ALL \
+events in the message are informational (READY/STARTING/THINKING/RUNNING) and nothing \
+depends on them: make no tool calls and reply with exactly `ok` — that reply is \
+suppressed and never shown to the user. \
 Messages starting \
 with [linkshell] are system notes.\n\
 \n\
@@ -1085,14 +1108,14 @@ mod tests {
             OrchestratorMsg::Reset,
             OrchestratorMsg::UserChat("two".into()),
         ];
-        let (text, any_user) = coalesce_batch(&msgs, &mut history);
+        let (text, any_user, _) = coalesce_batch(&msgs, &mut history);
         assert_eq!(text.as_deref(), Some("two"));
         assert!(any_user);
         assert!(history.is_empty());
 
         // Pure reset: history wiped, nothing to send.
         let mut history = vec![serde_json::json!({"role": "user", "content": "old"})];
-        let (text, _) = coalesce_batch(&[OrchestratorMsg::Reset], &mut history);
+        let (text, _, _) = coalesce_batch(&[OrchestratorMsg::Reset], &mut history);
         assert!(text.is_none());
         assert!(history.is_empty());
 
@@ -1102,10 +1125,35 @@ mod tests {
             OrchestratorMsg::UserChat("a".into()),
             OrchestratorMsg::SystemNote("b".into()),
         ];
-        let (text, any_user) = coalesce_batch(&msgs, &mut history);
+        let (text, any_user, _) = coalesce_batch(&msgs, &mut history);
         assert_eq!(text.as_deref(), Some("a\n\n[linkshell] b"));
         assert!(any_user);
         assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn waiting_events_are_actionable_ready_events_are_not() {
+        let ev = |state: &str| OrchestratorMsg::SessionEvent {
+            session_id: 1,
+            name: "claude".into(),
+            kind: "claude".into(),
+            state: state.into(),
+            waiting_prompt: None,
+            tail: String::new(),
+        };
+        let mut h = Vec::new();
+        let (_, _, actionable) = coalesce_batch(&[ev("READY")], &mut h);
+        assert!(!actionable, "READY alone must be suppressible");
+        let (_, _, actionable) = coalesce_batch(&[ev("READY"), ev("WAITING!")], &mut h);
+        assert!(
+            actionable,
+            "WAITING (with bar decoration) must always surface"
+        );
+        let (_, _, actionable) = coalesce_batch(&[ev("ERROR")], &mut h);
+        assert!(actionable);
+        let (_, _, actionable) =
+            coalesce_batch(&[OrchestratorMsg::SystemNote("note".into())], &mut h);
+        assert!(actionable, "system notes must always surface");
     }
 
     #[test]
