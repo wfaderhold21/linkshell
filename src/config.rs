@@ -134,12 +134,11 @@ impl Default for OrchestratorConfig {
             cwd: String::new(),
             hidden: true,
             permission_mode: "accept-edits".to_string(),
-            events: vec![
-                "ready".into(),
-                "waiting".into(),
-                "error".into(),
-                "dead".into(),
-            ],
+            // "ready" is deliberately absent: sessions going idle is the most
+            // frequent and least actionable transition, and each event costs
+            // a full orchestrator turn (expensive on local models). Add
+            // "ready" to [orchestrator].events to opt back in.
+            events: vec!["waiting".into(), "error".into(), "dead".into()],
             event_cooldown_secs: 30,
             approval: "auto".to_string(),
             auto_approve: vec![

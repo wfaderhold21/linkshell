@@ -371,21 +371,37 @@ async fn run_server() -> anyhow::Result<()> {
     let mut headless = true;
     let mut relay_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut relay_kitty = false;
+    let mut relay_write_failures: u32 = 0;
     loop {
         if !headless && app.needs_redraw && last_render.elapsed() >= frame_cap {
             let mut layout = ui::LayoutInfo::default();
             if let Err(error) = terminal.draw(|f| {
                 layout = ui::draw(f, &app);
             }) {
+                last_render = Instant::now();
                 if is_transient_terminal_error(&error) {
                     // A busy terminal or relay socket may briefly reject a
-                    // frame. Keep the redraw pending and retry after the frame
-                    // interval instead of terminating the whole application.
-                    last_render = Instant::now();
-                    continue;
+                    // frame; retry. But while attached, repeated timeouts
+                    // mean the relay client is wedged (not draining its
+                    // socket) — without escalation the server would render
+                    // one frame per write-timeout forever and reject new
+                    // reattach attempts as "already attached".
+                    relay_write_failures += 1;
+                    if headless || relay_write_failures < 3 {
+                        continue;
+                    }
+                } else if headless {
+                    // No relay client involved: a real backend failure.
+                    return Err(error.into());
                 }
-                return Err(error.into());
+                // The attached client is dead or stalled. Drop it and go
+                // headless instead of hanging or killing the server — the
+                // sessions keep running and the user can reattach.
+                let _ = tx.try_send(AppEvent::Detach);
+                relay_write_failures = 0;
+                continue;
             }
+            relay_write_failures = 0;
             app.output_areas = layout.output_areas.clone();
             app.session_bar_area = layout.session_bar_area;
             app.session_slot_areas = layout.session_slot_areas;
@@ -1386,14 +1402,20 @@ fn spawn_reattach_listener(
                 if stream.write_all(b"{\"ok\":true}\n").await.is_err() {
                     return;
                 }
-                let _ = tx
-                    .send(AppEvent::Reattach {
+                // Bounded: if the main loop is wedged and never drains the
+                // channel, dropping the stream here EOFs the client so it
+                // exits cleanly instead of hanging on a blank screen after
+                // the ok-ack.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tx.send(AppEvent::Reattach {
                         stream,
                         rows,
                         cols,
                         kitty,
-                    })
-                    .await;
+                    }),
+                )
+                .await;
             });
         }
     });
@@ -1416,6 +1438,10 @@ async fn do_reattach(
     let Ok(writer_clone) = std_stream.try_clone() else {
         return None;
     };
+    // A stalled client (not draining its socket) must not block the main
+    // loop inside terminal.draw() forever: bound each write, and let the
+    // resulting error surface as a detach in the draw error path.
+    let _ = writer_clone.set_write_timeout(Some(Duration::from_secs(5)));
     let _ = std_stream.set_nonblocking(true); // back to non-blocking for tokio
     let Ok(relay_reader) = tokio::net::UnixStream::from_std(std_stream) else {
         return None;

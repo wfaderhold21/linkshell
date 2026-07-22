@@ -545,24 +545,17 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
             },
             tokens: if total == 0 {
                 "—".into()
-            } else if total >= 1000 {
-                format!("{:.1}k tok", total as f64 / 1000.0)
             } else {
-                format!("{total} tok")
+                crate::session::fmt_count(total)
             },
-            ctx: {
-                fn short(n: u64) -> String {
-                    if n >= 1000 {
-                        format!("{:.1}k", n as f64 / 1000.0)
-                    } else {
-                        n.to_string()
-                    }
-                }
-                match (stats.context_tokens, app.orchestrator_ctx_max) {
-                    (0, None) => "—".into(),
-                    (c, None) => format!("{} ctx", short(c)),
-                    (c, Some(m)) => format!("{}/{}", short(c), short(m)),
-                }
+            ctx: match (stats.context_tokens, app.orchestrator_ctx_max) {
+                (0, None) => "—".into(),
+                (c, None) => crate::session::fmt_count(c),
+                (c, Some(m)) => format!(
+                    "{}/{}",
+                    crate::session::fmt_count(c),
+                    crate::session::fmt_count(m)
+                ),
             },
             cost: if stats.total_cost_usd > 0.0 {
                 format!("${:.3}", stats.total_cost_usd)
@@ -631,9 +624,9 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:>6}  ", "Time"), hdr_style),
             Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:>8}  ", "Tokens"), hdr_style),
+            Span::styled(format!("{:>6}  ", "Tokens"), hdr_style),
             Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:>8}  ", "Ctx"), hdr_style),
+            Span::styled(format!("{:>13}  ", "Ctx"), hdr_style),
             Span::styled("│ ", hdr_style),
             Span::styled(format!("{:>7}", "Cost"), hdr_style),
         ];
@@ -747,10 +740,10 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
                 Style::default().fg(Color::Gray),
             ),
             Span::raw("│ "),
-            Span::styled(format!("{:>8}  ", tokens), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:>6}  ", tokens), Style::default().fg(Color::Cyan)),
             Span::raw("│ "),
             Span::styled(
-                format!("{:>8}  ", context),
+                format!("{:>13}  ", context),
                 Style::default().fg(Color::Magenta),
             ),
             Span::raw("│ "),
@@ -818,12 +811,12 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
                 Span::styled(format!("{:>6}  ", ""), Style::default().fg(Color::Gray)),
                 Span::raw("│ "),
                 Span::styled(
-                    format!("{:>8}  ", o.tokens),
+                    format!("{:>6}  ", o.tokens),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw("│ "),
                 Span::styled(
-                    format!("{:>8}  ", o.ctx),
+                    format!("{:>13}  ", o.ctx),
                     Style::default().fg(Color::Magenta),
                 ),
                 Span::raw("│ "),

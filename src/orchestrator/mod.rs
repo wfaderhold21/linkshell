@@ -214,8 +214,11 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
                 Err(e) => format!("[{}: error: {}]", cfg.name, e),
             };
             // Always answer a human; stay quiet only if an event turn produced
-            // nothing (the model may have just filed tool calls / no comment).
-            if any_user || !text.trim().is_empty() {
+            // nothing, or the bare `ok` the system prompt designates as the
+            // "nothing to report" acknowledgment for informational events.
+            let noop_ack =
+                text.trim().eq_ignore_ascii_case("ok") || text.trim().eq_ignore_ascii_case("ok.");
+            if any_user || (!text.trim().is_empty() && !noop_ack) {
                 let _ = event_tx
                     .send(AppEvent::ChatReply {
                         from: cfg.name.clone(),
@@ -636,8 +639,12 @@ session's process (SIGSTOP) without losing its context — its state shows PAUSE
 which is the right lever when concurrent sessions contend for limited CPU or RAM.\n\
 \n\
 Messages starting with [linkshell event] are automatic notifications that a session \
-changed state; investigate briefly (read_output) and tell the user in one or two \
-sentences what happened, what it needs, and what you suggest. Messages starting \
+changed state. For WAITING, ERROR, and DEAD events: investigate briefly (read_output) \
+and tell the user in one or two sentences what happened, what it needs, and what you \
+suggest. For purely informational events that require no action from you or the user \
+(a session simply became READY/idle and nothing depends on it), do NOT call any tools \
+and reply with exactly `ok` — that reply is suppressed and never shown to the user. \
+Messages starting \
 with [linkshell] are system notes.\n\
 \n\
 Your replies render in a small chat pane: be concise, no markdown headers.",
