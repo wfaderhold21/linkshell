@@ -7122,8 +7122,12 @@ mod tests {
             otx,
             "agent".into(),
         ));
-
-        // READY is in the default event list (completion notifications)
+        // Opt into "ready" events for this test (not in the default list)
+        {
+            let mut cfg = (*app.config).clone();
+            cfg.orchestrator.events.push("ready".into());
+            app.config = std::sync::Arc::new(cfg);
+        }
         app.notify_orchestrator(watched, &SessionState::Ready);
         assert!(orx.try_recv().is_ok());
         // …but not twice within the cooldown
@@ -7155,9 +7159,13 @@ mod tests {
             otx,
             "agent".into(),
         ));
+        // Opt into "ready" events for this test (not in the default list)
+        {
+            let mut cfg = (*app.config).clone();
+            cfg.orchestrator.events.push("ready".into());
+            app.config = std::sync::Arc::new(cfg);
+        }
 
-        // Simulate an agent CLI that streamed output and then went quiet:
-        // Running with the last output more than 2s ago.
         {
             let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
             s.state = SessionState::Running;
