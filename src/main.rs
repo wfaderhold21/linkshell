@@ -10,6 +10,7 @@ mod doctor;
 mod events;
 mod ipc;
 mod keybindings;
+mod layout;
 mod notify;
 mod opencode_log;
 mod orchestrator;
@@ -48,57 +49,117 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(doctor::run());
     }
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "-r" || a == "--reattach") {
-        return reattach::run_relay_client().await;
-    }
     if args.iter().any(|a| a == "--server") {
         return run_server().await;
     }
 
-    // ── Default path: client/server split (tmux-style) ─────────────────────
-    // `linkshell` is a thin launcher: make sure a detached server exists,
-    // then run the relay client in the foreground. Detaching just exits the
-    // client — the shell comes back immediately and the server keeps running.
-    launch_and_attach().await
-}
-
-/// Ensure a linkshell server is running (spawning one detached if needed),
-/// then attach the relay client to it in the foreground.
-async fn launch_and_attach() -> anyhow::Result<()> {
-    let already_running = reattach::server_alive();
-    if !already_running {
-        spawn_server_detached()?;
-        // Wait for the server to write its reattach info file and bind the
-        // socket. The server does this early in startup, so 5s is generous.
-        // The socket path must come from the info file, not be recomputed
-        // here: the default path embeds the server's pid, and the info file
-        // is written before the socket is bound — waiting for both avoids
-        // racing the bind.
-        let mut ready = false;
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(sock) = reattach::recorded_reattach_socket() {
-                if std::path::Path::new(&sock).exists() {
-                    ready = true;
-                    break;
-                }
-            }
-        }
-        if !ready {
-            anyhow::bail!(
-                "linkshell server did not start within 5s\n  \
-                 (run `linkshell --server` in the foreground to see errors, \
-                 or check {})",
-                reattach::server_log_path_display()
-            );
-        }
-    } else {
-        eprintln!("[linkshell] attaching to existing session");
+    // `linkshell ls` / `list` — enumerate detached sessions and exit.
+    if matches!(args.get(1).map(String::as_str), Some("ls") | Some("list")) {
+        list_sessions_cli();
+        return Ok(());
     }
 
-    let result = reattach::run_relay_client().await;
+    // `linkshell -r [id]` / `--reattach [id]` / `attach [id]` — reattach to an
+    // existing session. With no id, attach the single running session (error
+    // if there are several). Never spawns a new server.
+    if let Some(pos) = args
+        .iter()
+        .position(|a| a == "-r" || a == "--reattach" || a == "attach")
+    {
+        let requested = args.get(pos + 1).filter(|a| !a.starts_with('-')).cloned();
+        return attach_existing(requested).await;
+    }
+
+    // ── Default path: always spawn a fresh detached server (screen-style) ──
+    // `linkshell` (optionally `linkshell new [name]`) starts a new server and
+    // attaches the relay client in the foreground. Detaching just exits the
+    // client — the shell comes back immediately and the server keeps running.
+    let name = if args.get(1).map(String::as_str) == Some("new") {
+        args.get(2).filter(|a| !a.starts_with('-')).cloned()
+    } else {
+        None
+    };
+    launch_and_attach(name).await
+}
+
+/// Print the live session registry, screen-style.
+fn list_sessions_cli() {
+    let sessions = reattach::list_sessions();
+    if sessions.is_empty() {
+        println!("No detached linkshell sessions.");
+        return;
+    }
+    println!("{:<8} {:<20} {:>8}  STATUS", "ID", "NAME", "PID");
+    for s in &sessions {
+        let name = if s.name.is_empty() { "-" } else { &s.name };
+        let status = if s.attached { "attached" } else { "detached" };
+        println!("{:<8} {:<20} {:>8}  {}", s.id, name, s.pid, status);
+    }
+    println!("\nReattach with: linkshell -r <id>");
+}
+
+/// Reattach to an existing detached session. `requested` selects one by id;
+/// when absent, the single running session is chosen (ambiguous if several).
+async fn attach_existing(requested: Option<String>) -> anyhow::Result<()> {
+    let sessions = reattach::list_sessions();
+    let id = match requested {
+        Some(id) => id,
+        None => match sessions.as_slice() {
+            [] => anyhow::bail!("no detached linkshell sessions (start one with `linkshell`)"),
+            [only] => only.id.clone(),
+            _ => {
+                let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+                anyhow::bail!(
+                    "multiple sessions running; pick one with `linkshell -r <id>`\n  sessions: {}",
+                    ids.join(", ")
+                );
+            }
+        },
+    };
+    let result = reattach::run_relay_client(&id).await;
     if result.is_ok() {
-        println!("[linkshell] detached — sessions keep running; run `linkshell` to reattach");
+        println!(
+            "[linkshell] detached — sessions keep running; run `linkshell -r {id}` to reattach"
+        );
+    }
+    result
+}
+
+/// Spawn a fresh detached server with a new session id, then attach the relay
+/// client to it in the foreground.
+async fn launch_and_attach(name: Option<String>) -> anyhow::Result<()> {
+    let id = reattach::new_session_id();
+    spawn_server_detached(&id, name.as_deref())?;
+
+    // Wait for the server to register its session entry and bind the reattach
+    // socket. The server does this early in startup, so 5s is generous. The
+    // socket path must come from the entry, not be recomputed here: the
+    // default path embeds the server's pid, and the entry is written before
+    // the socket is bound — waiting for both avoids racing the bind.
+    let mut ready = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(entry) = reattach::read_session_entry(&id) {
+            if std::path::Path::new(&entry.reattach).exists() {
+                ready = true;
+                break;
+            }
+        }
+    }
+    if !ready {
+        anyhow::bail!(
+            "linkshell server did not start within 5s\n  \
+             (run `linkshell --server` in the foreground to see errors, \
+             or check {})",
+            reattach::server_log_path_display()
+        );
+    }
+
+    let result = reattach::run_relay_client(&id).await;
+    if result.is_ok() {
+        println!(
+            "[linkshell] detached — sessions keep running; run `linkshell -r {id}` to reattach"
+        );
     }
     result
 }
@@ -106,8 +167,9 @@ async fn launch_and_attach() -> anyhow::Result<()> {
 /// Spawn `linkshell --server` as a daemon: new session (setsid) so it has no
 /// controlling terminal and survives SSH drops, stdio detached from our tty.
 /// stderr goes to a log file so server-side startup errors are diagnosable.
-/// All CLI flags (--profile, --council, --tcp, ...) are forwarded verbatim.
-fn spawn_server_detached() -> anyhow::Result<()> {
+/// CLI flags (--profile, --council, --tcp, ...) are forwarded; the session id
+/// and name travel via env.
+fn spawn_server_detached(id: &str, name: Option<&str>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -116,11 +178,19 @@ fn spawn_server_detached() -> anyhow::Result<()> {
         .map(Stdio::from)
         .unwrap_or_else(Stdio::null);
     let mut cmd = Command::new(exe);
+    // Forward only flags (--profile, --council, --tcp, …); positional
+    // launcher tokens like `new`/`<name>` are consumed here, not by the
+    // server. The session id and name travel via env instead.
+    let flag_args = std::env::args().skip(1).filter(|a| a.starts_with('-'));
     cmd.arg("--server")
-        .args(std::env::args().skip(1))
+        .args(flag_args)
+        .env("LINKSHELL_SESSION_ID", id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
+    if let Some(name) = name {
+        cmd.env("LINKSHELL_SESSION_NAME", name);
+    }
     unsafe {
         cmd.pre_exec(|| {
             // Detach from the launcher's session and controlling terminal,
@@ -233,18 +303,33 @@ async fn run_server() -> anyhow::Result<()> {
     // No local stdin input reader: all input arrives as JSON relay events
     // from the attached client via the reattach socket.
 
-    // Write the reattach info file so `linkshell -r` can find this session.
-    // The minted token authenticates relay clients; it lives only in the
-    // 0600 info file, so only the owning user can reattach.
+    // Register this session so `linkshell ls` / `linkshell -r <id>` can find
+    // it. The minted token authenticates relay clients; it lives only in the
+    // 0600 entry file, so only the owning user can reattach.
+    let session_id =
+        std::env::var("LINKSHELL_SESSION_ID").unwrap_or_else(|_| reattach::new_session_id());
+    let session_name = std::env::var("LINKSHELL_SESSION_NAME").unwrap_or_default();
     let ipc_socket_path = ipc::socket_path(&config);
     let reattach_token = auth::mint_token();
-    reattach::write_reattach_info(std::process::id(), &ipc_socket_path, &reattach_token);
+    let reattach_socket_path = reattach::reattach_socket_from_ipc(&ipc_socket_path);
+    reattach::write_session_entry(&reattach::SessionEntry {
+        id: session_id.clone(),
+        name: session_name,
+        pid: std::process::id(),
+        socket: ipc_socket_path.clone(),
+        reattach: reattach_socket_path.clone(),
+        token: reattach_token.clone(),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        attached: false,
+    });
 
     // Reattach socket — accepts a single relay client (plain `linkshell` or
     // `linkshell -r`). One client at a time by design: a second connection
     // attempt is rejected at the handshake while `attached` is set.
     let attached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reattach_socket_path = reattach::reattach_socket_from_ipc(&ipc_socket_path);
     spawn_reattach_listener(
         tx.clone(),
         reattach_socket_path.clone(),
@@ -321,15 +406,18 @@ async fn run_server() -> anyhow::Result<()> {
             app.needs_redraw = false;
             last_render = Instant::now();
 
-            let mut sizes = app.pane_sizes;
-            for (idx, area) in layout.output_areas.iter().take(2).enumerate() {
+            let mut sizes = app.pane_sizes.clone();
+            for (idx, area) in layout.output_areas.iter().enumerate() {
+                if idx >= sizes.len() {
+                    break;
+                }
                 sizes[idx] = (
                     area.height.saturating_sub(2).max(1),
                     area.width.saturating_sub(2).max(1),
                 );
             }
-            let old_sizes = app.pane_sizes;
-            app.handle_pane_resize(sizes);
+            let old_sizes = app.pane_sizes.clone();
+            app.handle_pane_resize(&sizes);
             if app.pane_sizes != old_sizes {
                 app.needs_redraw = true;
             }
@@ -368,6 +456,7 @@ async fn run_server() -> anyhow::Result<()> {
                             }
                             headless = true;
                             attached.store(false, std::sync::atomic::Ordering::SeqCst);
+                            reattach::set_session_attached(&session_id, false);
                         }
                     }
                     Some(AppEvent::Resize { cols, rows }) => {
@@ -392,6 +481,7 @@ async fn run_server() -> anyhow::Result<()> {
                         ).await;
                         relay_kitty = kitty;
                         attached.store(true, std::sync::atomic::Ordering::SeqCst);
+                        reattach::set_session_attached(&session_id, true);
                         *term_size.lock().unwrap() = (cols, rows);
                         headless = false;
                         app.needs_redraw = true;
@@ -399,7 +489,8 @@ async fn run_server() -> anyhow::Result<()> {
                         let chrome_rows = 3 + (app.sessions.len().max(1) as u16 + 4);
                         let pty_rows = rows.saturating_sub(chrome_rows).max(1);
                         let pty_cols = cols.saturating_sub(2).max(1);
-                        app.handle_pane_resize([(pty_rows, pty_cols); 2]);
+                        let sizes = vec![(pty_rows, pty_cols); app.pane_sizes.len()];
+                        app.handle_pane_resize(&sizes);
                     }
                     Some(other) => handle_event(&mut app, other),
                 }
@@ -421,7 +512,7 @@ async fn run_server() -> anyhow::Result<()> {
     if let Some(task) = relay_task.take() {
         task.abort();
     }
-    reattach::clear_reattach_info();
+    reattach::remove_session_entry(&session_id);
     let _ = std::fs::remove_file(&reattach_socket_path);
     ipc::cleanup(&config);
 
@@ -719,7 +810,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                             app.dock_chat(None);
                         }
                     }
-                    Action::ToggleSplit => app.toggle_split(),
+                    Action::SplitPaneRight => app.split_focused(layout::SplitDir::Row),
+                    Action::SplitPaneDown => app.split_focused(layout::SplitDir::Col),
+                    Action::ClosePane => app.close_focused_pane(),
                     Action::RotateSplit => app.rotate_split(),
                     Action::FocusNextPane => app.focus_next_pane(),
                     Action::BroadcastToggle => {
