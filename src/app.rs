@@ -488,6 +488,9 @@ pub struct App {
     pub pending_proposal: Option<PendingProposal>,
     /// Token usage of the orchestrator's own API calls
     pub orchestrator_stats: crate::session::TokenStats,
+    /// Loaded context window of the API-class orchestrator's local backend
+    /// (LM Studio / llama-server), when probeable.
+    pub orchestrator_ctx_max: Option<u64>,
     /// Live progress of the orchestrator's current turn, plus when it was
     /// set (drives the chat-pane spinner). None while idle.
     pub orchestrator_status: Option<(String, std::time::Instant)>,
@@ -585,6 +588,7 @@ impl App {
             pending_kill: None,
             pending_proposal: None,
             orchestrator_stats: crate::session::TokenStats::default(),
+            orchestrator_ctx_max: None,
             orchestrator_status: None,
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
@@ -1149,6 +1153,47 @@ impl App {
     pub fn focus_next_pane(&mut self) {
         if self.is_split() {
             self.focused_pane = (self.focused_pane + 1) % self.panes.len();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Move pane focus spatially: pick the pane whose rendered rect center
+    /// lies in the requested direction from the focused pane's center,
+    /// nearest first. Uses `output_areas` (recorded each draw), so geometry
+    /// matches exactly what's on screen, including recursive splits.
+    /// (dx, dy) is the unit direction: left = (-1, 0), down = (0, 1), ...
+    pub fn focus_pane_dir(&mut self, dx: i32, dy: i32) {
+        if !self.is_split() || self.output_areas.len() < self.panes.len() {
+            return;
+        }
+        let center = |r: &Rect| {
+            (
+                r.x as i32 + r.width as i32 / 2,
+                r.y as i32 + r.height as i32 / 2,
+            )
+        };
+        let (cx, cy) = center(&self.output_areas[self.focused_pane]);
+        let mut best: Option<(i64, usize)> = None;
+        for (i, r) in self.output_areas.iter().enumerate().take(self.panes.len()) {
+            if i == self.focused_pane {
+                continue;
+            }
+            let (px, py) = center(r);
+            let (ddx, ddy) = (px - cx, py - cy);
+            // Must lie strictly in the requested direction.
+            if (dx != 0 && ddx * dx <= 0) || (dy != 0 && ddy * dy <= 0) {
+                continue;
+            }
+            // Rank by distance, weighing off-axis drift heavier so the
+            // straight-across neighbor beats a nearer diagonal one.
+            let (along, across) = if dx != 0 { (ddx, ddy) } else { (ddy, ddx) };
+            let score = (along as i64).pow(2) + 4 * (across as i64).pow(2);
+            if best.is_none_or(|(s, _)| score < s) {
+                best = Some((score, i));
+            }
+        }
+        if let Some((_, i)) = best {
+            self.focused_pane = i;
             self.needs_redraw = true;
         }
     }
@@ -2227,6 +2272,12 @@ impl App {
                         cfg.name
                     ));
                 }
+                // Local backends (LM Studio / llama-server) can report the
+                // loaded model's context window; probe so the status row can
+                // show occupancy against the real limit.
+                if let Some(backend) = crate::ctx_probe::backend_for_provider(&cfg.provider) {
+                    crate::ctx_probe::spawn_orchestrator_probe(backend, self.event_tx.clone());
+                }
                 self.orchestrator = Some(crate::orchestrator::spawn(cfg, self.event_tx.clone()));
             }
             crate::config::OrchestratorClass::Cli(kind_str) => {
@@ -2520,6 +2571,8 @@ impl App {
     pub fn handle_orchestrator_usage(&mut self, input: u64, output: u64) {
         self.orchestrator_stats.input_tokens += input;
         self.orchestrator_stats.output_tokens += output;
+        // Input tokens of the most recent call == current context occupancy.
+        self.orchestrator_stats.context_tokens = input;
     }
 
     /// A line posted into the chat pane via IPC `chat_post`. If it came from
@@ -6294,6 +6347,25 @@ mod tests {
             vec![Some(0), Some(2)],
             "a session cannot be displayed in both panes"
         );
+    }
+
+    #[test]
+    fn focus_pane_dir_moves_by_geometry() {
+        let mut app = make_app();
+        app.spawn_headless_session("one".into(), None).unwrap();
+        app.spawn_headless_session("two".into(), None).unwrap();
+        app.split_focused(SplitDir::Row);
+        // Simulate what draw records: pane 0 left, pane 1 right.
+        app.output_areas = vec![Rect::new(0, 0, 40, 20), Rect::new(40, 0, 40, 20)];
+        assert_eq!(app.focused_pane, 1);
+        app.focus_pane_dir(-1, 0); // left
+        assert_eq!(app.focused_pane, 0);
+        app.focus_pane_dir(-1, 0); // nothing further left: no-op
+        assert_eq!(app.focused_pane, 0);
+        app.focus_pane_dir(0, 1); // no pane below: no-op
+        assert_eq!(app.focused_pane, 0);
+        app.focus_pane_dir(1, 0); // right
+        assert_eq!(app.focused_pane, 1);
     }
 
     #[test]

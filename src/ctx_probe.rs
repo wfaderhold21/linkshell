@@ -49,6 +49,22 @@ pub fn backend_for_command(base_name: &str) -> Option<Backend> {
 }
 
 pub fn spawn_probe(session_id: usize, backend: Backend, tx: mpsc::Sender<AppEvent>) {
+    spawn_probe_with(backend, tx, move |max| AppEvent::SessionContextMax {
+        session_id,
+        max,
+    });
+}
+
+/// Same probe, but for the API-class orchestrator (which is not a session).
+pub fn spawn_orchestrator_probe(backend: Backend, tx: mpsc::Sender<AppEvent>) {
+    spawn_probe_with(backend, tx, |max| AppEvent::OrchestratorContextMax { max });
+}
+
+fn spawn_probe_with(
+    backend: Backend,
+    tx: mpsc::Sender<AppEvent>,
+    make_event: impl Fn(u64) -> AppEvent + Send + 'static,
+) {
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
@@ -65,11 +81,7 @@ pub fn spawn_probe(session_id: usize, backend: Backend, tx: mpsc::Sender<AppEven
             };
             if let Some(max) = max {
                 if max > 0 && max != last_sent {
-                    if tx
-                        .send(AppEvent::SessionContextMax { session_id, max })
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(make_event(max)).await.is_err() {
                         return; // main loop gone
                     }
                     last_sent = max;
