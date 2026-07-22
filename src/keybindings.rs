@@ -24,6 +24,10 @@ pub enum Action {
     ClosePane,
     RotateSplit,
     FocusNextPane,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
     BroadcastToggle,
     Detach,
 }
@@ -78,6 +82,10 @@ fn default_keymap() -> Keymap {
     let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
     m.insert((alt_shift, KeyCode::PageUp), Action::ScrollUpPage);
     m.insert((alt_shift, KeyCode::PageDown), Action::ScrollDownPage);
+    m.insert((alt_shift, KeyCode::Left), Action::FocusPaneLeft);
+    m.insert((alt_shift, KeyCode::Right), Action::FocusPaneRight);
+    m.insert((alt_shift, KeyCode::Up), Action::FocusPaneUp);
+    m.insert((alt_shift, KeyCode::Down), Action::FocusPaneDown);
     m.insert((alt_shift, KeyCode::Up), Action::ScrollUpLine);
     m.insert((alt_shift, KeyCode::Down), Action::ScrollDownLine);
 
@@ -164,6 +172,10 @@ fn parse_action(s: &str) -> Option<Action> {
         "close_pane" => Some(Action::ClosePane),
         "rotate_split" => Some(Action::RotateSplit),
         "focus_next_pane" => Some(Action::FocusNextPane),
+        "focus_pane_left" => Some(Action::FocusPaneLeft),
+        "focus_pane_right" => Some(Action::FocusPaneRight),
+        "focus_pane_up" => Some(Action::FocusPaneUp),
+        "focus_pane_down" => Some(Action::FocusPaneDown),
         "broadcast_toggle" => Some(Action::BroadcastToggle),
         "detach" => Some(Action::Detach),
         _ => None,

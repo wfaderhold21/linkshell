@@ -500,6 +500,7 @@ struct OrchRow {
     state: String,
     state_style: Style,
     tokens: String,
+    ctx: String,
     cost: String,
 }
 
@@ -549,6 +550,20 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
             } else {
                 format!("{total} tok")
             },
+            ctx: {
+                fn short(n: u64) -> String {
+                    if n >= 1000 {
+                        format!("{:.1}k", n as f64 / 1000.0)
+                    } else {
+                        n.to_string()
+                    }
+                }
+                match (stats.context_tokens, app.orchestrator_ctx_max) {
+                    (0, None) => "—".into(),
+                    (c, None) => format!("{} ctx", short(c)),
+                    (c, Some(m)) => format!("{}/{}", short(c), short(m)),
+                }
+            },
             cost: if stats.total_cost_usd > 0.0 {
                 format!("${:.3}", stats.total_cost_usd)
             } else {
@@ -577,6 +592,7 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
             Style::default().fg(Color::Green)
         },
         tokens: s.tokens_display(),
+        ctx: s.context_display(),
         cost: s.cost_display(),
     })
 }
@@ -806,7 +822,10 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw("│ "),
-                Span::styled(format!("{:>8}  ", "—"), Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    format!("{:>8}  ", o.ctx),
+                    Style::default().fg(Color::Magenta),
+                ),
                 Span::raw("│ "),
                 Span::styled(format!("{:>7}", o.cost), Style::default().fg(Color::Green)),
             ];
@@ -1161,7 +1180,8 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
         ("alt-tab", "Next session"),
         ("alt-shift-tab", "Previous session"),
         ("alt-1 … alt-8", "Switch to session by number"),
-        ("alt-← / alt-→", "Cycle sessions"),
+        ("alt-← / alt-→", "Cycle sessions in focused pane"),
+        ("alt-shift-arrows", "Focus pane in direction"),
         ("alt-x", "Kill active session"),
         ("alt-c", "Open command bar"),
         ("alt-t", "Toggle agent chat pane"),

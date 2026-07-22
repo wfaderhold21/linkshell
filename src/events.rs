@@ -65,6 +65,10 @@ pub enum AppEvent {
         session_id: usize,
         max: u64,
     },
+    /// Loaded context window of the API-class orchestrator's local backend.
+    OrchestratorContextMax {
+        max: u64,
+    },
     /// Model ID parsed from the session's JSONL log (Claude or Codex)
     SessionModel {
         session_id: usize,

@@ -630,6 +630,9 @@ fn handle_event(app: &mut App, event: AppEvent) {
                 s.context_max = max;
             }
         }
+        AppEvent::OrchestratorContextMax { max } => {
+            app.orchestrator_ctx_max = Some(max);
+        }
         AppEvent::SessionModel { session_id, model } => {
             if let Some(s) = app.sessions.iter_mut().find(|s| s.id == session_id) {
                 s.model = Some(model);
@@ -815,6 +818,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ClosePane => app.close_focused_pane(),
                     Action::RotateSplit => app.rotate_split(),
                     Action::FocusNextPane => app.focus_next_pane(),
+                    Action::FocusPaneLeft => app.focus_pane_dir(-1, 0),
+                    Action::FocusPaneRight => app.focus_pane_dir(1, 0),
+                    Action::FocusPaneUp => app.focus_pane_dir(0, -1),
+                    Action::FocusPaneDown => app.focus_pane_dir(0, 1),
                     Action::BroadcastToggle => {
                         app.broadcast_mode = !app.broadcast_mode;
                         app.command_result = if app.broadcast_mode {
