@@ -30,8 +30,8 @@ tmux doesn't know your Claude session is blocked waiting on you. It doesn't know
 ## Features
 
 - **Up to 8 sessions** — Claude, Codex, shell, or any custom command
-- **Detach & reattach** — tmux-style client/server split; quit the client and sessions keep running (`alt-d` to detach, `linkshell` or `linkshell -r` to reattach)
-- **Split panes** — view two sessions side by side (`alt-\` to split, `alt--` to rotate, `alt-o` to switch focus)
+- **Detach, reattach & multiple sessions** — tmux/screen-style client/server split; quit the client and sessions keep running. Run many independent linkshells (`linkshell ls` to list, `linkshell -r <id>` to reattach)
+- **Recursive split panes** — split any pane side by side (`alt-\`) or top/bottom (`alt--`), repeatedly and in any direction, for arbitrary tiled layouts; `alt-w` closes a pane, `alt-r` rotates a split, `alt-o` switches focus
 - **Startup profiles** — save a layout of sessions and pipes with `profile save <name>`, relaunch it with `--profile <name>`
 - **Aliased identities** — env-prefixed commands (`CLAUDE_CONFIG_DIR=~/w claude`) and configured wrapper aliases get full Claude/Codex treatment, each with its own config home
 - **Local agents & LLMs** — opencode, oh-my-pi, pi, aider, and llama.cpp sessions get agent-style state inference; llama.cpp/Ollama/vLLM/LM Studio endpoints are chat-addressable via `[agents.*]`
@@ -78,7 +78,9 @@ Requires Rust 1.80+.
 ## Usage
 
 ```bash
-linkshell               # Unix socket at $XDG_RUNTIME_DIR/linkshell/<pid>.sock
+linkshell               # start a new session (Unix socket at $XDG_RUNTIME_DIR/linkshell/<pid>.sock)
+linkshell ls            # list detached sessions
+linkshell -r <id>       # reattach to a detached session
 linkshell --tcp         # also open TCP agent listener on port 7373
 linkshell --tcp 9000    # custom TCP port
 linkshell --council examples/council.toml   # launch a multi-agent council
@@ -87,10 +89,22 @@ linkshell --profile ucc-dev                 # launch a named session profile
 
 Then create your first session with `alt-n`.
 
-Linkshell runs as a client/server pair, like tmux: the first `linkshell`
-starts a background server that owns the sessions, and the foreground TUI is
-a client attached to it. `alt-d` detaches — sessions keep running — and
-running `linkshell` (or `linkshell -r`) again reattaches to the live server.
+Linkshell runs as a client/server pair, like tmux/screen: each `linkshell`
+starts a background server that owns its sessions, and the foreground TUI is
+a client attached to it. `alt-d` detaches — sessions keep running.
+
+You can run **multiple independent linkshells** on one machine, screen-style:
+
+```bash
+linkshell                 # start a new detached server and attach
+linkshell new work        # start a new one named "work"
+linkshell ls              # list detached sessions (id, name, pid, status)
+linkshell -r <id>         # reattach to a specific session by id
+linkshell -r              # reattach when exactly one session is running
+```
+
+Each server has its own id, pid, and sockets; `linkshell ls` prunes any whose
+process has died.
 
 If something looks wrong (missing logs, stale socket, nested multiplexer,
 limited terminal colors), run `linkshell doctor` for a diagnostic report.
@@ -316,8 +330,10 @@ returns you to the live tail.
 | `alt-h` | Toggle help |
 | `alt-x` | Kill active session |
 | `alt-d` | Detach (sessions keep running) |
-| `alt-\` | Toggle split pane |
-| `alt--` | Rotate split layout |
+| `alt-\` | Split focused pane side by side |
+| `alt--` | Split focused pane top/bottom |
+| `alt-w` | Close focused pane (sibling reclaims the space) |
+| `alt-r` | Rotate the focused pane's split direction |
 | `alt-o` | Focus next pane |
 | `alt-b` | Toggle broadcast input to all sessions |
 | `alt-g` | Dock the chat pane |

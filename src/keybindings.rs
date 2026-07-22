@@ -19,7 +19,9 @@ pub enum Action {
     OpenMenu,
     ToggleChat,
     DockChat,
-    ToggleSplit,
+    SplitPaneRight,
+    SplitPaneDown,
+    ClosePane,
     RotateSplit,
     FocusNextPane,
     BroadcastToggle,
@@ -62,8 +64,10 @@ fn default_keymap() -> Keymap {
     m.insert((ctrl, KeyCode::Char(' ')), Action::OpenMenu);
     m.insert((alt, KeyCode::Char('t')), Action::ToggleChat);
     m.insert((alt, KeyCode::Char('g')), Action::DockChat);
-    m.insert((alt, KeyCode::Char('\\')), Action::ToggleSplit);
-    m.insert((alt, KeyCode::Char('-')), Action::RotateSplit);
+    m.insert((alt, KeyCode::Char('\\')), Action::SplitPaneRight);
+    m.insert((alt, KeyCode::Char('-')), Action::SplitPaneDown);
+    m.insert((alt, KeyCode::Char('w')), Action::ClosePane);
+    m.insert((alt, KeyCode::Char('r')), Action::RotateSplit);
     m.insert((alt, KeyCode::Char('o')), Action::FocusNextPane);
     m.insert((alt, KeyCode::Char('b')), Action::BroadcastToggle);
     m.insert((alt, KeyCode::Char('d')), Action::Detach);
@@ -155,7 +159,9 @@ fn parse_action(s: &str) -> Option<Action> {
         "toggle_chat" | "chat" => Some(Action::ToggleChat),
         "dock_chat" | "chat_dock" => Some(Action::DockChat),
         "open_menu" => Some(Action::OpenMenu),
-        "toggle_split" => Some(Action::ToggleSplit),
+        "split_pane_right" | "split_right" => Some(Action::SplitPaneRight),
+        "split_pane_down" | "split_down" => Some(Action::SplitPaneDown),
+        "close_pane" => Some(Action::ClosePane),
         "rotate_split" => Some(Action::RotateSplit),
         "focus_next_pane" => Some(Action::FocusNextPane),
         "broadcast_toggle" => Some(Action::BroadcastToggle),
@@ -186,7 +192,7 @@ mod tests {
         );
         assert_eq!(
             map.get(&(KeyModifiers::ALT, KeyCode::Char('\\'))),
-            Some(&Action::ToggleSplit)
+            Some(&Action::SplitPaneRight)
         );
         assert_eq!(
             map.get(&(KeyModifiers::ALT, KeyCode::Char('o'))),
@@ -249,7 +255,11 @@ mod tests {
     fn parse_action_accepts_only_valid_switch_ranges() {
         assert_eq!(parse_action("switch_1"), Some(Action::SwitchSession(0)));
         assert_eq!(parse_action("switch_8"), Some(Action::SwitchSession(7)));
-        assert_eq!(parse_action("toggle_split"), Some(Action::ToggleSplit));
+        assert_eq!(
+            parse_action("split_pane_right"),
+            Some(Action::SplitPaneRight)
+        );
+        assert_eq!(parse_action("close_pane"), Some(Action::ClosePane));
         assert_eq!(parse_action("rotate_split"), Some(Action::RotateSplit));
         assert_eq!(parse_action("focus_next_pane"), Some(Action::FocusNextPane));
         assert_eq!(parse_action("switch_0"), None);

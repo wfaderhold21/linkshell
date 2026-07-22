@@ -6,7 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, FileBrowserState, LayoutMode, NewSessionField, Selection, MENU};
+use crate::app::{App, AppMode, FileBrowserState, NewSessionField, Selection, MENU};
+use crate::layout::LayoutTree;
 use crate::session::{SessionKind, SessionState};
 use vt100::Screen;
 
@@ -185,7 +186,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let mut chat_area = Rect::default();
     let mut chat_layout = ChatLayout::default();
 
-    let output_areas = split_output_areas(chunks[0], app.layout);
+    let output_areas = split_output_areas(chunks[0], &app.tree);
     for (pane_idx, area) in output_areas.iter().copied().enumerate() {
         if app.chat_docked == Some(pane_idx) && output_areas.len() > 1 {
             chat_layout = draw_chat_in(f, app, area, pane_idx == app.focused_pane);
@@ -268,19 +269,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     }
 }
 
-fn split_output_areas(area: Rect, mode: LayoutMode) -> Vec<Rect> {
-    // Note the naming inversion: our SplitV ("vertical split", panes side by
-    // side) is ratatui's Direction::Horizontal, and vice versa.
-    let direction = match mode {
-        LayoutMode::Single => return vec![area],
-        LayoutMode::SplitV => Direction::Horizontal,
-        LayoutMode::SplitH => Direction::Vertical,
-    };
-    Layout::default()
-        .direction(direction)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area)
-        .to_vec()
+fn split_output_areas(area: Rect, tree: &LayoutTree) -> Vec<Rect> {
+    tree.rects(area)
 }
 
 // ── Main output zone ───────────────────────────────────────────────────────
@@ -1176,10 +1166,8 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
         ("alt-c", "Open command bar"),
         ("alt-t", "Toggle agent chat pane"),
         ("alt-g", "Dock/undock chat as a split pane"),
-        (
-            "alt-\\ / alt-- / alt-o",
-            "Toggle / rotate / switch split panes",
-        ),
+        ("alt-\\ / alt--", "Split focused pane right / down"),
+        ("alt-w / alt-r / alt-o", "Close / rotate / focus next pane"),
         ("alt-shift-pgup/pgdn", "Scroll output (any session)"),
         ("alt-h", "Show this help"),
         ("ctrl-space", "Toggle menu bar"),
@@ -2273,8 +2261,13 @@ mod tests {
     fn split_layout_returns_two_non_overlapping_output_areas() {
         let area = Rect::new(3, 4, 101, 20);
 
-        let single = split_output_areas(area, LayoutMode::Single);
-        let split = split_output_areas(area, LayoutMode::SplitV);
+        use crate::layout::SplitDir;
+
+        let single = split_output_areas(area, &LayoutTree::Leaf);
+
+        let mut row = LayoutTree::Leaf;
+        row.split_leaf(0, SplitDir::Row);
+        let split = split_output_areas(area, &row);
 
         assert_eq!(single, vec![area]);
         assert_eq!(split.len(), 2);
@@ -2284,7 +2277,9 @@ mod tests {
         assert_eq!(split[0].height, area.height);
         assert_eq!(split[1].height, area.height);
 
-        let stacked = split_output_areas(area, LayoutMode::SplitH);
+        let mut col = LayoutTree::Leaf;
+        col.split_leaf(0, SplitDir::Col);
+        let stacked = split_output_areas(area, &col);
         assert_eq!(stacked.len(), 2);
         assert_eq!(stacked[0].y, area.y);
         assert_eq!(stacked[1].y, stacked[0].y + stacked[0].height);

@@ -104,7 +104,35 @@ impl ratatui::backend::Backend for SizedBackend {
     }
 }
 
-// ── Session / reattach file ────────────────────────────────────────────────
+// ── Session registry ───────────────────────────────────────────────────────
+// Each detached server records itself as a JSON entry under
+// `<config>/sessions/<id>.json`, screen-style. Multiple servers coexist, each
+// with its own id, pid, and per-instance sockets. `linkshell ls` enumerates
+// the registry (pruning entries whose pid has died); `linkshell -r <id>`
+// attaches to a specific one.
+
+use serde::{Deserialize, Serialize};
+
+/// A registered detached linkshell server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub pid: u32,
+    /// IPC socket path.
+    pub socket: String,
+    /// Reattach (relay) socket path.
+    pub reattach: String,
+    pub token: String,
+    /// Unix timestamp (seconds) when the server started.
+    #[serde(default)]
+    pub created: u64,
+    /// Best-effort: whether a relay client is currently attached. Updated by
+    /// the server on attach/detach; may be stale if the server crashed.
+    #[serde(default)]
+    pub attached: bool,
+}
 
 fn linkshell_config_dir() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -115,8 +143,36 @@ fn linkshell_config_dir() -> Option<std::path::PathBuf> {
         .map(|h| h.join(".config").join("linkshell"))
 }
 
-fn reattach_info_path() -> Option<std::path::PathBuf> {
-    linkshell_config_dir().map(|d| d.join("reattach"))
+fn sessions_dir() -> Option<std::path::PathBuf> {
+    linkshell_config_dir().map(|d| d.join("sessions"))
+}
+
+fn session_entry_path(id: &str) -> Option<std::path::PathBuf> {
+    sessions_dir().map(|d| d.join(format!("{id}.json")))
+}
+
+/// True if `pid` is a live process owned by (signalable by) this user.
+pub fn pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// A short, filesystem-safe session id. Derived from the wall clock and pid so
+/// concurrent launches don't collide.
+pub fn new_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mix = nanos ^ ((std::process::id() as u128) << 17);
+    // 6 base36 characters — plenty of entropy for a per-user session table.
+    let mut n = mix;
+    let mut s = String::new();
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    for _ in 0..6 {
+        s.push(ALPHABET[(n % 36) as usize] as char);
+        n /= 36;
+    }
+    s
 }
 
 pub fn reattach_socket_from_ipc(ipc_socket: &str) -> String {
@@ -128,61 +184,78 @@ pub fn reattach_socket_from_ipc(ipc_socket: &str) -> String {
     }
 }
 
-pub fn write_reattach_info(pid: u32, ipc_socket: &str, token: &str) {
-    let Some(path) = reattach_info_path() else {
+/// Write (or overwrite) a session's registry entry. The entry carries the
+/// reattach token, so keep it readable by the owner only.
+pub fn write_session_entry(entry: &SessionEntry) {
+    let Some(dir) = sessions_dir() else {
         return;
     };
-    let info = serde_json::json!({
-        "pid": pid,
-        "socket": ipc_socket,
-        "reattach": reattach_socket_from_ipc(ipc_socket),
-        "token": token,
-    });
-    // The file carries the reattach token; keep it readable by the owner only.
-    if std::fs::write(&path, info.to_string()).is_ok() {
-        use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::create_dir_all(&dir);
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    let Some(path) = session_entry_path(&entry.id) else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string(entry) else {
+        return;
+    };
+    if std::fs::write(&path, json).is_ok() {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
 }
 
-/// The reattach socket path recorded in the info file, if present. This is
-/// the server's own view of the path — the default socket path embeds the
-/// server's pid, so other processes must read it from here rather than
-/// recompute it.
-pub fn recorded_reattach_socket() -> Option<String> {
-    let path = reattach_info_path()?;
+/// Read one session entry by id (no liveness check).
+pub fn read_session_entry(id: &str) -> Option<SessionEntry> {
+    let path = session_entry_path(id)?;
     let bytes = std::fs::read(path).ok()?;
-    let info: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    info["reattach"].as_str().map(str::to_string)
+    serde_json::from_slice(&bytes).ok()
 }
 
-pub fn clear_reattach_info() {
-    if let Some(path) = reattach_info_path() {
+/// Update the `attached` flag on a session entry in place. Best-effort.
+pub fn set_session_attached(id: &str, attached: bool) {
+    if let Some(mut entry) = read_session_entry(id) {
+        entry.attached = attached;
+        write_session_entry(&entry);
+    }
+}
+
+pub fn remove_session_entry(id: &str) {
+    if let Some(path) = session_entry_path(id) {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// True if a linkshell server appears to be running: the reattach info file
-/// exists and its recorded pid is alive. A stale file (dead pid) is removed
-/// so the launcher can start a fresh server.
-pub fn server_alive() -> bool {
-    let Some(path) = reattach_info_path() else {
-        return false;
+/// All live sessions, sorted by creation time. Entries whose pid has died are
+/// pruned from disk as a side effect.
+pub fn list_sessions() -> Vec<SessionEntry> {
+    let Some(dir) = sessions_dir() else {
+        return Vec::new();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
+    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+        return Vec::new();
     };
-    let Ok(info) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    let Some(pid) = info["pid"].as_u64() else {
-        return false;
-    };
-    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-    if !alive {
-        let _ = std::fs::remove_file(&path);
+    let mut out = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(session) = serde_json::from_slice::<SessionEntry>(&bytes) else {
+            // Unparseable entry — drop it so it stops cluttering the list.
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if pid_alive(session.pid) {
+            out.push(session);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
     }
-    alive
+    out.sort_by_key(|s| s.created);
+    out
 }
 
 fn server_log_path() -> Option<std::path::PathBuf> {
@@ -206,7 +279,7 @@ pub fn open_server_log() -> Option<std::fs::File> {
 
 // ── Relay client: `linkshell -r` / `linkshell --reattach` ─────────────────
 
-pub async fn run_relay_client() -> anyhow::Result<()> {
+pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
     use crossterm::{
         event::{self, DisableMouseCapture, EnableMouseCapture},
         execute,
@@ -214,37 +287,16 @@ pub async fn run_relay_client() -> anyhow::Result<()> {
     };
 
     // ── Find the detached session ─────────────────────────────────────────
-    let info_path =
-        reattach_info_path().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
-
-    let info_bytes = std::fs::read(&info_path).map_err(|_| {
-        anyhow::anyhow!(
-            "no detached linkshell session found\n  (expected {})",
-            info_path.display()
-        )
+    let entry = read_session_entry(id).ok_or_else(|| {
+        anyhow::anyhow!("no linkshell session '{}' found (try `linkshell ls`)", id)
     })?;
-
-    let info: serde_json::Value = serde_json::from_slice(&info_bytes)?;
-    let pid = info["pid"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("invalid reattach file: missing pid"))? as i32;
-    let reattach_socket = info["reattach"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid reattach file: missing socket"))?
-        .to_string();
-    let token = info["token"]
-        .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid reattach file: missing token (session started by an older linkshell?)"
-            )
-        })?
-        .to_string();
+    let pid = entry.pid as i32;
+    let reattach_socket = entry.reattach.clone();
+    let token = entry.token.clone();
 
     // ── Check the process is alive ────────────────────────────────────────
-    let alive = unsafe { libc::kill(pid, 0) == 0 };
-    if !alive {
-        let _ = std::fs::remove_file(&info_path);
+    if !pid_alive(entry.pid) {
+        remove_session_entry(id);
         anyhow::bail!("no active linkshell session (pid {} is not running)", pid);
     }
 
@@ -438,6 +490,24 @@ pub fn decode_relay_line(line: &str) -> Option<crate::events::AppEvent> {
 mod tests {
     use super::*;
     use ratatui::backend::Backend;
+
+    #[test]
+    fn session_ids_are_six_base36_chars() {
+        let id = new_session_id();
+        assert_eq!(id.len(), 6);
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn reattach_socket_is_derived_from_ipc_socket() {
+        assert_eq!(
+            reattach_socket_from_ipc("/run/user/1000/linkshell/42.sock"),
+            "/run/user/1000/linkshell/42.reattach"
+        );
+        assert_eq!(reattach_socket_from_ipc("/tmp/foo"), "/tmp/foo.reattach");
+    }
 
     #[test]
     fn relay_resize_lines_carry_dimensions() {

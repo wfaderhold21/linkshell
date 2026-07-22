@@ -11,6 +11,10 @@ use crate::config::{self, Config};
 use crate::council::CouncilRouter;
 use crate::events::AppEvent;
 use crate::keybindings::{self, Keymap};
+use crate::layout::{LayoutTree, SplitDir};
+
+/// Maximum number of simultaneously visible panes.
+pub const MAX_PANES: usize = 8;
 use crate::patterns::PatternMatcher;
 use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
 use crate::session::{
@@ -403,21 +407,14 @@ impl FileBrowserState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutMode {
-    Single,
-    /// Two panes side by side (vertical divider).
-    SplitV,
-    /// Two panes stacked (horizontal divider).
-    SplitH,
-}
-
 pub struct App {
     pub sessions: Vec<Session>,
-    pub layout: LayoutMode,
-    /// Split direction restored by toggle_split after a collapse to Single.
-    pub last_split: LayoutMode,
-    pub panes: [Option<usize>; 2],
+    /// Geometry of the output zone: a binary tree of splits whose leaves map
+    /// one-to-one, in in-order traversal order, to `panes` and `pane_sizes`.
+    pub tree: LayoutTree,
+    /// One entry per pane slot (leaf), holding the index into `sessions` shown
+    /// there (or `None` for an empty pane). Length matches the tree's leaves.
+    pub panes: Vec<Option<usize>>,
     pub focused_pane: usize,
     pub mode: AppMode,
     pub new_session_state: NewSessionState,
@@ -431,8 +428,9 @@ pub struct App {
     pub event_tx: mpsc::Sender<AppEvent>,
     pub config: Arc<Config>,
     pub pipes: Vec<Pipe>,
-    // Current PTY size derived from the output pane (rows, cols)
-    pub pane_sizes: [(u16, u16); 2],
+    // Current PTY size derived from each output pane (rows, cols), one per
+    // pane slot; length matches `panes`.
+    pub pane_sizes: Vec<(u16, u16)>,
     // Layout cache (updated after each draw, used for mouse hit-testing)
     pub output_areas: Vec<Rect>,
     pub session_bar_area: Rect,
@@ -535,9 +533,8 @@ impl App {
         }
         Self {
             sessions: Vec::new(),
-            layout: LayoutMode::Single,
-            last_split: LayoutMode::SplitV,
-            panes: [None, None],
+            tree: LayoutTree::Leaf,
+            panes: vec![None],
             focused_pane: 0,
             mode: AppMode::Normal,
             new_session_state: NewSessionState::default(),
@@ -551,7 +548,7 @@ impl App {
             event_tx,
             config,
             pipes: Vec::new(),
-            pane_sizes: [(PTY_ROWS, PTY_COLS); 2],
+            pane_sizes: vec![(PTY_ROWS, PTY_COLS)],
             output_areas: Vec::new(),
             session_bar_area: Rect::default(),
             session_slot_areas: Vec::new(),
@@ -608,7 +605,7 @@ impl App {
     }
 
     pub fn active_idx(&self) -> Option<usize> {
-        self.panes[self.focused_pane]
+        self.panes.get(self.focused_pane).copied().flatten()
     }
 
     /// Indices into `sessions` of the sessions the user can see and switch
@@ -1015,8 +1012,7 @@ impl App {
                 other => other,
             };
         }
-        if self.layout == LayoutMode::Single && self.panes[0].is_none() && !self.sessions.is_empty()
-        {
+        if !self.is_split() && self.panes[0].is_none() && !self.sessions.is_empty() {
             // Fall back to the nearest visible session, if any remain.
             let target = idx.min(self.sessions.len() - 1);
             self.panes[0] = self
@@ -1032,11 +1028,13 @@ impl App {
         if self.chat_docked == Some(self.focused_pane) {
             self.chat_docked = None;
         }
-        let other = self.focused_pane ^ 1;
-        if idx < self.sessions.len()
-            && !self.sessions[idx].hidden
-            && (!self.is_split() || self.panes[other] != Some(idx))
-        {
+        // Don't show the same session in two panes at once.
+        let shown_elsewhere = self
+            .panes
+            .iter()
+            .enumerate()
+            .any(|(i, p)| i != self.focused_pane && *p == Some(idx));
+        if idx < self.sessions.len() && !self.sessions[idx].hidden && !shown_elsewhere {
             self.panes[self.focused_pane] = Some(idx);
             let (rows, cols) = self.pane_sizes[self.focused_pane];
             let session = &mut self.sessions[idx];
@@ -1082,50 +1080,75 @@ impl App {
     }
 
     pub fn is_split(&self) -> bool {
-        self.layout != LayoutMode::Single
+        self.panes.len() > 1
     }
 
-    pub fn toggle_split(&mut self) {
-        match self.layout {
-            LayoutMode::Single => {
-                // Reopen in whichever direction was used last (default SplitV).
-                self.layout = self.last_split;
-                if self.panes[1].is_none() {
-                    self.panes[1] = self
-                        .visible_indices()
-                        .into_iter()
-                        .find(|idx| Some(*idx) != self.panes[0]);
-                }
+    /// Split the focused pane in two, creating a new empty pane beside (Row) or
+    /// below (Col) it, and move focus to the new pane. The new pane is seeded
+    /// with the next visible session not already on screen, if any.
+    pub fn split_focused(&mut self, dir: SplitDir) {
+        if self.panes.len() >= MAX_PANES {
+            return;
+        }
+        self.tree.split_leaf(self.focused_pane, dir);
+        let new_slot = self.focused_pane + 1;
+        // Seed the new pane with a session that isn't already displayed.
+        let seed = self
+            .visible_indices()
+            .into_iter()
+            .find(|idx| !self.panes.contains(&Some(*idx)));
+        let size = self.pane_sizes[self.focused_pane];
+        self.panes.insert(new_slot, seed);
+        self.pane_sizes.insert(new_slot, size);
+        // A pane inserted at or before a docked-chat slot shifts its index.
+        if let Some(dock) = self.chat_docked.as_mut() {
+            if *dock >= new_slot {
+                *dock += 1;
             }
-            LayoutMode::SplitV | LayoutMode::SplitH => {
-                self.last_split = self.layout;
+        }
+        self.focused_pane = new_slot;
+        // No immediate PTY resize: the true pane geometry isn't known until the
+        // next draw, whose post-draw handle_pane_resize sizes the new pane's
+        // session correctly.
+        self.needs_redraw = true;
+    }
+
+    /// Close the focused pane; its sibling reclaims the space. The session in
+    /// the pane is unassigned, not killed. No-op when only one pane remains.
+    pub fn close_focused_pane(&mut self) {
+        if self.panes.len() <= 1 {
+            return;
+        }
+        if !self.tree.close_leaf(self.focused_pane) {
+            return;
+        }
+        let removed = self.focused_pane;
+        self.panes.remove(removed);
+        self.pane_sizes.remove(removed);
+        // Keep the docked-chat slot pointing at the same pane.
+        if let Some(dock) = self.chat_docked {
+            if dock == removed {
                 self.chat_docked = None;
-                self.panes[0] = self.active_idx();
-                self.panes[1] = None;
-                self.focused_pane = 0;
-                self.layout = LayoutMode::Single;
+            } else if dock > removed {
+                self.chat_docked = Some(dock - 1);
             }
         }
+        self.focused_pane = removed.min(self.panes.len() - 1);
         self.needs_redraw = true;
     }
 
-    /// Flip an active split between side-by-side (SplitV) and stacked
-    /// (SplitH). No-op in Single layout — the pane pair and focus are
-    /// preserved; only the divider direction changes. The post-draw
-    /// handle_pane_resize pass propagates the new geometry to session PTYs.
+    /// Flip the split that parents the focused pane between side-by-side and
+    /// stacked. The post-draw handle_pane_resize pass propagates the new
+    /// geometry to session PTYs.
     pub fn rotate_split(&mut self) {
-        match self.layout {
-            LayoutMode::SplitV => self.layout = LayoutMode::SplitH,
-            LayoutMode::SplitH => self.layout = LayoutMode::SplitV,
-            LayoutMode::Single => return,
+        if self.tree.rotate_leaf(self.focused_pane) {
+            self.needs_redraw = true;
         }
-        self.last_split = self.layout;
-        self.needs_redraw = true;
     }
 
     pub fn focus_next_pane(&mut self) {
         if self.is_split() {
-            self.focused_pane ^= 1;
+            self.focused_pane = (self.focused_pane + 1) % self.panes.len();
             self.needs_redraw = true;
         }
     }
@@ -1196,15 +1219,13 @@ impl App {
     }
 
     /// Called from the main loop after each draw when the output area changes size.
-    pub fn handle_pane_resize(&mut self, sizes: [(u16, u16); 2]) {
+    pub fn handle_pane_resize(&mut self, sizes: &[(u16, u16)]) {
         let mut changed = false;
-        let mut visible: [Option<usize>; 2] = [None, None];
-        for (pane_idx, size) in sizes.iter().copied().enumerate() {
-            if self.layout == LayoutMode::Single && pane_idx == 1 {
-                continue;
+        for (pane_idx, &size) in sizes.iter().enumerate() {
+            if pane_idx >= self.pane_sizes.len() {
+                break;
             }
-            visible[pane_idx] = self.panes[pane_idx];
-            if self.pane_sizes[pane_idx] == sizes[pane_idx] {
+            if self.pane_sizes[pane_idx] == size {
                 continue;
             }
             self.pane_sizes[pane_idx] = size;
@@ -1230,7 +1251,7 @@ impl App {
         // they'd appear in when switched to — the focused one.
         let (rows, cols) = self.pane_sizes[self.focused_pane];
         for (idx, session) in self.sessions.iter_mut().enumerate() {
-            if visible.contains(&Some(idx)) {
+            if self.panes.contains(&Some(idx)) {
                 continue;
             }
             session.resize_screen(rows, cols);
@@ -1242,7 +1263,11 @@ impl App {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn handle_resize(&mut self, rows: u16, cols: u16) {
-        self.handle_pane_resize([(rows, cols), self.pane_sizes[1]]);
+        let mut sizes = self.pane_sizes.clone();
+        if let Some(first) = sizes.first_mut() {
+            *first = (rows, cols);
+        }
+        self.handle_pane_resize(&sizes);
     }
 
     /// Returns whether this output warrants a redraw: only when the byte chunk
@@ -3522,13 +3547,12 @@ impl App {
             ["chat", "dock"] => self.dock_chat(None),
             ["chat", "dock", side] => match *side {
                 "left" | "right" | "top" | "bottom" => {
-                    self.layout = if matches!(*side, "left" | "right") {
-                        LayoutMode::SplitV
+                    let dir = if matches!(*side, "left" | "right") {
+                        SplitDir::Row
                     } else {
-                        LayoutMode::SplitH
+                        SplitDir::Col
                     };
-                    self.last_split = self.layout;
-                    self.dock_chat(Some(usize::from(matches!(*side, "right" | "bottom"))));
+                    self.dock_chat(Some(dir));
                 }
                 other => {
                     self.command_result = format!(
@@ -4240,37 +4264,41 @@ impl App {
         };
     }
 
-    /// Dock the chat into a split pane. `pane` picks the slot (0 = left/top,
-    /// 1 = right/bottom); None docks into the non-focused pane. Opens a split
-    /// if the layout is Single and moves focus to the chat.
-    pub fn dock_chat(&mut self, pane: Option<usize>) {
+    /// Dock the chat into a dedicated pane, splitting the focused pane to make
+    /// room. `dir` picks the split direction (default side-by-side). Focus
+    /// moves to the chat pane.
+    pub fn dock_chat(&mut self, dir: Option<SplitDir>) {
         if matches!(self.mode, AppMode::Chat) {
             self.mode = AppMode::Normal;
         }
-        if !self.is_split() {
-            self.layout = self.last_split;
+        if let Some(pane) = self.chat_docked {
+            // Already docked — just focus it.
+            self.focused_pane = pane;
+            self.needs_redraw = true;
+            return;
         }
-        let pane = pane.unwrap_or(self.focused_pane ^ 1).min(1);
-        self.chat_docked = Some(pane);
-        self.focused_pane = pane;
+        let panes_before = self.panes.len();
+        self.split_focused(dir.unwrap_or(SplitDir::Row));
+        if self.panes.len() == panes_before {
+            // Couldn't split (pane cap reached) — nothing to dock into.
+            return;
+        }
+        // The freshly created, now-focused pane hosts the chat instead of a
+        // session.
+        self.panes[self.focused_pane] = None;
+        self.chat_docked = Some(self.focused_pane);
         self.chat_selection = None;
         self.needs_redraw = true;
     }
 
-    /// Remove the chat from its split pane. The session behind it (if any)
-    /// becomes visible again; an empty pane collapses the split.
+    /// Remove the chat from its pane; the sibling pane reclaims the space.
     pub fn undock_chat(&mut self) {
         let Some(pane) = self.chat_docked.take() else {
             return;
         };
         self.chat_selection = None;
-        if self.panes[pane].is_none() {
-            self.panes[0] = self.panes[pane ^ 1];
-            self.panes[1] = None;
-            self.last_split = self.layout;
-            self.layout = LayoutMode::Single;
-            self.focused_pane = 0;
-        }
+        self.focused_pane = pane;
+        self.close_focused_pane();
         self.needs_redraw = true;
     }
 
@@ -6248,84 +6276,90 @@ mod tests {
         app.spawn_headless_session("two".into(), None).unwrap();
         app.spawn_headless_session("three".into(), None).unwrap();
 
-        app.toggle_split();
-        assert_eq!(app.layout, LayoutMode::SplitV);
-        assert_eq!(app.panes, [Some(0), Some(1)]);
+        app.split_focused(SplitDir::Row);
+        assert_eq!(app.panes, vec![Some(0), Some(1)]);
+        assert_eq!(app.focused_pane, 1, "focus moves to the new pane");
+        assert_eq!(app.active_idx(), Some(1));
+
+        app.focus_next_pane();
+        assert_eq!(app.focused_pane, 0);
         assert_eq!(app.active_idx(), Some(0));
 
         app.focus_next_pane();
-        assert_eq!(app.focused_pane, 1);
-        assert_eq!(app.active_idx(), Some(1));
-
         app.switch_to(2);
-        assert_eq!(app.panes, [Some(0), Some(2)]);
+        assert_eq!(app.panes, vec![Some(0), Some(2)]);
         app.switch_to(0);
         assert_eq!(
             app.panes,
-            [Some(0), Some(2)],
+            vec![Some(0), Some(2)],
             "a session cannot be displayed in both panes"
         );
     }
 
     #[test]
-    fn rotate_split_flips_direction_and_toggle_remembers_it() {
+    fn rotate_split_flips_the_parent_split_direction() {
         let mut app = make_app();
         app.spawn_headless_session("one".into(), None).unwrap();
         app.spawn_headless_session("two".into(), None).unwrap();
 
-        app.rotate_split();
+        app.rotate_split(); // one pane: no split to rotate
+        assert_eq!(app.tree, LayoutTree::Leaf);
+
+        app.split_focused(SplitDir::Row);
+        let area = Rect::new(0, 0, 100, 40);
+        let before = app.tree.rects(area);
         assert_eq!(
-            app.layout,
-            LayoutMode::Single,
-            "rotate is a no-op in Single"
+            before[1].x,
+            before[0].x + before[0].width,
+            "Row split places panes side by side"
         );
 
-        app.toggle_split();
-        assert_eq!(app.layout, LayoutMode::SplitV);
-        let panes = app.panes;
-        app.focus_next_pane();
-
         app.rotate_split();
-        assert_eq!(app.layout, LayoutMode::SplitH);
-        assert_eq!(app.panes, panes, "rotation preserves the pane pair");
+        let after = app.tree.rects(area);
+        assert_eq!(
+            after[1].y,
+            after[0].y + after[0].height,
+            "rotation stacks the panes"
+        );
+        assert_eq!(
+            app.panes,
+            vec![Some(0), Some(1)],
+            "rotation keeps the panes"
+        );
         assert_eq!(app.focused_pane, 1, "rotation preserves focus");
-
-        app.focus_next_pane();
-        assert_eq!(app.focused_pane, 0, "pane focus works in SplitH");
-
-        // Collapse and reopen: the split comes back stacked.
-        app.toggle_split();
-        assert_eq!(app.layout, LayoutMode::Single);
-        app.toggle_split();
-        assert_eq!(app.layout, LayoutMode::SplitH);
     }
 
     #[test]
-    fn collapsing_split_keeps_the_focused_session() {
+    fn closing_a_pane_lets_the_sibling_reclaim_the_space() {
         let mut app = make_app();
         app.spawn_headless_session("one".into(), None).unwrap();
         app.spawn_headless_session("two".into(), None).unwrap();
-        app.toggle_split();
-        app.focus_next_pane();
+        app.split_focused(SplitDir::Row); // panes [0, 1], focus on 1
 
-        app.toggle_split();
-
-        assert_eq!(app.layout, LayoutMode::Single);
+        // Close the focused (new) pane: pane 0 reclaims the space.
+        app.close_focused_pane();
+        assert_eq!(app.panes, vec![Some(0)]);
         assert_eq!(app.focused_pane, 0);
-        assert_eq!(app.panes, [Some(1), None]);
-        assert_eq!(app.active_idx(), Some(1));
+        assert_eq!(app.active_idx(), Some(0));
+
+        // Split again and close the first pane: the sibling (session 1) stays.
+        app.split_focused(SplitDir::Row); // panes [0, 1], focus 1
+        app.focused_pane = 0;
+        app.close_focused_pane();
+        assert_eq!(app.panes, vec![Some(1)]);
     }
 
     #[test]
-    fn docking_chat_opens_split_and_undocking_collapses_empty_pane() {
+    fn docking_chat_opens_a_pane_and_undocking_reclaims_it() {
         let mut app = make_app();
         app.spawn_headless_session("one".into(), None).unwrap();
 
-        // Dock from Single: opens a split with chat in the other pane, focused.
+        // Dock: splits the pane and puts chat in the new, focused pane.
         app.dock_chat(None);
-        assert_eq!(app.layout, LayoutMode::SplitV);
+        assert_eq!(app.panes.len(), 2);
         assert_eq!(app.chat_docked, Some(1));
         assert_eq!(app.focused_pane, 1);
+        assert_eq!(app.panes[1], None, "the chat pane holds no session");
 
         // Esc from the chat pane jumps back to the work pane.
         app.chat_key(crossterm::event::KeyEvent::new(
@@ -6334,28 +6368,28 @@ mod tests {
         ));
         assert_eq!(app.focused_pane, 0);
 
-        // Undock: the empty pane collapses back to Single.
+        // Undock: the chat pane closes and the work pane reclaims the space.
         app.undock_chat();
         assert_eq!(app.chat_docked, None);
-        assert_eq!(app.layout, LayoutMode::Single);
-        assert_eq!(app.panes, [Some(0), None]);
+        assert_eq!(app.panes, vec![Some(0)]);
     }
 
     #[test]
-    fn collapsing_split_undocks_chat_and_switching_replaces_docked_chat() {
+    fn closing_chat_pane_undocks_and_switching_replaces_docked_chat() {
         let mut app = make_app();
         app.spawn_headless_session("one".into(), None).unwrap();
         app.spawn_headless_session("two".into(), None).unwrap();
 
-        app.dock_chat(Some(0));
-        assert_eq!(app.chat_docked, Some(0));
-        app.toggle_split();
-        assert_eq!(app.chat_docked, None, "collapsing the split undocks chat");
+        app.dock_chat(Some(SplitDir::Row));
+        assert_eq!(app.chat_docked, Some(app.focused_pane));
+        app.close_focused_pane();
+        assert_eq!(app.chat_docked, None, "closing the chat pane undocks chat");
 
-        app.dock_chat(Some(1));
+        app.dock_chat(Some(SplitDir::Row));
+        let chat_pane = app.focused_pane;
         app.switch_to(1);
         assert_eq!(app.chat_docked, None, "picking a session replaces chat");
-        assert_eq!(app.panes[1], Some(1));
+        assert_eq!(app.panes[chat_pane], Some(1));
     }
 
     #[test]
@@ -6364,19 +6398,18 @@ mod tests {
         app.spawn_headless_session("one".into(), None).unwrap();
         app.spawn_headless_session("two".into(), None).unwrap();
         app.spawn_headless_session("three".into(), None).unwrap();
-        app.toggle_split();
-        app.focus_next_pane();
+        app.split_focused(SplitDir::Row); // panes [0, 1], focus 1
 
         app.kill_active_session();
 
         assert_eq!(app.sessions.len(), 2);
-        assert_eq!(app.panes, [Some(0), None]);
+        assert_eq!(app.panes, vec![Some(0), None]);
         assert_eq!(app.focused_pane, 1);
 
         app.panes[1] = Some(1);
         app.focus_next_pane();
         app.kill_active_session();
-        assert_eq!(app.panes, [None, Some(0)]);
+        assert_eq!(app.panes, vec![None, Some(0)]);
     }
 
     #[test]
@@ -6391,19 +6424,19 @@ mod tests {
         app.handle_session_resizer(first, first_tx);
         app.handle_session_resizer(second, second_tx);
         app.handle_session_resizer(hidden, hidden_tx);
-        app.toggle_split();
+        app.split_focused(SplitDir::Row); // panes [0, 1], focus on pane 1
 
-        app.handle_pane_resize([(12, 40), (12, 39)]);
+        app.handle_pane_resize(&[(12, 40), (12, 39)]);
 
-        assert_eq!(app.pane_sizes, [(12, 40), (12, 39)]);
+        assert_eq!(app.pane_sizes, vec![(12, 40), (12, 39)]);
         assert_eq!(app.sessions[0].screen.screen().size(), (12, 40));
         assert_eq!(app.sessions[1].screen.screen().size(), (12, 39));
         assert_eq!(first_rx.try_recv().unwrap(), (12, 40));
         assert_eq!(second_rx.try_recv().unwrap(), (12, 39));
-        // Hidden sessions track the focused pane's size so their programs
-        // see the SIGWINCH immediately instead of on switch_to.
-        assert_eq!(app.sessions[2].screen.screen().size(), (12, 40));
-        assert_eq!(hidden_rx.try_recv().unwrap(), (12, 40));
+        // Hidden sessions track the focused pane's size (pane 1 here) so their
+        // programs see the SIGWINCH immediately instead of on switch_to.
+        assert_eq!(app.sessions[2].screen.screen().size(), (12, 39));
+        assert_eq!(hidden_rx.try_recv().unwrap(), (12, 39));
     }
 
     #[test]
@@ -6426,13 +6459,12 @@ mod tests {
         app.spawn_headless_session("one".into(), None).unwrap();
         app.spawn_headless_session("two".into(), None).unwrap();
         let third = app.spawn_headless_session("three".into(), None).unwrap();
-        app.toggle_split();
-        app.handle_pane_resize([(12, 40), (12, 39)]);
+        app.split_focused(SplitDir::Row); // panes [0, 1], focus on pane 1
+        app.handle_pane_resize(&[(12, 40), (12, 39)]);
         let (tx, mut rx) = mpsc::channel(1);
         app.handle_session_resizer(third, tx);
-        app.focus_next_pane();
 
-        app.switch_to(2);
+        app.switch_to(2); // replace the focused pane (1) with session 2
 
         assert_eq!(app.sessions[2].screen.screen().size(), (12, 39));
         assert_eq!(rx.try_recv().unwrap(), (12, 39));
