@@ -93,11 +93,18 @@ Skills are `*.md` files in `~/.config/linkshell/skills/` (name + description in 
 
 Vertical panes: main output (optionally split into two session panes), session bar, status panel, and an optional chat pane (`alt-t`, dockable with `alt-g`). Overlays: NewSession dialog, command bar/palette (`alt-c`), pipes overlay, help (`alt-h`).
 
-Keybindings and command-bar commands are user-facing — keep the README's Keybindings and Command Bar sections as the source of truth and update them when defaults in `keybindings.rs` or the parser in `app.rs::execute_command` change.
+Keybindings and command-bar commands are user-facing — keep the Keybindings and Command Bar sections in `docs/panes-and-navigation.md` as the source of truth and update them when defaults in `keybindings.rs` or the parser in `app.rs::execute_command` change.
 
 ## Documentation
 
-- `README.md` — user-facing feature docs; keep in sync with behavior changes
+- `README.md` — user-facing overview; links out to the per-feature guides below
+- `docs/sessions.md` — sessions, detach/reattach, profiles, aliased/local agents, states
+- `docs/panes-and-navigation.md` — split panes, scrollback, status panel, keybindings, command bar
+- `docs/pipes.md` — session pipes
+- `docs/councils.md` — multi-agent councils
+- `docs/chat.md` — agent chat pane and local LLM agents
+- `docs/orchestrator.md` — resident orchestrator agent
+- `docs/agent-integration.md` — linkshell-ctl, capabilities, hooks, remote agents
 - `docs/config-reference.md` — full linkshell.toml reference
 - `docs/recipes.md` — workflow recipes
 - `docs/orchestrator-memory.md` — orchestrator memory design
