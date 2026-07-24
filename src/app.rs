@@ -433,6 +433,10 @@ pub struct App {
     pub pipe_list_selected: usize,
     pub should_quit: bool,
     pub needs_redraw: bool,
+    // Shrink hysteresis for the status panel (see stabilized_status_rows).
+    // Cells because the render path only has &App.
+    status_rows_hold: std::cell::Cell<u16>,
+    status_rows_hold_at: std::cell::Cell<Option<std::time::Instant>>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub config: Arc<Config>,
     pub pipes: Vec<Pipe>,
@@ -556,6 +560,8 @@ impl App {
             pipe_list_selected: 0,
             should_quit: false,
             needs_redraw: true,
+            status_rows_hold: std::cell::Cell::new(0),
+            status_rows_hold_at: std::cell::Cell::new(None),
             event_tx,
             config,
             pipes: Vec::new(),
@@ -1250,6 +1256,30 @@ impl App {
             .and_then(|i| self.sessions.get(i))
             .map(|s| s.screen.screen().scrollback().max(s.history_scroll))
             .unwrap_or(0)
+    }
+
+    /// Status-panel height with shrink hysteresis. Growing applies
+    /// immediately; shrinking only after the smaller height has been desired
+    /// for a few seconds. Without this, a session whose inferred state flaps
+    /// (codex repaints re-triggering WAITING↔RUNNING) adds and removes its
+    /// waiting-preview row every few hundred ms; each change resizes the
+    /// output panes, the resized TUI repaints, the repaint re-flaps the
+    /// state, and the whole UI oscillates.
+    pub fn stabilized_status_rows(&self, desired: u16) -> u16 {
+        const HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+        let held = self.status_rows_hold.get();
+        let fresh = self
+            .status_rows_hold_at
+            .get()
+            .is_some_and(|t| t.elapsed() < HOLD);
+        if desired >= held || !fresh {
+            self.status_rows_hold.set(desired);
+            self.status_rows_hold_at
+                .set(Some(std::time::Instant::now()));
+            desired
+        } else {
+            held
+        }
     }
 
     // ── Event handlers ─────────────────────────────────────────────────────
@@ -5738,6 +5768,19 @@ mod tests {
 
     fn cursor_pos(app: &App) -> usize {
         app.new_session_state.cursor_pos()
+    }
+
+    #[test]
+    fn status_rows_grow_immediately_but_shrink_with_hysteresis() {
+        let app = make_app();
+        assert_eq!(app.stabilized_status_rows(6), 6);
+        // Growth applies at once.
+        assert_eq!(app.stabilized_status_rows(7), 7);
+        // A flap back down is held at the larger height…
+        assert_eq!(app.stabilized_status_rows(6), 7);
+        // …and growing again re-arms the hold.
+        assert_eq!(app.stabilized_status_rows(7), 7);
+        assert_eq!(app.stabilized_status_rows(6), 7);
     }
 
     #[test]

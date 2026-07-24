@@ -60,16 +60,27 @@ fn rollout_cwd(path: &Path) -> Option<String> {
 /// Codex only creates the rollout file when the user submits their first
 /// prompt, which can be arbitrarily long after the session spawns — so there
 /// is no deadline here; poll until the file appears or the app shuts down.
+///
+/// A resumed session (`codex resume`, or the in-TUI resume picker) appends to
+/// a rollout that already existed at spawn, so a pre-existing file counts as
+/// a candidate too once its mtime moves past our spawn time — otherwise
+/// resumed sessions never get token stats.
 async fn wait_for_new_rollout(
     dir: &Path,
     existing: &HashSet<PathBuf>,
+    spawn_time: std::time::SystemTime,
     cwd: &str,
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
 ) -> Option<PathBuf> {
     loop {
         let mut candidates: Vec<PathBuf> = jsonl_files(dir)
             .into_iter()
-            .filter(|p| !existing.contains(p))
+            .filter(|p| {
+                !existing.contains(p)
+                    || std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|mtime| mtime > spawn_time)
+            })
             .collect();
         candidates.sort();
 
@@ -277,9 +288,10 @@ pub fn spawn_watcher(
     // spawned, so a fast-starting Codex can't create its file first and have
     // it land in `existing` (same race claude_log guards against).
     let existing = jsonl_files(&dir);
+    let spawn_time = std::time::SystemTime::now();
 
     tokio::spawn(async move {
-        let jsonl = match wait_for_new_rollout(&dir, &existing, &cwd, &tx).await {
+        let jsonl = match wait_for_new_rollout(&dir, &existing, spawn_time, &cwd, &tx).await {
             Some(p) => p,
             None => return,
         };
