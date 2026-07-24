@@ -25,6 +25,12 @@ it is copied to the clipboard on release, like the session panes. Pasting into
 the chat input works too; multi-line pastes are delivered to sessions via
 bracketed paste so they arrive as one message. Dock the pane with `alt-g`.
 
+The input supports the usual line-editing keys (`Home`/`End`/`Delete` alongside
+arrows and backspace). `Up`/`Down` recall previously sent messages, restoring
+any in-progress draft when you scroll back down. Typing `/` as the first
+character opens a command popup that narrows as you type — `Up`/`Down` pick an
+entry, `Tab` completes it, `Enter` sends.
+
 ## Answering permission prompts
 
 When an AI session stops on a permission dialog or y/n question, the prompt is

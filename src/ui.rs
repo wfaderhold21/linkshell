@@ -1601,6 +1601,41 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
         .collect();
     f.render_widget(Paragraph::new(input_lines), input_area);
 
+    // Slash-command completion popup: overlays the transcript just above the
+    // separator while the input starts with '/'.
+    if focused && !app.chat.palette.matches.is_empty() {
+        let count = (app.chat.palette.matches.len().min(8) as u16).min(transcript_h as u16);
+        if count > 0 {
+            let popup = Rect {
+                x: inner.x,
+                y: sep.y.saturating_sub(count),
+                width: inner.width,
+                height: count,
+            };
+            f.render_widget(Clear, popup);
+            let lines: Vec<Line<'_>> = app
+                .chat
+                .palette
+                .matches
+                .iter()
+                .take(count as usize)
+                .enumerate()
+                .map(|(index, entry)| {
+                    let style = if index == app.chat.palette.selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::White).bg(Color::DarkGray)
+                    };
+                    Line::from(vec![
+                        Span::styled(format!(" {:<30}", entry.template), style),
+                        Span::styled(entry.summary.clone(), style.add_modifier(Modifier::DIM)),
+                    ])
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), popup);
+        }
+    }
+
     ChatLayout {
         area: popup,
         transcript_area: transcript,

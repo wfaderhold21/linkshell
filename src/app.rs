@@ -265,6 +265,14 @@ pub struct ChatState {
     /// Per-local-agent conversation history (role, content), oldest first.
     pub histories: std::collections::HashMap<String, Vec<(String, String)>>,
     pub pending: Vec<PendingChat>,
+    /// Previously sent inputs, oldest first (Up/Down recall).
+    pub history: Vec<String>,
+    /// Index into `history` while browsing with Up/Down; None = live input.
+    pub history_pos: Option<usize>,
+    /// The in-progress input stashed when Up starts browsing history.
+    pub history_draft: String,
+    /// Slash-command completion popup (populated while input starts with '/').
+    pub palette: PaletteState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4368,6 +4376,21 @@ impl App {
                 }
             }
             KeyCode::Enter => self.chat_send(),
+            KeyCode::Tab if !self.chat.palette.matches.is_empty() => {
+                if let Some(entry) = self.chat.palette.matches.get(self.chat.palette.selected) {
+                    self.chat.input = entry.insert.clone();
+                    self.chat.cursor = self.chat.input.len();
+                    self.refresh_chat_palette();
+                }
+            }
+            KeyCode::Up if !self.chat.palette.matches.is_empty() => {
+                self.chat_palette_move(-1);
+            }
+            KeyCode::Down if !self.chat.palette.matches.is_empty() => {
+                self.chat_palette_move(1);
+            }
+            KeyCode::Up => self.chat_history_prev(),
+            KeyCode::Down => self.chat_history_next(),
             KeyCode::Backspace if self.chat.cursor > 0 => {
                 let mut i = self.chat.cursor - 1;
                 while i > 0 && !self.chat.input.is_char_boundary(i) {
@@ -4375,7 +4398,20 @@ impl App {
                 }
                 self.chat.input.replace_range(i..self.chat.cursor, "");
                 self.chat.cursor = i;
+                self.chat.history_pos = None;
+                self.refresh_chat_palette();
             }
+            KeyCode::Delete if self.chat.cursor < self.chat.input.len() => {
+                let mut i = self.chat.cursor + 1;
+                while i < self.chat.input.len() && !self.chat.input.is_char_boundary(i) {
+                    i += 1;
+                }
+                self.chat.input.replace_range(self.chat.cursor..i, "");
+                self.chat.history_pos = None;
+                self.refresh_chat_palette();
+            }
+            KeyCode::Home => self.chat.cursor = 0,
+            KeyCode::End => self.chat.cursor = self.chat.input.len(),
             KeyCode::Left if self.chat.cursor > 0 => {
                 let mut i = self.chat.cursor - 1;
                 while i > 0 && !self.chat.input.is_char_boundary(i) {
@@ -4395,9 +4431,104 @@ impl App {
             KeyCode::Char(c) => {
                 self.chat.input.insert(self.chat.cursor, c);
                 self.chat.cursor += c.len_utf8();
+                self.chat.history_pos = None;
+                self.refresh_chat_palette();
             }
             _ => {}
         }
+    }
+
+    fn chat_palette_move(&mut self, delta: isize) {
+        if self.chat.palette.matches.is_empty() {
+            self.chat.palette.selected = 0;
+            return;
+        }
+        self.chat.palette.selected = (self.chat.palette.selected as isize + delta)
+            .clamp(0, self.chat.palette.matches.len() as isize - 1)
+            as usize;
+    }
+
+    /// Populate the slash-command popup while the input starts with '/'.
+    /// Offers the chat-only commands plus everything in the command palette
+    /// (all runnable from chat via the '/' prefix).
+    fn refresh_chat_palette(&mut self) {
+        const CHAT_COMMANDS: &[(&str, &str, &str)] = &[
+            ("agents", "List chat-addressable targets", "agents"),
+            (
+                "approve",
+                "Approve the pending orchestrator proposal",
+                "approve",
+            ),
+            (
+                "deny [reason]",
+                "Deny the pending orchestrator proposal",
+                "deny ",
+            ),
+            (
+                "confirm-kill",
+                "Approve a pending kill request",
+                "confirm-kill",
+            ),
+            ("deny-kill", "Refuse a pending kill request", "deny-kill"),
+        ];
+        let Some(rest) = self.chat.input.strip_prefix('/') else {
+            self.chat.palette = PaletteState::default();
+            return;
+        };
+        let query = rest.trim().to_lowercase();
+        let mut matches: Vec<(i32, PaletteEntry)> = CHAT_COMMANDS
+            .iter()
+            .chain(COMMAND_PALETTE.iter())
+            .filter_map(|(template, summary, insert)| {
+                fuzzy_score(&query, &template.to_lowercase()).map(|score| {
+                    (
+                        score,
+                        PaletteEntry {
+                            template: format!("/{}", template),
+                            summary: (*summary).into(),
+                            insert: format!("/{}", insert),
+                        },
+                    )
+                })
+            })
+            .collect();
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.template.cmp(&b.1.template)));
+        self.chat.palette.matches = matches.into_iter().map(|(_, entry)| entry).collect();
+        self.chat.palette.selected = self
+            .chat
+            .palette
+            .selected
+            .min(self.chat.palette.matches.len().saturating_sub(1));
+    }
+
+    fn chat_history_prev(&mut self) {
+        if self.chat.history.is_empty() {
+            return;
+        }
+        let pos = match self.chat.history_pos {
+            None => {
+                self.chat.history_draft = self.chat.input.clone();
+                self.chat.history.len() - 1
+            }
+            Some(p) => p.saturating_sub(1),
+        };
+        self.chat.history_pos = Some(pos);
+        self.chat.input = self.chat.history[pos].clone();
+        self.chat.cursor = self.chat.input.len();
+    }
+
+    fn chat_history_next(&mut self) {
+        let Some(p) = self.chat.history_pos else {
+            return;
+        };
+        if p + 1 < self.chat.history.len() {
+            self.chat.history_pos = Some(p + 1);
+            self.chat.input = self.chat.history[p + 1].clone();
+        } else {
+            self.chat.history_pos = None;
+            self.chat.input = std::mem::take(&mut self.chat.history_draft);
+        }
+        self.chat.cursor = self.chat.input.len();
     }
 
     pub fn chat_scroll_up(&mut self, lines: usize) {
@@ -4420,6 +4551,8 @@ impl App {
             .collect();
         self.chat.input.insert_str(self.chat.cursor, &cleaned);
         self.chat.cursor += cleaned.len();
+        self.chat.history_pos = None;
+        self.refresh_chat_palette();
     }
 
     fn chat_system(&mut self, text: impl Into<String>) {
@@ -4441,9 +4574,15 @@ impl App {
         self.chat.cursor = 0;
         self.chat.scroll = 0;
         let raw = raw.trim().to_string();
+        self.chat.palette = PaletteState::default();
         if raw.is_empty() {
             return;
         }
+        if self.chat.history.last() != Some(&raw) {
+            self.chat.history.push(raw.clone());
+        }
+        self.chat.history_pos = None;
+        self.chat.history_draft.clear();
 
         if raw == "/agents" {
             let mut targets: Vec<String> = Vec::new();
@@ -6444,6 +6583,92 @@ mod tests {
         app.undock_chat();
         assert_eq!(app.chat_docked, None);
         assert_eq!(app.panes, vec![Some(0)]);
+    }
+
+    fn chat_press(app: &mut App, code: crossterm::event::KeyCode) {
+        app.chat_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    #[test]
+    fn chat_home_end_delete_edit_the_input() {
+        use crossterm::event::KeyCode;
+        let mut app = make_app();
+        app.chat.input = "hello".into();
+        app.chat.cursor = 3;
+
+        chat_press(&mut app, KeyCode::Home);
+        assert_eq!(app.chat.cursor, 0);
+        chat_press(&mut app, KeyCode::Delete);
+        assert_eq!(app.chat.input, "ello");
+        chat_press(&mut app, KeyCode::End);
+        assert_eq!(app.chat.cursor, 4);
+        chat_press(&mut app, KeyCode::Delete); // at end: no-op
+        assert_eq!(app.chat.input, "ello");
+    }
+
+    #[test]
+    fn chat_up_down_recall_history_and_restore_the_draft() {
+        use crossterm::event::KeyCode;
+        let mut app = make_app();
+        app.chat.input = "first".into();
+        app.chat_send();
+        app.chat.input = "second".into();
+        app.chat_send();
+
+        app.chat.input = "draft".into();
+        app.chat.cursor = 5;
+        chat_press(&mut app, KeyCode::Up);
+        assert_eq!(app.chat.input, "second");
+        chat_press(&mut app, KeyCode::Up);
+        assert_eq!(app.chat.input, "first");
+        chat_press(&mut app, KeyCode::Up); // at oldest: stays
+        assert_eq!(app.chat.input, "first");
+        chat_press(&mut app, KeyCode::Down);
+        assert_eq!(app.chat.input, "second");
+        chat_press(&mut app, KeyCode::Down);
+        assert_eq!(app.chat.input, "draft", "leaving history restores draft");
+
+        // Sending the same line twice records it once.
+        app.chat.input = "second".into();
+        app.chat_send();
+        assert_eq!(app.chat.history, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn chat_slash_opens_a_filtering_palette_and_tab_completes() {
+        use crossterm::event::KeyCode;
+        let mut app = make_app();
+        assert!(app.chat.palette.matches.is_empty());
+
+        for c in "/agen".chars() {
+            chat_press(&mut app, KeyCode::Char(c));
+        }
+        assert!(app
+            .chat
+            .palette
+            .matches
+            .iter()
+            .any(|m| m.template == "/agents"));
+
+        // Narrow to the top match and complete it.
+        app.chat.palette.selected = 0;
+        chat_press(&mut app, KeyCode::Tab);
+        assert!(app.chat.input.starts_with('/'));
+        assert_eq!(app.chat.cursor, app.chat.input.len());
+
+        // With the palette open, Up/Down move the selection, not history.
+        let before = app.chat.input.clone();
+        chat_press(&mut app, KeyCode::Down);
+        assert_eq!(app.chat.input, before);
+
+        // Deleting back past '/' closes the palette.
+        app.chat.input.clear();
+        app.chat.cursor = 0;
+        chat_press(&mut app, KeyCode::Char('h'));
+        assert!(app.chat.palette.matches.is_empty());
     }
 
     #[test]
