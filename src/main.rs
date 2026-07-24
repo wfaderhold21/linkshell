@@ -858,6 +858,23 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.chat_key(key);
                 return;
             }
+            // Full-screen agent TUIs (claude, codex) ignore the terminal's
+            // PageUp/PageDown sequences, so route those keys to linkshell's
+            // captured scrollback — the same history the mouse wheel scrolls.
+            // Shells and other alt-screen apps (vim, less) still get the keys.
+            if key.modifiers.is_empty() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                let agent_alt_screen = app.active_session().is_some_and(|s| {
+                    s.kind.captures_alt_scrollback() && s.screen.screen().alternate_screen()
+                });
+                if agent_alt_screen {
+                    if key.code == KeyCode::PageUp {
+                        app.scroll_up(20);
+                    } else {
+                        app.scroll_down(20);
+                    }
+                    return;
+                }
+            }
             // Pass through to PTY
             let bytes = key_to_bytes(&key);
             if !bytes.is_empty() {
@@ -1251,7 +1268,19 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
                 return vec![b];
             }
             let mut buf = [0u8; 4];
-            c.encode_utf8(&mut buf).as_bytes().to_vec()
+            let encoded = c.encode_utf8(&mut buf).as_bytes();
+            // Alt+char must keep its ESC prefix. Without this, an Escape
+            // keypress followed quickly by a character (vim users leaving
+            // insert mode: Esc then `:wq`) gets merged by crossterm into
+            // Alt+char and the Escape silently vanishes — vim never leaves
+            // insert mode and the command text lands in the buffer.
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                let mut v = Vec::with_capacity(1 + encoded.len());
+                v.push(27);
+                v.extend_from_slice(encoded);
+                return v;
+            }
+            encoded.to_vec()
         }
         // Shift+Enter: ESC [ 13 ; 2 u (kitty/xterm extended)
         KeyCode::Enter => {
@@ -1564,6 +1593,18 @@ fn parse_tcp_flag() -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_char_keeps_its_escape_prefix() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        // Esc followed quickly by a char is delivered by crossterm as
+        // Alt+char; the PTY must see ESC then the char, not a bare char.
+        let key = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::ALT);
+        assert_eq!(key_to_bytes(&key), vec![27, b':']);
+
+        let plain = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE);
+        assert_eq!(key_to_bytes(&plain), vec![b':']);
+    }
 
     #[test]
     fn transient_terminal_errors_are_retried() {

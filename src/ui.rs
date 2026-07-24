@@ -173,7 +173,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         0
     };
     let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + previews + orch_row;
-    let status_rows = desired_status_rows.min((body.height / 3).max(4));
+    let capped = desired_status_rows.min((body.height / 3).max(4));
+    // Hysteresis so a flapping WAITING preview row can't oscillate the
+    // pane layout (and with it the sessions' PTY sizes).
+    let status_rows = app
+        .stabilized_status_rows(capped)
+        .min((body.height / 3).max(4));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
