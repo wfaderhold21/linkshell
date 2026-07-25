@@ -20,11 +20,27 @@ pub enum Transport {
     Tcp,
 }
 
+/// Whether this platform lets us verify a Unix peer's uid (SO_PEERCRED).
+///
+/// The tokenless "same-uid peer is the operator" shortcut is only sound when
+/// this holds. On platforms where it doesn't, a connecting process is anonymous
+/// and must present a token like any TCP client — otherwise anything that can
+/// reach the socket is handed `operator_caps()`, which includes `InjectInput`
+/// and `CreateSession`, i.e. arbitrary command execution as the user.
+pub const PEER_UID_VERIFIED: bool = cfg!(target_os = "linux");
+
 fn runtime_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+            // /run/user/<uid> is a Linux (systemd) convention. Falling back to
+            // it unconditionally meant the default socket path could not be
+            // created at all on macOS/BSD, where TMPDIR is the equivalent.
+            if cfg!(target_os = "linux") {
+                std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+            } else {
+                std::env::temp_dir()
+            }
         });
     let dir = base.join("linkshell");
     let _ = std::fs::create_dir_all(&dir);
@@ -60,16 +76,16 @@ pub fn spawn_listener(tx: mpsc::Sender<AppEvent>, config: Arc<Config>) {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         eprintln!("[linkshell] IPC socket: {}", path);
         write_last_socket(&path);
+        if !PEER_UID_VERIFIED {
+            eprintln!(
+                "[ipc] warning: SO_PEERCRED unavailable on this platform; \
+                 tokenless clients will be rejected"
+            );
+        }
         while let Ok((stream, _)) = listener.accept().await {
             #[cfg(target_os = "linux")]
             if peer_uid(&stream).ok() != Some(unsafe { libc::getuid() }) {
                 continue;
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                eprintln!(
-                    "[ipc] warning: SO_PEERCRED unavailable on this platform, skipping uid check"
-                );
             }
             let tx = tx.clone();
             let (r, w) = stream.into_split();

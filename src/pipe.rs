@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -7,6 +7,9 @@ use tokio::task::JoinHandle;
 use crate::config::Config;
 use crate::events::AppEvent;
 use crate::session::Session;
+
+/// Wall-clock bound on a pipe's summarize request, covering connect + response.
+const SUMMARIZE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub enum ExtractMode {
@@ -146,7 +149,13 @@ async fn summarize_for_relay(
     max_tokens: u32,
     config: &Config,
 ) -> anyhow::Result<String> {
-    let client = reqwest::Client::new();
+    // reqwest has no default timeout, so an unresponsive endpoint would wedge
+    // this relay indefinitely. The orchestrator paths already set one
+    // per-request; this is a short summarize of a bounded amount of text, so it
+    // gets a tighter bound.
+    let client = reqwest::Client::builder()
+        .timeout(SUMMARIZE_TIMEOUT)
+        .build()?;
     let auth = crate::config::AnthropicAuth::from_env().ok_or_else(|| {
         anyhow::anyhow!("no Anthropic credentials (set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)")
     })?;

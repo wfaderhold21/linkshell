@@ -297,8 +297,8 @@ mod tests {
 
     #[test]
     fn minted_tokens_are_32_hex_chars_and_unique() {
-        let a = crate::auth::mint_token();
-        let b = crate::auth::mint_token();
+        let a = crate::auth::mint_token().unwrap();
+        let b = crate::auth::mint_token().unwrap();
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
