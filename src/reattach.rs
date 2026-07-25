@@ -279,11 +279,62 @@ pub fn open_server_log() -> Option<std::fs::File> {
 
 // ── Relay client: `linkshell -r` / `linkshell --reattach` ─────────────────
 
+/// Put the terminal back the way we found it. Idempotent and infallible by
+/// design — every step is best-effort because the callers that need it most
+/// (panic hook, signal handler) cannot propagate an error anywhere useful.
+fn restore_terminal(kitty: bool) {
+    use crossterm::{event::DisableMouseCapture, execute, terminal::disable_raw_mode};
+
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    if kitty {
+        // The server pushes kitty flags on our terminal; pop them in case the
+        // server-side restore didn't reach us (crash, abort).
+        use crossterm::event::PopKeyboardEnhancementFlags;
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+}
+
+/// Await a signal, or never resolve if the stream failed to register. Keeps the
+/// `select!` arms below uniform. `Signal::recv` is cancel-safe, so rebuilding
+/// this future each loop iteration loses nothing.
+async fn wait_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Install a panic hook that restores the terminal before the panic report is
+/// printed.
+///
+/// Without this, a panic anywhere in the client — or in the server-side render
+/// path, which surfaces here as a dropped relay — leaves the user's shell in
+/// raw mode inside the alternate screen with mouse reporting on: no echo, no
+/// visible prompt, and escape garbage on every keystroke, recoverable only by
+/// a blind `reset`. Restoring first also means the panic message lands on the
+/// normal screen where it can actually be read and reported.
+fn install_terminal_panic_hook(kitty: bool) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal(kitty);
+        previous(info);
+    }));
+}
+
 pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
     use crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture},
+        event::{self, EnableMouseCapture},
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen},
     };
 
     // ── Find the detached session ─────────────────────────────────────────
@@ -357,24 +408,15 @@ pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
     // screen / mouse capture / kitty-push sequences over the relay on attach,
     // but we enter the alternate screen locally too so there is no flash of
     // shell content between connect and the server's first frame.
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-
-    let restore = move || {
-        let _ = disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        if kitty {
-            // The server pushes kitty flags on our terminal; pop them in case
-            // the server-side restore didn't reach us (crash, abort).
-            use crossterm::event::PopKeyboardEnhancementFlags;
-            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-        }
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            crossterm::cursor::Show
-        );
-    };
+    // Arm the hook before we take over the screen, so every path from here on
+    // is covered.
+    install_terminal_panic_hook(kitty);
+    if let Err(e) = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        // Raw mode is already on from the kitty probe; don't hand the user back
+        // a half-configured terminal.
+        restore_terminal(kitty);
+        return Err(e.into());
+    }
 
     // ── Task A: server terminal bytes → our stdout ────────────────────────
     let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
@@ -415,6 +457,13 @@ pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
     });
 
     // ── Main relay pump ───────────────────────────────────────────────────
+    // SIGTERM/SIGHUP would otherwise kill us mid-alternate-screen and leave the
+    // terminal wrecked; treat them as an ordinary detach so `restore` runs.
+    // Registration failure is not worth aborting an otherwise healthy attach,
+    // and bailing here with `?` would skip the restore.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    let mut sighup = signal(SignalKind::hangup()).ok();
     loop {
         tokio::select! {
             data = ev_rx.recv() => {
@@ -428,11 +477,40 @@ pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
                 }
             }
             _ = done_rx.recv() => break,
+            _ = wait_signal(sigterm.as_mut()) => break,
+            _ = wait_signal(sighup.as_mut()) => break,
         }
     }
 
-    restore();
+    restore_terminal(kitty);
+
+    // NOTE: the event-reader task is still parked in a blocking `event::read()`
+    // on stdin and cannot be cancelled. Dropping the tokio runtime — which is
+    // what returning from `main` does — waits for blocking tasks that have
+    // already started, so the caller must `exit_after_detach` rather than fall
+    // off the end of `main`, or the process hangs here until the user presses
+    // one more key (which the dying reader then swallows).
     Ok(())
+}
+
+/// Terminate the client process, bypassing the tokio runtime shutdown that
+/// would otherwise block on the parked stdin reader described above.
+///
+/// Nothing in the client owns unflushed state — stdout is flushed on every
+/// relay write and the terminal restore executes synchronously — so this is
+/// only skipping a wait we don't want.
+pub fn exit_after_detach(result: anyhow::Result<()>) -> ! {
+    use std::io::Write;
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("linkshell: {:#}", e);
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code)
 }
 
 /// Encode a crossterm Event as a compact JSON line for the relay protocol.

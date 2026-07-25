@@ -59,12 +59,26 @@ pub fn council_caps() -> CapSet {
     [Capability::SignalState].into_iter().collect()
 }
 
-pub fn mint_token() -> String {
+/// Mint a 128-bit capability token, hex-encoded.
+///
+/// Fails closed: if the system CSPRNG is unavailable the error is propagated
+/// rather than swallowed. Swallowing it (the previous `.ok()`) left `buf` at
+/// its zero initializer, so every token became 32 zeros — a fully predictable
+/// credential. That is reachable in practice: a container or bubblewrap
+/// sandbox with no `/dev` bound, a seccomp filter, or fd exhaustion all make
+/// the open/read fail while the process otherwise runs fine.
+pub fn mint_token() -> std::io::Result<String> {
     let mut buf = [0u8; 16];
     // /dev/urandom keeps the dep surface at zero; swap for `getrandom` if preferred.
     use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .ok();
-    buf.iter().map(|b| format!("{:02x}", b)).collect()
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    // Defence in depth: a short read can't get here (read_exact errors), but an
+    // all-zero buffer would be indistinguishable from the old bug, so reject it.
+    if buf.iter().all(|&b| b == 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CSPRNG returned all zero bytes",
+        ));
+    }
+    Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())
 }

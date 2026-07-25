@@ -738,6 +738,10 @@ impl App {
             return Err(anyhow::anyhow!("Maximum {} sessions reached", MAX_SESSIONS));
         }
 
+        // Mint before touching any state: a CSPRNG failure must not leave a
+        // half-registered session behind (next_id bumped, pane slot claimed).
+        let token = crate::auth::mint_token()?;
+
         let id = self.next_id;
         self.next_id += 1;
 
@@ -785,7 +789,6 @@ impl App {
         // to the human and keep full operator rights (so orchestrator scripts
         // run inside a linkshell shell can manage pipes / create sessions);
         // AI agent sessions are confined to worker capabilities.
-        let token = crate::auth::mint_token();
         self.tokens.insert(token.clone(), id);
         let caps = if matches!(kind, SessionKind::Shell) {
             crate::auth::operator_caps()
@@ -2650,7 +2653,10 @@ impl App {
             } else {
                 None
             }
-        } else if transport == Transport::Unix {
+        } else if transport == Transport::Unix && crate::ipc::PEER_UID_VERIFIED {
+            // Tokenless peers are trusted only because SO_PEERCRED already
+            // confirmed they run as us. Where that check is unavailable the
+            // connection is anonymous, so it falls through to the reject below.
             if name.as_ref().map(|n| !n.is_empty()).unwrap_or(false) {
                 match self.spawn_headless_session(name.unwrap_or_default(), group) {
                     Ok(id) => {
@@ -2664,7 +2670,7 @@ impl App {
                 Some((None, crate::auth::operator_caps()))
             }
         } else {
-            // TCP with no token → reject
+            // TCP with no token, or a Unix peer we cannot attribute → reject.
             None
         };
 
@@ -4394,7 +4400,7 @@ impl App {
     }
 
     pub fn chat_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
         match key.code {
             KeyCode::Esc => {
                 self.chat_selection = None;
@@ -4458,7 +4464,14 @@ impl App {
             }
             KeyCode::PageUp => self.chat_scroll_up(10),
             KeyCode::PageDown => self.chat_scroll_down(10),
-            KeyCode::Char(c) => {
+            // Only bare/shifted characters are text. crossterm reports Ctrl+C as
+            // Char('c') with CONTROL set, so an unguarded arm typed a literal
+            // "c" into the message — likewise "u" for Ctrl+U, "w" for Ctrl+W.
+            // Matching the guard already used by search mode in main.rs.
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 self.chat.input.insert(self.chat.cursor, c);
                 self.chat.cursor += c.len_utf8();
                 self.chat.history_pos = None;
@@ -6678,6 +6691,28 @@ mod tests {
         app.chat.input = "second".into();
         app.chat_send();
         assert_eq!(app.chat.history, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn chat_ignores_control_and_alt_chords_instead_of_typing_them() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        for c in "hi".chars() {
+            chat_press(&mut app, KeyCode::Char(c));
+        }
+
+        // crossterm reports these as Char(_) with a modifier set. Inserting them
+        // put a literal "c"/"u"/"b" into the message.
+        app.chat_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.chat_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.chat_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.chat.input, "hi");
+        assert_eq!(app.chat.cursor, 2);
+
+        // Shifted characters are still ordinary text.
+        app.chat_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(app.chat.input, "hiX");
+        assert_eq!(app.chat.cursor, app.chat.input.len());
     }
 
     #[test]

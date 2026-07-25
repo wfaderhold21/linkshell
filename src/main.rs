@@ -122,7 +122,7 @@ async fn attach_existing(requested: Option<String>) -> anyhow::Result<()> {
             "[linkshell] detached — sessions keep running; run `linkshell -r {id}` to reattach"
         );
     }
-    result
+    reattach::exit_after_detach(result)
 }
 
 /// Spawn a fresh detached server with a new session id, then attach the relay
@@ -161,7 +161,7 @@ async fn launch_and_attach(name: Option<String>) -> anyhow::Result<()> {
             "[linkshell] detached — sessions keep running; run `linkshell -r {id}` to reattach"
         );
     }
-    result
+    reattach::exit_after_detach(result)
 }
 
 /// Spawn `linkshell --server` as a daemon: new session (setsid) so it has no
@@ -310,7 +310,7 @@ async fn run_server() -> anyhow::Result<()> {
         std::env::var("LINKSHELL_SESSION_ID").unwrap_or_else(|_| reattach::new_session_id());
     let session_name = std::env::var("LINKSHELL_SESSION_NAME").unwrap_or_default();
     let ipc_socket_path = ipc::socket_path(&config);
-    let reattach_token = auth::mint_token();
+    let reattach_token = auth::mint_token()?;
     let reattach_socket_path = reattach::reattach_socket_from_ipc(&ipc_socket_path);
     reattach::write_session_entry(&reattach::SessionEntry {
         id: session_id.clone(),
@@ -958,7 +958,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Backspace => {
                 app.new_session_backspace();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 app.new_session_input(c);
             }
             _ => {}
@@ -1010,7 +1013,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::End => {
                 app.command_cursor_end();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 app.command_input_char(c);
             }
             _ => {}
@@ -1214,7 +1220,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     }
                     app.mode = AppMode::CommandResult;
                 }
-                KeyCode::Char(c) if app.settings_state.editing => {
+                KeyCode::Char(c)
+                    if app.settings_state.editing
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
                     let cursor = app.settings_state.edit_cursor;
                     app.settings_state.edit_buf.insert(cursor, c);
                     app.settings_state.edit_cursor += c.len_utf8();

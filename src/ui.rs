@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -138,8 +138,23 @@ fn state_border_style(state: &SessionState, active: bool) -> Style {
     }
 }
 
+/// Smallest terminal the main layout can be solved for: the vertical split
+/// below asks for a 5-row main pane, a 3-row session bar and a status panel of
+/// at least 4 rows. Under that, ratatui's solver starts handing back
+/// zero-height rects and the geometry arithmetic downstream has nothing valid
+/// to work from.
+const MIN_ROWS: u16 = 12;
+const MIN_COLS: u16 = 20;
+
 pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let size = f.size();
+    if size.height < MIN_ROWS || size.width < MIN_COLS {
+        draw_too_small(f, size);
+        // An empty LayoutInfo is safe: every consumer either iterates these
+        // vectors or length-checks before indexing, so hit-testing simply finds
+        // nothing until the terminal is large enough to lay out again.
+        return LayoutInfo::default();
+    }
     let menu_open = matches!(app.mode, AppMode::Menu { .. });
     let mut menu_bar_area = Rect::default();
     let mut menu_item_areas = Vec::new();
@@ -1651,8 +1666,23 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
 
 // ── Command bar ────────────────────────────────────────────────────────────
 
+/// How many rows the command palette popup may occupy: at most 8 entries, and
+/// never more than the rows left above the one-row command bar.
+///
+/// The clamp against `area_height` is the load-bearing part. Without it the
+/// caller's `area.y + area.height - 1 - match_count` wrapped the u16 on any
+/// terminal shorter than the match list (8 matches needed 9 rows), producing a
+/// y of ~65530 and a panic inside ratatui's buffer indexing.
+fn palette_popup_rows(match_len: usize, area_height: u16) -> u16 {
+    let rows_above_bar = area_height.saturating_sub(1);
+    (match_len.min(8) as u16).min(rows_above_bar)
+}
+
 fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
-    let match_count = app.palette.matches.len().min(8) as u16;
+    if area.height == 0 || area.width == 0 {
+        return Rect::default();
+    }
+    let match_count = palette_popup_rows(app.palette.matches.len(), area.height);
     if match_count > 0 {
         let popup = Rect {
             x: area.x,
@@ -1665,7 +1695,7 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
             .palette
             .matches
             .iter()
-            .take(8)
+            .take(match_count as usize)
             .enumerate()
             .map(|(index, entry)| {
                 let style = if index == app.palette.selected {
@@ -2164,8 +2194,37 @@ fn build_row_line(
     Line::from(spans)
 }
 
+/// Fallback frame for terminals below the minimum layout size. Deliberately
+/// uses no arithmetic on the area beyond ratatui's own clipping.
+fn draw_too_small(f: &mut Frame<'_>, size: Rect) {
+    f.render_widget(Clear, size);
+    let text = vec![
+        Line::from(Span::styled(
+            "terminal too small",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{}x{} — need {}x{}",
+                size.width, size.height, MIN_COLS, MIN_ROWS
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        size,
+    );
+}
+
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
-    let w = r.width * percent_x / 100;
+    // Widen to u32 for the percentage: `r.width * percent_x` overflows u16 past
+    // 655 columns, which is reachable on a wide display at a small font size.
+    let w = ((r.width as u32 * percent_x as u32) / 100).min(r.width as u32) as u16;
     let x = r.x + (r.width - w) / 2;
     let y = r.y + (r.height.saturating_sub(height)) / 2;
     Rect {
@@ -2179,6 +2238,46 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_popup_never_claims_rows_it_does_not_have() {
+        // Normal case: one row per match, bar keeps its own row.
+        assert_eq!(palette_popup_rows(5, 40), 5);
+        // Capped at 8 entries regardless of match count.
+        assert_eq!(palette_popup_rows(200, 40), 8);
+        // Exactly enough room for 8 matches plus the bar.
+        assert_eq!(palette_popup_rows(8, 9), 8);
+        // One row short: the bar wins, the popup gives one up.
+        assert_eq!(palette_popup_rows(8, 8), 7);
+        // Degenerate heights must not wrap or panic.
+        assert_eq!(palette_popup_rows(8, 1), 0);
+        assert_eq!(palette_popup_rows(8, 0), 0);
+    }
+
+    #[test]
+    fn palette_popup_y_offset_stays_in_range_at_every_height() {
+        // Guards the exact expression in draw_command_bar:
+        //   y = area.y + area.height - 1 - match_count
+        for height in 1..=64u16 {
+            let count = palette_popup_rows(64, height);
+            assert!(
+                height > count,
+                "height {} would underflow with {} popup rows",
+                height,
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn centered_rect_survives_terminals_wider_than_655_columns() {
+        // r.width * percent_x overflowed u16 above 655 columns.
+        let r = Rect::new(0, 0, 1200, 40);
+        let full = centered_rect(100, 10, r);
+        assert_eq!((full.x, full.width), (0, 1200));
+        let half = centered_rect(50, 10, r);
+        assert_eq!((half.x, half.width), (300, 600));
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
