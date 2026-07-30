@@ -173,24 +173,15 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 
     // ── Top-level vertical split ───────────────────────────────────────────
     // main output | session bar | status panel
-    let previews = app
-        .sessions
-        .iter()
-        .filter(|session| {
-            !session.hidden
-                && session.state == SessionState::Waiting
-                && session.waiting_prompt.is_some()
-        })
-        .count() as u16;
     let orch_row = if app.orchestrator.is_some() || app.orchestrator_session_id.is_some() {
         1u16
     } else {
         0
     };
-    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + previews + orch_row;
+    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + orch_row;
     let capped = desired_status_rows.min((body.height / 3).max(4));
-    // Hysteresis so a flapping WAITING preview row can't oscillate the
-    // pane layout (and with it the sessions' PTY sizes).
+    // Hysteresis so a changing row count can't oscillate the pane layout
+    // (and with it the sessions' PTY sizes).
     let status_rows = app
         .stabilized_status_rows(capped)
         .min((body.height / 3).max(4));
@@ -772,28 +763,6 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
         let line = Paragraph::new(Line::from(spans));
         f.render_widget(line, row);
-        if session.state == SessionState::Waiting {
-            if let Some(prompt) = &session.waiting_prompt {
-                if row_y < inner.y + inner.height {
-                    let preview = Rect {
-                        x: inner.x,
-                        y: row_y,
-                        width: inner.width,
-                        height: 1,
-                    };
-                    f.render_widget(
-                        Paragraph::new(Line::styled(
-                            format!("    ↳ {prompt}"),
-                            Style::default()
-                                .fg(Color::Gray)
-                                .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                        )),
-                        preview,
-                    );
-                    row_y += 1;
-                }
-            }
-        }
     }
 
     // Orchestrator agent row — after the session rows so the returned click

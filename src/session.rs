@@ -252,6 +252,16 @@ pub struct Session {
     pub ipc_state: bool,
     /// When ipc_state was last set; used to expire stale overrides in handle_tick.
     pub ipc_state_set_at: Option<Instant>,
+    /// The current WAITING state came from terminal pattern matching (a
+    /// permission dialog / question on screen), not from a watcher or IPC.
+    /// Dialogs are invisible to the JSONL/db watchers, so this state has to
+    /// survive their Running/Thinking reports — but it must also be *given
+    /// up* once the dialog is gone, or the session parks on WAITING forever.
+    pub pattern_waiting: bool,
+    /// Last state reported by an authoritative source (JSONL/db watcher or an
+    /// IPC `state` message). Restored when a pattern-derived WAITING clears,
+    /// so the session doesn't fall back to a stale terminal-scraped guess.
+    pub watcher_state: Option<SessionState>,
     /// Agent group for broadcast addressing and group-triggered pipes.
     pub group: Option<String>,
     /// vt100 screen buffer — updated with raw PTY bytes, used for display
@@ -355,6 +365,8 @@ impl Session {
             paused: false,
             ipc_state: false,
             ipc_state_set_at: None,
+            pattern_waiting: false,
+            watcher_state: None,
             group: None,
             screen: vt100::Parser::new(rows, cols, 1000),
             stats: TokenStats::default(),
@@ -378,22 +390,20 @@ impl Session {
         }
     }
 
-    /// Feed raw PTY bytes into the vt100 screen. Returns `true` if the visible
-    /// frame changed as a result — callers use this to skip redundant redraws
-    /// for full-screen TUIs that repaint with byte-identical output.
-    pub fn process_bytes(&mut self, data: &[u8]) -> bool {
+    /// Feed raw PTY bytes into the vt100 screen. When `detect_change`, returns
+    /// `true` if the visible frame changed as a result — callers use this to
+    /// skip redundant redraws for full-screen TUIs that repaint with
+    /// byte-identical output. The check hashes the whole formatted screen, so
+    /// callers that cannot act on the answer (off-screen sessions) pass `false`
+    /// and always get `false` back.
+    pub fn process_bytes(&mut self, data: &[u8], detect_change: bool) -> bool {
         use std::hash::{Hash, Hasher};
 
         // Capture top-line snapshot BEFORE processing, if this session kind
         // supports alt-screen scrollback capture and we're on the alternate screen.
         let prev_top =
             if self.kind.captures_alt_scrollback() && self.screen.screen().alternate_screen() {
-                self.screen
-                    .screen()
-                    .contents()
-                    .lines()
-                    .next()
-                    .map(|s| s.trim_end().trim_end_matches('\t').to_string())
+                self.top_row()
             } else {
                 None
             };
@@ -403,13 +413,7 @@ impl Session {
 
         // After processing, check if content scrolled (top row changed)
         if let Some(ref prev) = prev_top {
-            let current_top: Option<String> = self
-                .screen
-                .screen()
-                .contents()
-                .lines()
-                .next()
-                .map(|s| s.trim_end().trim_end_matches('\t').to_string());
+            let current_top: Option<String> = self.top_row();
 
             // If the top line changed, content scrolled upward. The old top row
             // was pushed off-screen — capture it for scrollback.
@@ -428,6 +432,11 @@ impl Session {
                 }
             }
         }
+        if !detect_change {
+            // Leave last_screen_hash stale on purpose: the first chunk after the
+            // session becomes visible again then reads as changed and redraws.
+            return false;
+        }
         // contents_formatted is exactly what the display path renders from, so
         // an unchanged hash means the next frame would be pixel-identical.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -436,6 +445,18 @@ impl Session {
         let changed = hash != self.last_screen_hash;
         self.last_screen_hash = hash;
         changed
+    }
+
+    /// Text of the screen's top row. `Screen::rows` is a lazy iterator, so this
+    /// renders one row — unlike `contents()`, which builds the entire screen
+    /// into a String and was being called twice per PTY chunk.
+    fn top_row(&self) -> Option<String> {
+        let cols = self.screen.screen().size().1;
+        self.screen
+            .screen()
+            .rows(0, cols)
+            .next()
+            .map(|s| s.trim_end().trim_end_matches('\t').to_string())
     }
 
     pub fn resize_screen(&mut self, rows: u16, cols: u16) {
@@ -473,6 +494,58 @@ impl Session {
         let start = lines.len().saturating_sub(n);
         lines.drain(..start);
         lines
+    }
+
+    /// Apply a state inferred from terminal output.
+    ///
+    /// Terminal patterns are the only source that can see permission dialogs
+    /// and questions, so WAITING/ERROR from them outrank a watcher's
+    /// Running/Thinking. The flip side is that a pattern WAITING must release
+    /// as soon as the screen stops showing the dialog — otherwise a session
+    /// whose watcher never reports another *change* parks on WAITING forever.
+    ///
+    /// Callers working from partial lines drop RUNNING before calling: there,
+    /// "non-empty text" is too weak a signal to declare a session running.
+    pub fn apply_pattern_state(&mut self, new_state: SessionState) {
+        match new_state {
+            SessionState::Waiting | SessionState::Error => {
+                self.pattern_waiting = new_state == SessionState::Waiting;
+                self.state = new_state;
+            }
+            // Ready/Thinking are positive evidence that the dialog is gone.
+            // RUNNING is not: a repaint of an unrelated screen region also
+            // reads as RUNNING, and clearing on that flickers the dialog away.
+            SessionState::Ready | SessionState::Thinking if self.pattern_waiting => {
+                self.pattern_waiting = false;
+                self.state = self.watcher_state.clone().unwrap_or(new_state);
+            }
+            _ if !self.ipc_state => {
+                self.pattern_waiting = false;
+                self.state = new_state;
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a state from an authoritative source (JSONL/db watcher or IPC).
+    /// Returns false if the report was *suppressed* rather than applied.
+    /// Running/Thinking are recorded
+    /// but not shown while a pattern-detected dialog is up — the watcher cannot
+    /// see the dialog, and the CLI is genuinely mid-turn *and* blocked on the
+    /// user. Any other report (Ready/Error/Dead/an explicit Waiting) means the
+    /// dialog is resolved or superseded.
+    pub fn apply_watcher_state(&mut self, new_state: SessionState) -> bool {
+        self.watcher_state = Some(new_state.clone());
+        self.ipc_state = true;
+        self.ipc_state_set_at = Some(Instant::now());
+        if self.pattern_waiting
+            && matches!(new_state, SessionState::Running | SessionState::Thinking)
+        {
+            return false;
+        }
+        self.pattern_waiting = false;
+        self.state = new_state;
+        true
     }
 
     /// State text for display and reporting: paused sessions read PAUSED
@@ -575,6 +648,14 @@ impl Session {
         if advances {
             self.stats = new;
         }
+    }
+
+    /// Note that input was sent to this session. Whatever dialog the screen was
+    /// showing has now been answered, so a pattern-detected WAITING must stop
+    /// outranking watcher reports — otherwise the session reads WAITING for the
+    /// whole tool run that follows the approval.
+    pub fn note_input_sent(&mut self) {
+        self.pattern_waiting = false;
     }
 
     /// Non-blocking send to PTY; silently drops if channel is full or closed
@@ -772,7 +853,7 @@ mod tests {
         let mut s = session(SessionKind::Claude);
         // TUI-style output: enter the alternate screen, then paint with
         // cursor positioning — no newline-terminated lines ever arrive.
-        s.process_bytes(b"\x1b[?1049h\x1b[1;1Hfirst row\x1b[2;1Hsecond row");
+        s.process_bytes(b"\x1b[?1049h\x1b[1;1Hfirst row\x1b[2;1Hsecond row", true);
         assert!(s.output_lines.is_empty());
 
         let tail = s.read_tail(50);
@@ -814,7 +895,7 @@ mod tests {
     fn process_bytes_updates_vt100_screen_and_tick_counter() {
         let mut s = session(SessionKind::Shell);
 
-        s.process_bytes(b"hello");
+        s.process_bytes(b"hello", true);
 
         assert_eq!(s.bytes_since_last_tick, 5);
         assert_eq!(s.screen.screen().contents().trim(), "hello");
@@ -825,11 +906,70 @@ mod tests {
         let mut s = session(SessionKind::Shell);
 
         // First paint changes the (blank) screen.
-        assert!(s.process_bytes(b"hello"));
+        assert!(s.process_bytes(b"hello", true));
         // Re-emitting an identical frame (as full-screen TUIs do) is a no-op.
-        assert!(!s.process_bytes(b"\x1b[1;1Hhello"));
+        assert!(!s.process_bytes(b"\x1b[1;1Hhello", true));
         // Actual new content changes the frame again.
-        assert!(s.process_bytes(b" world"));
+        assert!(s.process_bytes(b" world", true));
+    }
+
+    #[test]
+    fn process_bytes_skips_change_detection_when_asked() {
+        let mut s = session(SessionKind::Shell);
+
+        // Off-screen sessions never report a change (nothing could redraw)...
+        assert!(!s.process_bytes(b"hello", false));
+        // ...and the first check after becoming visible sees the difference.
+        assert!(s.process_bytes(b"", true));
+    }
+
+    #[test]
+    fn pattern_waiting_outranks_watcher_until_the_dialog_clears() {
+        let mut s = session(SessionKind::OpenCode);
+
+        // A watcher owns the ordinary states.
+        assert!(s.apply_watcher_state(SessionState::Running));
+        assert_eq!(s.state, SessionState::Running);
+
+        // A dialog the watcher cannot see takes over...
+        s.apply_pattern_state(SessionState::Waiting);
+        assert_eq!(s.state, SessionState::Waiting);
+
+        // ...and survives further mid-turn watcher reports, and RUNNING
+        // repaints of unrelated screen regions.
+        assert!(!s.apply_watcher_state(SessionState::Running));
+        assert_eq!(s.state, SessionState::Waiting);
+        s.apply_pattern_state(SessionState::Running);
+        assert_eq!(s.state, SessionState::Waiting);
+
+        // An idle prompt on screen releases it, restoring the watcher's view.
+        s.apply_pattern_state(SessionState::Ready);
+        assert_eq!(s.state, SessionState::Running);
+        assert!(!s.pattern_waiting);
+    }
+
+    #[test]
+    fn watcher_ready_releases_a_stale_pattern_waiting() {
+        let mut s = session(SessionKind::OpenCode);
+        s.apply_watcher_state(SessionState::Running);
+        s.apply_pattern_state(SessionState::Waiting);
+
+        // The turn finished, so the dialog is answered no matter what the
+        // (repaint-noisy) screen still shows.
+        assert!(s.apply_watcher_state(SessionState::Ready));
+        assert_eq!(s.state, SessionState::Ready);
+        assert!(!s.pattern_waiting);
+    }
+
+    #[test]
+    fn pattern_states_apply_freely_without_a_watcher() {
+        let mut s = session(SessionKind::Aider);
+
+        s.apply_pattern_state(SessionState::Waiting);
+        assert_eq!(s.state, SessionState::Waiting);
+        // No watcher state to fall back on: a complete RUNNING line clears it.
+        s.apply_pattern_state(SessionState::Running);
+        assert_eq!(s.state, SessionState::Running);
     }
 
     #[test]
@@ -1062,17 +1202,20 @@ mod tests {
             80,
             100,
         );
-        s.process_bytes(b"\x1b[?1049h\x1b[HLine A\r\nLine B\r\nLine C\r\nLine D\r\nLine E");
+        s.process_bytes(
+            b"\x1b[?1049h\x1b[HLine A\r\nLine B\r\nLine C\r\nLine D\r\nLine E",
+            true,
+        );
         assert!(s.output_lines.is_empty());
 
         // Scroll up by 1: Line A leaves the top, everything shifts up
-        s.process_bytes(b"\x1b[1S");
+        s.process_bytes(b"\x1b[1S", true);
 
         assert_eq!(s.output_lines.len(), 1);
         assert_eq!(s.output_lines.front().unwrap(), "Line A");
 
         // Scroll up by 1 more: Line B leaves the top
-        s.process_bytes(b"\x1b[1S");
+        s.process_bytes(b"\x1b[1S", true);
 
         assert_eq!(s.output_lines.len(), 2);
         assert_eq!(s.output_lines.get(1).unwrap(), "Line B");
@@ -1089,10 +1232,10 @@ mod tests {
             80,
             100,
         );
-        s.process_bytes(b"\x1b[?1049h\x1b[HHeader\r\nBody 1\r\nFooter");
+        s.process_bytes(b"\x1b[?1049h\x1b[HHeader\r\nBody 1\r\nFooter", true);
 
         // Repaint with same top line (TUI re-rendering) — should NOT add to output_lines
-        s.process_bytes(b"\x1b[HHeader\r\nBody 1\r\nFooter");
+        s.process_bytes(b"\x1b[HHeader\r\nBody 1\r\nFooter", true);
         assert!(s.output_lines.is_empty());
     }
 
@@ -1107,7 +1250,7 @@ mod tests {
             80,
             100,
         );
-        s.process_bytes(b"hello world\n");
+        s.process_bytes(b"hello world\n", true);
         assert!(s.output_lines.is_empty());
     }
 }

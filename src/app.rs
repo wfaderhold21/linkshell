@@ -1023,6 +1023,10 @@ impl App {
         // A stopped process can't react to the PTY closing; continue it first
         // so it actually dies instead of lingering as a stopped orphan.
         let _ = self.sessions[idx].set_paused(false);
+        // Retire the OpenCode db watcher so it releases its claim on the db
+        // session — otherwise it keeps taking it from the next opencode
+        // started in the same directory.
+        crate::opencode_log::stop_watcher(self.sessions[idx].id);
         // Drop the PTY write channel so the background task exits
         self.sessions[idx].pty_writer = None;
         self.sessions.remove(idx);
@@ -1361,15 +1365,21 @@ impl App {
     /// especially) repaint continuously with byte-identical frames — gating on
     /// real change keeps the 60 fps render loop off the CPU while idle.
     pub fn handle_session_bytes(&mut self, session_id: usize, data: Vec<u8>) -> bool {
-        let mut changed = false;
-        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            changed = session.process_bytes(&data);
-        }
+        // Only an on-screen session can warrant a redraw, so decide visibility
+        // first and let off-screen sessions skip the screen-diff hash entirely —
+        // that hash renders the whole formatted screen, and background TUIs
+        // (opencode) repaint often enough for it to dominate CPU time.
+        //
         // While the user is scrolled up, hold their position (tmux-style)
         // instead of yanking to the tail on every output burst — full-screen
         // TUIs redraw constantly, which previously made scrollback unusable
         // for them. Typing returns to the live view (see clear_scroll).
-        changed && self.session_is_visible(session_id)
+        let visible = self.session_is_visible(session_id);
+        let mut changed = false;
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            changed = session.process_bytes(&data, visible);
+        }
+        changed
     }
 
     pub fn handle_session_output(&mut self, session_id: usize, line: String) {
@@ -1395,11 +1405,7 @@ impl App {
                 // When JSONL is active it owns Thinking/Running/Ready transitions, but it
                 // cannot see permission prompts or question text, so Waiting and Error must
                 // still come from terminal pattern matching.
-                if !session.ipc_state
-                    || matches!(new_state, SessionState::Waiting | SessionState::Error)
-                {
-                    session.state = new_state;
-                }
+                session.apply_pattern_state(new_state);
             }
             if state_before.as_ref() != Some(&session.state) {
                 session.waiting_prompt = if session.state == SessionState::Waiting {
@@ -1738,11 +1744,8 @@ impl App {
                 // flip to Running — that requires a complete line.
                 // Even with JSONL active, Waiting and Error must pass through because
                 // JSONL has no record for permission prompts or question text.
-                if new_state != SessionState::Running
-                    && (!session.ipc_state
-                        || matches!(new_state, SessionState::Waiting | SessionState::Error))
-                {
-                    session.state = new_state;
+                if new_state != SessionState::Running {
+                    session.apply_pattern_state(new_state);
                 }
             }
             if state_before.as_ref() != Some(&session.state) {
@@ -1782,14 +1785,17 @@ impl App {
             .find(|s| s.id == session_id)
             .map(|s| s.state.clone());
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            session.state = state.clone();
-            session.waiting_prompt = if state == SessionState::Waiting {
+            // A pattern-detected permission dialog outranks a watcher's
+            // Running/Thinking (see apply_watcher_state), so the reported state
+            // is not always the visible one.
+            if !session.apply_watcher_state(state.clone()) {
+                return;
+            }
+            session.waiting_prompt = if session.state == SessionState::Waiting {
                 extract_waiting_prompt(&session.output_lines)
             } else {
                 None
             };
-            session.ipc_state = true;
-            session.ipc_state_set_at = Some(std::time::Instant::now());
         }
         if old.as_ref() != Some(&state) {
             match old {
@@ -2733,26 +2739,30 @@ impl App {
                 if expired {
                     session.ipc_state = false;
                     session.ipc_state_set_at = None;
+                    session.pattern_waiting = false;
                     let before = session.state.clone();
                     session.state = SessionState::Ready;
                     tick_ready.push((session.id, before));
                 }
             }
             if !session.ipc_state {
-                if let Some(last) = session.last_output_at {
-                    let elapsed = last.elapsed();
-                    if (elapsed > Duration::from_secs(2)
-                        && matches!(
-                            session.state,
-                            SessionState::Running | SessionState::Thinking
-                        ))
-                        || (elapsed > Duration::from_secs(30)
-                            && session.state == SessionState::Waiting)
-                    {
-                        let before = session.state.clone();
-                        session.state = SessionState::Ready;
-                        tick_ready.push((session.id, before));
-                    }
+                // Fall back to the launch time: a full-screen TUI can repaint
+                // for its whole life without ever completing a line, leaving
+                // last_output_at unset — and the session parked on the
+                // STARTING/RUNNING it was born with.
+                let last = session.last_output_at.unwrap_or(session.started_at);
+                let elapsed = last.elapsed();
+                if (elapsed > Duration::from_secs(2)
+                    && matches!(
+                        session.state,
+                        SessionState::Running | SessionState::Thinking
+                    ))
+                    || (elapsed > Duration::from_secs(30) && session.state == SessionState::Waiting)
+                {
+                    let before = session.state.clone();
+                    session.pattern_waiting = false;
+                    session.state = SessionState::Ready;
+                    tick_ready.push((session.id, before));
                 }
             }
         }
@@ -4208,18 +4218,16 @@ impl App {
         // Typing returns the view to the live tail.
         self.clear_scroll();
         if self.broadcast_mode {
-            let ids: Vec<usize> = self
+            for s in self
                 .sessions
-                .iter()
+                .iter_mut()
                 .filter(|s| s.state != SessionState::Dead)
-                .map(|s| s.id)
-                .collect();
-            for id in ids {
-                if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
-                    s.write_bytes(data.to_vec());
-                }
+            {
+                s.note_input_sent();
+                s.write_bytes(data.to_vec());
             }
-        } else if let Some(session) = self.active_session() {
+        } else if let Some(session) = self.active_session_mut() {
+            session.note_input_sent();
             session.write_bytes(data.to_vec());
         }
     }
@@ -4850,7 +4858,7 @@ impl App {
                 }
             },
         };
-        let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
+        let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) else {
             return;
         };
         if s.state != SessionState::Waiting {
@@ -4869,6 +4877,7 @@ impl App {
             (_, true) => b"y\r",
             (_, false) => b"n\r",
         };
+        s.note_input_sent();
         s.write_bytes(bytes.to_vec());
         let name = s.name.clone();
         if self.last_permission_request == Some(id) {
@@ -5566,6 +5575,13 @@ async fn run_pty(
     let mut reader = read_half;
     let mut buf = [0u8; 4096];
     let mut pending = String::new();
+    // Last partial we sent for state inference, and when. A repainting TUI
+    // re-emits the same tail 50 times a second; re-inferring from identical
+    // text costs an ANSI strip plus a regex sweep each time and can only
+    // produce the same answer. Unchanged text is still re-sent once a second so
+    // a state the app changed elsewhere (an expired override) gets corrected.
+    let mut last_partial = String::new();
+    let mut last_partial_at = std::time::Instant::now();
 
     loop {
         match tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut buf))
@@ -5595,6 +5611,7 @@ async fn run_pty(
                 pending.push_str(&String::from_utf8_lossy(&data));
                 let (complete, partial) = split_pty_lines(&pending);
                 pending = partial;
+                truncate_pending(&mut pending);
                 for line in complete {
                     if tx
                         .send(AppEvent::SessionOutput { session_id, line })
@@ -5606,8 +5623,14 @@ async fn run_pty(
                 }
             }
             Ok(Err(_)) => break,
-            // Timeout: update current-line display without adding to the line buffer
+            // Timeout: re-infer state from the unterminated tail, which is
+            // where a TUI's prompts and dialogs live.
             Err(_) => {
+                if pending == last_partial
+                    && last_partial_at.elapsed() < std::time::Duration::from_secs(1)
+                {
+                    continue;
+                }
                 if tx
                     .send(AppEvent::SessionCurrentLine {
                         session_id,
@@ -5618,12 +5641,38 @@ async fn run_pty(
                 {
                     return Ok(());
                 }
+                last_partial.clone_from(&pending);
+                last_partial_at = std::time::Instant::now();
             }
         }
     }
 
     let _ = tx.send(AppEvent::SessionDied { session_id }).await;
     Ok(())
+}
+
+/// Cap on the unterminated tail the PTY reader carries between chunks.
+///
+/// Full-screen TUIs (opencode above all) repaint via cursor positioning and can
+/// run for minutes without emitting a single newline or carriage return, so the
+/// partial buffer grows without bound — and it is cloned, ANSI-stripped and
+/// regex-scanned every 20ms for state inference, which turns into an
+/// ever-worsening CPU burn (measured climbing past 20% of a core on one idle
+/// opencode session). Only the tail is meaningful for inferring the state of
+/// what's on screen now, so drop the rest. Big enough to hold a repainted
+/// permission dialog, which Claude sends as one blob.
+const MAX_PENDING_BYTES: usize = 8 * 1024;
+
+/// Trim `pending` to the last [`MAX_PENDING_BYTES`], on a char boundary.
+fn truncate_pending(pending: &mut String) {
+    if pending.len() <= MAX_PENDING_BYTES {
+        return;
+    }
+    let mut cut = pending.len() - MAX_PENDING_BYTES;
+    while cut < pending.len() && !pending.is_char_boundary(cut) {
+        cut += 1;
+    }
+    pending.drain(..cut);
 }
 
 /// Split PTY bytes into complete lines and a leftover partial.
@@ -6023,6 +6072,41 @@ mod tests {
         app.handle_session_output(id, "$ ".into());
         assert_eq!(app.sessions[0].state, SessionState::Ready);
         assert_eq!(app.sessions[0].waiting_prompt, None);
+    }
+
+    #[test]
+    fn watched_session_holds_waiting_through_the_turn_then_releases_on_ready() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+
+        // A db/JSONL watcher owns the ordinary states.
+        app.handle_ipc_state(id, SessionState::Running);
+        // A permission dialog only the terminal can see.
+        app.handle_session_output(id, "Should I apply this change? [y/n]".into());
+        assert_eq!(app.sessions[0].state, SessionState::Waiting);
+
+        // The watcher keeps reporting the in-flight turn; the dialog wins.
+        app.handle_ipc_state(id, SessionState::Running);
+        assert_eq!(app.sessions[0].state, SessionState::Waiting);
+
+        // Once the turn completes, the dialog is stale and WAITING is released
+        // — without this the session parked on WAITING indefinitely.
+        app.handle_ipc_state(id, SessionState::Ready);
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+        assert_eq!(app.sessions[0].waiting_prompt, None);
+    }
+
+    #[test]
+    fn answering_a_dialog_lets_watcher_states_flow_again() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+        app.handle_ipc_state(id, SessionState::Running);
+        app.handle_session_output(id, "Should I apply this change? [y/n]".into());
+        assert_eq!(app.sessions[0].state, SessionState::Waiting);
+
+        app.sessions[0].note_input_sent();
+        app.handle_ipc_state(id, SessionState::Running);
+        assert_eq!(app.sessions[0].state, SessionState::Running);
     }
 
     #[test]
@@ -7071,6 +7155,30 @@ mod tests {
     }
 
     #[test]
+    fn truncate_pending_bounds_a_newline_less_repaint_stream() {
+        let mut pending = String::new();
+        // A TUI repainting via cursor positioning, never ending a line.
+        for i in 0..4000 {
+            pending.push_str(&format!("\x1b[H\x1b[2Jframe {i}"));
+            truncate_pending(&mut pending);
+        }
+        assert!(pending.len() <= MAX_PENDING_BYTES);
+        // The newest frame is what state inference needs, and it survives.
+        assert!(pending.ends_with("frame 3999"));
+
+        // Multi-byte characters are never split mid-sequence.
+        let mut wide = "→".repeat(MAX_PENDING_BYTES);
+        truncate_pending(&mut wide);
+        assert!(wide.len() <= MAX_PENDING_BYTES);
+        assert!(wide.chars().all(|c| c == '→'));
+
+        // Short buffers are left exactly as they are.
+        let mut short = "❯ 1. Yes".to_string();
+        truncate_pending(&mut short);
+        assert_eq!(short, "❯ 1. Yes");
+    }
+
+    #[test]
     fn split_pty_lines_handles_lf_crlf_bare_cr_and_deferred_cr() {
         let (lines, pending) = split_pty_lines("one\ntwo\r\nspinner 1\rspinner 2\r");
         assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
@@ -7216,7 +7324,7 @@ mod tests {
                 s.push_output_line(format!("history-{}", i));
             }
             // Enter the alternate screen, like claude/codex/opencode do.
-            s.process_bytes(b"\x1b[?1049h");
+            s.process_bytes(b"\x1b[?1049h", true);
             assert!(s.screen.screen().alternate_screen());
         }
         // Scrolling a full-screen app walks our captured history…
