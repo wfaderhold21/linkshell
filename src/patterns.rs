@@ -36,8 +36,15 @@ impl PatternMatcher {
                 r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|(?i)\b(thinking|working|generating|reasoning)\b\.\.\.|esc to interrupt|ctrl\+c to interrupt",
             )
             .unwrap(),
-            // idle prompt markers used by local agent TUIs and llama-cli
-            local_ready: Regex::new(r"^[>❯]\s*$|^\(\S+\)>\s*$").unwrap(),
+            // Idle prompt markers used by local agent TUIs and llama-cli.
+            // Border-tolerant and multi-line for the same reason as
+            // claude_waiting: opencode draws its input box with `│` edges, so
+            // its idle prompt is `│ > │`, not a bare `>` on its own line. That
+            // Ready signal is what releases a stale pattern WAITING.
+            local_ready: Regex::new(
+                r"(?m)^\s*[│┃|]?\s*[>❯]\s*[│┃|]?\s*$|^\s*\(\S+\)>\s*$",
+            )
+            .unwrap(),
             // opencode permission dialog ("△ Permission required" with
             // Allow once / Allow always / Reject options) and aider's
             // (Y)es/(N)o confirmation prompts.
@@ -53,8 +60,15 @@ impl PatternMatcher {
             // list) — none of which the legacy y/n markers match. The ❯
             // selector before a numbered item is required so ordinary
             // numbered lists in Claude's prose don't read as dialogs.
+            //
+            // Those menus are drawn inside a rounded box, so every line arrives
+            // prefixed by a `│` border — and because Claude repaints via cursor
+            // positioning rather than newlines, several of them arrive in one
+            // partial-line blob. Hence `(?m)` plus a border-tolerant start
+            // anchor; a plain `^\s*` matched neither case and dialogs went
+            // undetected.
             claude_waiting: Regex::new(
-                r"\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?|proceed\?|^\s*❯\s*\d+\.\s|(?i)^\s*do you want\b|(?i)don't ask again",
+                r"(?m)\[y/n\]|\[Y/n\]|\(yes/no\)|Press Enter|continue\?|proceed\?|(?:^|[│┃|])\s*❯\s*\d+\.\s|(?i)(?:^|[│┃|])\s*do you want\b|(?i)don't ask again",
             )
             .unwrap(),
             codex_ready: Regex::new(r"codex>\s*$|>\s*$").unwrap(),
@@ -407,6 +421,61 @@ mod tests {
         assert_eq!(
             matcher.infer_state("⠙ working... esc to interrupt", BaseKind::LocalAgent),
             Some(SessionState::Thinking)
+        );
+    }
+
+    #[test]
+    fn claude_dialogs_inside_a_box_border_are_waiting() {
+        let matcher = PatternMatcher::new();
+
+        // Claude Code draws permission dialogs in a rounded box, so each line
+        // reaches us behind a `│`, and the whole box often arrives as a single
+        // repaint blob with no line of its own.
+        for line in [
+            "│ Do you want to make this edit to app.rs?                    │",
+            "│ ❯ 1. Yes                                                    │",
+            "│   2. Yes, and don't ask again this session                   │",
+        ] {
+            assert_eq!(
+                matcher.infer_state(line, BaseKind::Claude),
+                Some(SessionState::Waiting),
+                "{line}"
+            );
+        }
+
+        let blob = "╭──────────────────────╮\n\
+                    │ Edit file            │\n\
+                    │ Do you want to edit? │\n\
+                    │ ❯ 1. Yes             │\n\
+                    ╰──────────────────────╯";
+        assert_eq!(
+            matcher.infer_state(blob, BaseKind::Claude),
+            Some(SessionState::Waiting)
+        );
+
+        // Prose that merely mentions a numbered plan is still not a dialog.
+        assert_eq!(
+            matcher.infer_state("│ 1. First, refactor the parser │", BaseKind::Claude),
+            Some(SessionState::Running)
+        );
+    }
+
+    #[test]
+    fn local_agent_boxed_input_prompt_is_ready() {
+        let matcher = PatternMatcher::new();
+
+        // opencode's input box: the idle prompt sits between border glyphs.
+        for line in ["│ >                          │", "│ ❯   │", "> "] {
+            assert_eq!(
+                matcher.infer_state(line, BaseKind::LocalAgent),
+                Some(SessionState::Ready),
+                "{line}"
+            );
+        }
+        // A line with real content next to the prompt is not an idle prompt.
+        assert_eq!(
+            matcher.infer_state("│ > fix the parser │", BaseKind::LocalAgent),
+            Some(SessionState::Running)
         );
     }
 

@@ -4,6 +4,7 @@
 /// `session` table and per-message usage JSON on the `message` table; the
 /// latest assistant message's input-side tokens reflect the current context
 /// window size.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,18 +31,86 @@ fn open_db(path: &Path) -> Option<Connection> {
     Some(conn)
 }
 
+/// Which linkshell session each OpenCode db session is bound to. Two linkshell
+/// sessions running `opencode` in the same directory would otherwise both bind
+/// to the newest db session and report identical tokens/context/state.
+static CLAIMS: std::sync::Mutex<Option<HashMap<String, usize>>> = std::sync::Mutex::new(None);
+
+fn claims() -> std::sync::MutexGuard<'static, Option<HashMap<String, usize>>> {
+    let mut guard = CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashMap::new);
+    guard
+}
+
+/// Claim `db_session` for `owner`, unless another linkshell session holds it.
+fn claim(db_session: &str, owner: usize) -> bool {
+    let mut guard = claims();
+    let map = guard.as_mut().expect("initialized by claims()");
+    match map.get(db_session) {
+        Some(held) if *held != owner => false,
+        _ => {
+            map.retain(|_, held| *held != owner);
+            map.insert(db_session.to_string(), owner);
+            true
+        }
+    }
+}
+
+fn release(owner: usize) {
+    let mut guard = claims();
+    guard
+        .as_mut()
+        .expect("initialized by claims()")
+        .retain(|_, held| *held != owner);
+}
+
+/// linkshell sessions whose watcher should stop. Watcher threads outlive their
+/// session otherwise (they only notice the app shutting down), and a leaked one
+/// keeps re-claiming the newest db session away from a freshly started
+/// OpenCode in the same directory. Session ids are never reused, so retired
+/// entries stay valid for the life of the server.
+static RETIRED: std::sync::Mutex<Option<HashSet<usize>>> = std::sync::Mutex::new(None);
+
+/// Stop the watcher bound to a linkshell session, if any. Called when the
+/// session goes away.
+pub fn stop_watcher(owner: usize) {
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(owner);
+    release(owner);
+}
+
+fn is_retired(owner: usize) -> bool {
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&owner))
+}
+
 /// Most recently active top-level OpenCode session in `dir` touched since
-/// `since_ms` (epoch millis). Subagent sessions carry a parent_id and are
-/// excluded — the TUI's status line reflects the parent session.
-fn find_session(conn: &Connection, dir: &str, since_ms: i64) -> Option<String> {
-    conn.query_row(
-        "SELECT id FROM session \
-         WHERE directory = ?1 AND parent_id IS NULL AND time_updated >= ?2 \
-         ORDER BY time_updated DESC LIMIT 1",
-        rusqlite::params![dir, since_ms],
-        |row| row.get(0),
-    )
-    .ok()
+/// `since_ms` (epoch millis) and not already claimed by another linkshell
+/// session. Subagent sessions carry a parent_id and are excluded — the TUI's
+/// status line reflects the parent session.
+fn find_session(conn: &Connection, dir: &str, since_ms: i64, owner: usize) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM session \
+             WHERE directory = ?1 AND parent_id IS NULL AND time_updated >= ?2 \
+             ORDER BY time_updated DESC LIMIT ?3",
+        )
+        .ok()?;
+    let candidates: Vec<String> = stmt
+        .query_map(
+            rusqlite::params![dir, since_ms, crate::session::MAX_SESSIONS as i64],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?
+        .flatten()
+        .collect();
+    candidates.into_iter().find(|id| claim(id, owner))
 }
 
 /// The session.model column holds JSON like
@@ -224,7 +293,7 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
         let mut last_state: Option<SessionState> = None;
         let mut state_sent_at = std::time::Instant::now();
 
-        while !tx.is_closed() {
+        'watch: while !tx.is_closed() && !is_retired(session_id) {
             std::thread::sleep(Duration::from_millis(1000));
 
             if conn.is_none() {
@@ -236,23 +305,26 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
             let Some(c) = conn.as_ref() else { continue };
 
             // Re-query the binding each poll: the user can switch sessions
-            // inside the OpenCode TUI, and the newest active one wins.
-            if let Some(id) = find_session(c, &dir, since_ms) {
+            // inside the OpenCode TUI, and the newest active one we can claim
+            // wins.
+            if let Some(id) = find_session(c, &dir, since_ms, session_id) {
                 bound = Some(id);
             }
             let Some(id) = bound.as_ref() else { continue };
 
             // State first: it must flow even before any tokens are recorded
             // (read_stats bails on all-zero sessions).
-            // Re-assert an unchanged Ready every 30s: ipc_state overrides
-            // expire (ipc_state_override_timeout_secs, default 60s), and once
-            // one lapses the pattern path could re-park an idle session on
-            // Thinking from TUI redraw noise. Only Ready is refreshed —
-            // re-asserting Running would stomp a pattern-detected Waiting
-            // (permission dialog) that the DB can't see.
+            // Re-assert the current state every REFRESH_SECS: ipc_state
+            // overrides expire (ipc_state_override_timeout_secs, default 60s),
+            // and once one lapses the pattern path could re-park an idle
+            // session on Thinking from TUI redraw noise. The refresh is also
+            // the only thing that releases a stale pattern-detected WAITING
+            // (Session::apply_watcher_state holds WAITING against a
+            // Running/Thinking report but yields to Ready), so it must be
+            // frequent enough not to strand the session for a visible while.
+            const REFRESH_SECS: u64 = 5;
             if let Some(state) = read_latest_state(c, id) {
-                let refresh = state == SessionState::Ready
-                    && state_sent_at.elapsed() > Duration::from_secs(30);
+                let refresh = state_sent_at.elapsed() > Duration::from_secs(REFRESH_SECS);
                 if last_state.as_ref() != Some(&state) || refresh {
                     if tx
                         .blocking_send(AppEvent::IpcStateOverride {
@@ -261,7 +333,7 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
                         })
                         .is_err()
                     {
-                        return;
+                        break 'watch;
                     }
                     last_state = Some(state);
                     state_sent_at = std::time::Instant::now();
@@ -281,7 +353,7 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
                         })
                         .is_err()
                     {
-                        return;
+                        break 'watch;
                     }
                     last_provider = Some(provider);
                 }
@@ -296,7 +368,7 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
                         })
                         .is_err()
                     {
-                        return;
+                        break 'watch;
                     }
                     last_model = Some(model);
                 }
@@ -310,11 +382,12 @@ pub fn spawn_watcher(session_id: usize, cwd: String, tx: tokio::sync::mpsc::Send
                     })
                     .is_err()
                 {
-                    return;
+                    break 'watch;
                 }
                 last_stats = Some(stats);
             }
         }
+        release(session_id);
     });
 }
 
@@ -361,20 +434,55 @@ mod tests {
         .unwrap();
     }
 
+    // CLAIMS is process-global, so each test uses its own owner ids and its own
+    // db session ids to stay independent under the parallel test runner.
     #[test]
     fn finds_newest_top_level_session_in_directory() {
         let conn = test_db();
-        insert_session(&conn, "ses_old", "/home/u/proj", None, 100);
-        insert_session(&conn, "ses_new", "/home/u/proj", None, 200);
-        insert_session(&conn, "ses_sub", "/home/u/proj", Some("ses_new"), 300);
-        insert_session(&conn, "ses_other", "/home/u/other", None, 400);
+        insert_session(&conn, "a_old", "/home/u/proj", None, 100);
+        insert_session(&conn, "a_new", "/home/u/proj", None, 200);
+        insert_session(&conn, "a_sub", "/home/u/proj", Some("a_new"), 300);
+        insert_session(&conn, "a_other", "/home/u/other", None, 400);
 
         assert_eq!(
-            find_session(&conn, "/home/u/proj", 150).as_deref(),
-            Some("ses_new")
+            find_session(&conn, "/home/u/proj", 150, 900).as_deref(),
+            Some("a_new")
+        );
+        // Re-binding the same owner keeps the same session, not the runner-up.
+        assert_eq!(
+            find_session(&conn, "/home/u/proj", 150, 900).as_deref(),
+            Some("a_new")
         );
         // Nothing active since the launch timestamp → no binding.
-        assert!(find_session(&conn, "/home/u/proj", 250).is_none());
+        assert!(find_session(&conn, "/home/u/proj", 250, 900).is_none());
+        release(900);
+    }
+
+    #[test]
+    fn two_watchers_in_one_directory_bind_to_different_sessions() {
+        let conn = test_db();
+        insert_session(&conn, "b_old", "/home/u/two", None, 100);
+        insert_session(&conn, "b_new", "/home/u/two", None, 200);
+
+        assert_eq!(
+            find_session(&conn, "/home/u/two", 50, 910).as_deref(),
+            Some("b_new")
+        );
+        assert_eq!(
+            find_session(&conn, "/home/u/two", 50, 911).as_deref(),
+            Some("b_old")
+        );
+        // A third has nothing left to claim rather than duplicating a binding.
+        assert!(find_session(&conn, "/home/u/two", 50, 912).is_none());
+
+        // Retiring the first watcher frees its session for the newcomer.
+        stop_watcher(910);
+        assert_eq!(
+            find_session(&conn, "/home/u/two", 50, 912).as_deref(),
+            Some("b_new")
+        );
+        release(911);
+        release(912);
     }
 
     #[test]

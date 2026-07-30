@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fixed two OpenCode sessions in the same directory reporting identical tokens, context and state: both watchers bound to the newest db session in that directory. Each watcher now claims a distinct one, and releases it when its session goes away.
+- Fixed OpenCode sessions getting stuck on WAITING indefinitely. A permission dialog is only visible to terminal pattern matching, so it has to outrank the db watcher's Running/Thinking — but it was never given up, and the watcher only re-reported on a *change*. WAITING now releases when the dialog leaves the screen, when input is sent to the session, or when the watcher reports the turn finished (now re-asserted every 5s rather than 30s).
+- Fixed a freshly started full-screen TUI session (OpenCode) sitting on RUNNING forever: the idle-timeout check keyed off the last completed output line, which a TUI that repaints via cursor positioning never produces.
+- Fixed ever-worsening CPU burn from full-screen TUI sessions — around 20% of a core per idle OpenCode session and still climbing. The PTY reader's unterminated-line buffer had no bound, and a TUI can repaint for minutes without a newline, so the buffer grew without limit while being ANSI-stripped and regex-scanned every 20ms. The tail is now capped, unchanged tails are not re-scanned, and off-screen sessions skip the screen-change hash.
+- Fixed Claude permission dialogs not being detected as WAITING: the dialog is drawn inside a box, so every line arrives behind a `│` border, and the whole box often arrives as one blob with no newlines — neither of which the start-anchored patterns matched.
+- Removed the WAITING preview row under a waiting session in the status panel; the WAITING state itself is unchanged.
 - Capability tokens are no longer minted from a silently-failed CSPRNG read. If `/dev/urandom` could not be opened or read the error was discarded and the buffer kept its zero initializer, so every token became 32 zeros — a predictable credential for reattach and for TCP agents. `mint_token` now propagates the failure, which surfaces as a session-spawn error rather than a weak token. Most likely to have bitten agents run inside a container or bubblewrap sandbox with no `/dev` bound.
 - A panic no longer leaves the terminal unusable. The relay client installs a panic hook that leaves the alternate screen, disables raw mode and mouse reporting, and pops kitty flags before the panic report prints, so the message lands on the normal screen instead of a shell with no echo. `SIGTERM`/`SIGHUP` are now handled the same way as a detach rather than killing the client mid-alternate-screen.
 - Fixed a crash when the command bar's slash-command popup was open on a short terminal: the popup claimed one row per match (up to 8) without checking how many rows were left above the bar, underflowing the row calculation and panicking inside ratatui's buffer indexing. The popup now yields rows to the bar, and terminals below 20x12 render a "terminal too small" placeholder instead of attempting a layout the solver can't satisfy.
@@ -11,7 +17,7 @@
 - A pipe's `Summarize` relay no longer stalls indefinitely against an unresponsive endpoint; the request now carries a 60s timeout, matching the bounds the orchestrator paths already set.
 - Fixed Escape keypresses being swallowed when followed quickly by another key (crossterm merges them into Alt+char): the ESC prefix is now forwarded to the PTY. Most visible in vim, where Esc then `:wq` typed fast left the session in insert mode with `:wq` inserted into the buffer.
 - `PageUp`/`PageDown` now scroll linkshell's captured scrollback in claude/codex panes (matching the mouse wheel) instead of being sent to the TUI, which ignored them.
-- Fixed the whole UI shaking when a codex session flapped in and out of WAITING: the status panel's waiting-preview row now shrinks with a few seconds of hysteresis, breaking the resize→repaint→state-flap feedback loop.
+- Fixed the whole UI shaking when a codex session flapped in and out of WAITING: the status panel now shrinks with a few seconds of hysteresis, breaking the resize→repaint→state-flap feedback loop.
 - Fixed missing token/context stats for resumed codex sessions (`codex resume` or the in-TUI picker): the rollout watcher now also picks up a pre-existing rollout file that starts being written after the session spawns.
 - Chat pane input: `Home`/`End`/`Delete` now work; `Up`/`Down` recall previously sent messages (draft preserved); typing `/` as the first character opens a filtering command popup (`Up`/`Down` select, `Tab` completes).
 - Added recursive split panes: any pane can be split side by side (`alt-\`) or top/bottom (`alt--`), repeatedly and in any direction, for arbitrary tiled layouts. `alt-w` closes the focused pane (its sibling reclaims the space), `alt-r` rotates a split, `alt-o` cycles focus. Replaces the previous two-pane toggle; keybinding actions are now `split_pane_right`, `split_pane_down`, `close_pane`, `rotate_split`, `focus_next_pane`.
@@ -21,6 +27,6 @@
 - Added split panes with independent focus and PTY sizing.
 - Added a fuzzy command palette and session-name completion.
 - Added pipe topology summaries and an interactive `pipes` overlay.
-- Added WAITING previews and debounced desktop notifications.
+- Added debounced desktop notifications.
 - Added diagnostics, recipes, and configuration documentation.
 
