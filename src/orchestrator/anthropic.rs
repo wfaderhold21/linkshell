@@ -37,6 +37,7 @@ pub async fn run_turn(
     cfg: &OrchestratorConfig,
     client: &reqwest::Client,
     history: &mut Vec<serde_json::Value>,
+    calls: &mut super::CallLog,
     user_text: &str,
     event_tx: &mpsc::Sender<AppEvent>,
     interrupt: &mut super::Interrupt,
@@ -136,7 +137,7 @@ pub async fn run_turn(
                     super::INTERRUPTED_RESULT.to_string()
                 } else {
                     tokio::select! {
-                        r = super::exec_tool(cfg, event_tx, name, &b["input"]) => r,
+                        r = super::exec_tool(cfg, event_tx, calls, name, &b["input"]) => r,
                         _ = interrupt.wait() => {
                             interrupted = true;
                             super::INTERRUPTED_RESULT.to_string()

@@ -2472,8 +2472,36 @@ impl App {
                         .insert(session_id, (response_tx, line_offset));
                     return; // reply arrives via check_ipc_replies on READY
                 }
-                s.write_bytes(shape_injected_input(&text));
-                serde_json::json!({"ok": true})
+                // Fire-and-forget, but never a bare {"ok": true}: an
+                // unconditional success is indistinguishable from a send into
+                // a paused or dead session, so the model cannot tell a no-op
+                // from a real action and retries. Report what is knowable
+                // synchronously and point at wait_ready for the rest.
+                if s.paused {
+                    serde_json::json!({
+                        "error": "session is paused (SIGSTOP); resume_session first — \
+                                  input would sit unread in the terminal buffer",
+                        "session_id": session_id
+                    })
+                } else if s.state_label().eq_ignore_ascii_case("dead") {
+                    serde_json::json!({
+                        "error": "session is dead; input was not sent",
+                        "session_id": session_id
+                    })
+                } else {
+                    let before = s.output_lines.len();
+                    s.write_bytes(shape_injected_input(&text));
+                    serde_json::json!({
+                        "ok": true,
+                        "session_id": session_id,
+                        "state_at_send": s.state_label(),
+                        "output_lines_at_send": before,
+                        "note": "input was written to the terminal; this is not \
+                                 confirmation it was accepted or acted on. Use \
+                                 wait_ready=true, or read_output later and compare \
+                                 against output_lines_at_send, to verify."
+                    })
+                }
             }
             OrchestratorReq::PipeAdd {
                 source,

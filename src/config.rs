@@ -112,6 +112,11 @@ pub struct OrchestratorConfig {
     /// Lines of session output inlined into a [linkshell event]
     /// notification. The orchestrator can always read_output for more.
     pub event_tail_lines: usize,
+    /// Seconds during which an identical (tool, arguments) call is answered
+    /// with a duplicate_call error instead of being re-executed. Bounds the
+    /// cross-turn loops that max_tool_iterations (per-turn) cannot see.
+    /// 0 disables.
+    pub tool_dedup_secs: u64,
     /// Cap on lines returned by send_input wait_ready / `input --wait`.
     /// Longer replies are truncated to the last N lines with a marker.
     /// 0 disables.
@@ -156,6 +161,7 @@ impl Default for OrchestratorConfig {
             max_context_tokens: 60_000,
             tool_result_keep_turns: 3,
             event_tail_lines: 5,
+            tool_dedup_secs: 45,
             wait_ready_max_lines: 80,
         }
     }

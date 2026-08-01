@@ -111,3 +111,5 @@ are `source`, `dest`, `trigger`, `extract`, and `prefix`.
 
 Local LLMs require `endpoint` and `model`; `system` and `api_key` are optional.
 
+
+- `tool_dedup_secs` (default `45`) — repeat-call suppression window for the orchestrator's tools. `0` disables.

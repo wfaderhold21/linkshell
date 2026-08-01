@@ -67,6 +67,61 @@ impl Interrupt {
     }
 }
 
+/// Cross-turn repeat-call suppressor.
+///
+/// `max_tool_iterations` bounds a single turn; nothing bounds the *sequence*
+/// of turns, so a flapping session can drive the model through the same tool
+/// call indefinitely. The log remembers recent (name, args) pairs and turns
+/// an exact repeat into a tool result that says so — which is information the
+/// model can act on, rather than a silent loop.
+pub(crate) struct CallLog {
+    seen: Vec<(u64, std::time::Instant)>,
+    window: std::time::Duration,
+}
+
+impl CallLog {
+    pub(crate) fn new(window_secs: u64) -> Self {
+        Self {
+            seen: Vec::new(),
+            window: std::time::Duration::from_secs(window_secs),
+        }
+    }
+
+    /// Drop the history (used by /reset, so a fresh context is not haunted by
+    /// the calls of the previous one).
+    pub(crate) fn clear(&mut self) {
+        self.seen.clear();
+    }
+
+    fn key(name: &str, args: &serde_json::Value) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut h);
+        // Serialized form: serde_json preserves insertion order, and both
+        // providers hand us arguments the model just generated, so identical
+        // calls serialize identically in practice.
+        args.to_string().hash(&mut h);
+        h.finish()
+    }
+
+    /// Record a call. Returns Some(age) when the identical call was already
+    /// made inside the window.
+    fn check(&mut self, name: &str, args: &serde_json::Value) -> Option<std::time::Duration> {
+        if self.window.is_zero() {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        self.seen
+            .retain(|(_, t)| now.duration_since(*t) < self.window);
+        let key = Self::key(name, args);
+        if let Some((_, t)) = self.seen.iter().find(|(k, _)| *k == key) {
+            return Some(now.duration_since(*t));
+        }
+        self.seen.push((key, now));
+        None
+    }
+}
+
 /// Tool result injected for calls cut short by /interrupt.
 const INTERRUPTED_RESULT: &str = "{\"error\": \"interrupted by user\"}";
 /// Turn text surfaced in the chat pane after an interrupt.
@@ -175,6 +230,7 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
         // Provider-native message history (anthropic and openai shapes differ,
         // but both are serde_json Values in a flat Vec).
         let mut history: Vec<serde_json::Value> = Vec::new();
+        let mut calls = CallLog::new(cfg.tool_dedup_secs);
         while let Some(first) = rx.recv().await {
             // Coalesce whatever queued up while we were idle or mid-turn into
             // a single user turn — an event storm becomes one API call.
@@ -182,7 +238,11 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
             while let Ok(next) = rx.try_recv() {
                 msgs.push(next);
             }
+            let had_reset = msgs.iter().any(|m| matches!(m, OrchestratorMsg::Reset));
             let (user_text, any_user, any_actionable) = coalesce_batch(&msgs, &mut history);
+            if had_reset {
+                calls.clear();
+            }
             let Some(user_text) = user_text else {
                 // Pure reset, nothing to say to the model.
                 continue;
@@ -200,6 +260,7 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
                         &cfg,
                         &client,
                         &mut history,
+                        &mut calls,
                         &user_text,
                         &event_tx,
                         &mut interrupt,
@@ -211,6 +272,7 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
                         &cfg,
                         &client,
                         &mut history,
+                        &mut calls,
                         &user_text,
                         &event_tx,
                         &mut interrupt,
@@ -474,9 +536,27 @@ fn proposal_detail(name: &str, args: &serde_json::Value) -> String {
 async fn exec_tool(
     cfg: &OrchestratorConfig,
     event_tx: &mpsc::Sender<AppEvent>,
+    calls: &mut CallLog,
     name: &str,
     args: &serde_json::Value,
 ) -> String {
+    // Repeat-call suppression, before the approval gate: an identical call
+    // inside the window is answered rather than executed, so the user is not
+    // asked to approve the same proposal twice either.
+    if let Some(age) = calls.check(name, args) {
+        return serde_json::json!({
+            "error": "duplicate_call",
+            "detail": format!(
+                "you already called {} with these exact arguments {}s ago and the result is \
+                 above in this conversation. Nothing was re-run. If you are waiting for a \
+                 session to change, use send_input with wait_ready=true, or tell the user \
+                 what you are blocked on.",
+                name,
+                age.as_secs()
+            ),
+        })
+        .to_string();
+    }
     // Propose mode: gated tools block here until the human answers in the
     // chat pane (/approve, /deny [reason]) or the timeout fires. Only the
     // orchestrator's own tokio task waits — no HTTP request is held open and
@@ -813,9 +893,70 @@ fn skills_section(cfg: &OrchestratorConfig, with_paths: bool) -> Option<String> 
     Some(skills::skill_list(&list, with_paths))
 }
 
-/// Stub text substituted for aged-out tool results.
+/// Stub text substituted for aged-out tool results whose originating call
+/// could not be identified. Also the minimum length worth eliding.
 const ELIDED_RESULT: &str =
     "[elided to save context — re-run the tool if this result is still needed]";
+
+/// Map tool-call id -> (tool name, arguments) across both provider shapes.
+///
+/// Aged-out results are replaced by a stub that *names the call it answered*.
+/// A bare "[elided]" leaves the model reading its own `tool_use` block
+/// followed by nothing, which reads as an unfinished action and invites an
+/// immediate re-call; naming the call turns it into a completed one.
+fn call_index(
+    history: &[serde_json::Value],
+) -> std::collections::HashMap<String, (String, serde_json::Value)> {
+    let mut map = std::collections::HashMap::new();
+    for m in history.iter().filter(|m| m["role"] == "assistant") {
+        // Anthropic: content array of blocks, tool_use carries id/name/input.
+        if let Some(blocks) = m["content"].as_array() {
+            for b in blocks.iter().filter(|b| b["type"] == "tool_use") {
+                if let Some(id) = b["id"].as_str() {
+                    map.insert(
+                        id.to_string(),
+                        (
+                            b["name"].as_str().unwrap_or("tool").to_string(),
+                            b["input"].clone(),
+                        ),
+                    );
+                }
+            }
+        }
+        // OpenAI: tool_calls array, arguments is a JSON-encoded string.
+        if let Some(calls) = m["tool_calls"].as_array() {
+            for c in calls {
+                if let Some(id) = c["id"].as_str() {
+                    let args: serde_json::Value = c["function"]["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(serde_json::json!({}));
+                    map.insert(
+                        id.to_string(),
+                        (
+                            c["function"]["name"].as_str().unwrap_or("tool").to_string(),
+                            args,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Stub naming the call whose result was dropped, with the original size.
+fn elision_stub(call: Option<&(String, serde_json::Value)>, original_len: usize) -> String {
+    match call {
+        Some((name, args)) => format!(
+            "[elided: {} {} returned {} chars — re-run only if you still need the detail]",
+            name,
+            proposal_detail(name, args),
+            original_len
+        ),
+        None => ELIDED_RESULT.to_string(),
+    }
+}
 
 /// Count plain user-text turns (the boundaries trim_history cuts at).
 fn user_turns(history: &[serde_json::Value]) -> usize {
@@ -842,6 +983,7 @@ fn age_tool_results(history: &mut [serde_json::Value], keep_turns: usize) {
     if keep_turns == 0 {
         return;
     }
+    let calls = call_index(history);
     // Index of the keep_turns-th plain user turn from the end; everything
     // before it is "old".
     let mut seen = 0;
@@ -861,11 +1003,10 @@ fn age_tool_results(history: &mut [serde_json::Value], keep_turns: usize) {
     for m in history[..boundary].iter_mut() {
         // OpenAI shape: {"role": "tool", "content": "..."}
         if m["role"] == "tool" {
-            if m["content"]
-                .as_str()
-                .is_some_and(|s| s.len() > ELIDED_RESULT.len())
-            {
-                m["content"] = serde_json::json!(ELIDED_RESULT);
+            let len = m["content"].as_str().map_or(0, |s| s.len());
+            if len > ELIDED_RESULT.len() {
+                let call = m["tool_call_id"].as_str().and_then(|id| calls.get(id));
+                m["content"] = serde_json::json!(elision_stub(call, len));
             }
             continue;
         }
@@ -874,12 +1015,13 @@ fn age_tool_results(history: &mut [serde_json::Value], keep_turns: usize) {
         if m["role"] == "user" {
             if let Some(blocks) = m["content"].as_array_mut() {
                 for b in blocks.iter_mut().filter(|b| b["type"] == "tool_result") {
-                    let long = match &b["content"] {
-                        serde_json::Value::String(s) => s.len() > ELIDED_RESULT.len(),
-                        v => v.to_string().len() > ELIDED_RESULT.len(),
+                    let len = match &b["content"] {
+                        serde_json::Value::String(s) => s.len(),
+                        v => v.to_string().len(),
                     };
-                    if long {
-                        b["content"] = serde_json::json!(ELIDED_RESULT);
+                    if len > ELIDED_RESULT.len() {
+                        let call = b["tool_use_id"].as_str().and_then(|id| calls.get(id));
+                        b["content"] = serde_json::json!(elision_stub(call, len));
                     }
                 }
             }
@@ -986,6 +1128,7 @@ mod tests {
         let out = exec_tool(
             &cfg,
             &tx,
+            &mut CallLog::new(0),
             "remember",
             &serde_json::json!({"text": "user prefers rebase\nover merge"}),
         )
@@ -1025,6 +1168,7 @@ mod tests {
                 exec_tool(
                     &cfg,
                     &tx,
+                    &mut CallLog::new(0),
                     "send_input",
                     &serde_json::json!({"session_id": 2, "text": "cargo test"}),
                 )
@@ -1086,7 +1230,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AppEvent>(8);
         // use_skill with no skills dir: fails fast without a main-loop trip,
         // but the status announcement must still come first.
-        let _ = exec_tool(&cfg, &tx, "use_skill", &serde_json::json!({"name": "x"})).await;
+        let _ = exec_tool(
+            &cfg,
+            &tx,
+            &mut CallLog::new(0),
+            "use_skill",
+            &serde_json::json!({"name": "x"}),
+        )
+        .await;
         match rx.try_recv() {
             Ok(AppEvent::OrchestratorStatus(Some(s))) => {
                 assert!(s.contains("use_skill"), "status names the tool: {}", s)
@@ -1161,7 +1312,9 @@ mod tests {
         let big = "x".repeat(500);
         let mut h = vec![
             serde_json::json!({"role": "user", "content": "one"}),
-            serde_json::json!({"role": "assistant", "content": [{"type": "tool_use", "id": "a"}]}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "read_output",
+                 "input": {"session_id": 2}}]}),
             serde_json::json!({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "a", "content": big.clone()}]}),
             serde_json::json!({"role": "assistant", "content": "reply"}),
@@ -1172,7 +1325,12 @@ mod tests {
         ];
         age_tool_results(&mut h, 1);
         // Old result stubbed, id preserved
-        assert_eq!(h[2]["content"][0]["content"], ELIDED_RESULT);
+        let stub = h[2]["content"][0]["content"].as_str().unwrap();
+        assert!(stub.starts_with("[elided:"), "{stub}");
+        // The stub names the call it answered, so the model reads a completed
+        // action rather than a tool_use followed by nothing.
+        assert!(stub.contains("read_output"), "{stub}");
+        assert!(stub.contains("500 chars"), "{stub}");
         assert_eq!(h[2]["content"][0]["tool_use_id"], "a");
         // Result within the keep window untouched
         assert_eq!(h[6]["content"][0]["content"], big);
@@ -1180,6 +1338,33 @@ mod tests {
         let before = h.clone();
         age_tool_results(&mut h, 10);
         assert_eq!(h, before);
+    }
+
+    #[test]
+    fn repeat_calls_are_suppressed_within_the_window() {
+        let mut log = CallLog::new(60);
+        let args = serde_json::json!({"session_id": 2, "lines": 50});
+        assert!(log.check("read_output", &args).is_none());
+        // Identical call: reported as a repeat rather than executed again.
+        assert!(log.check("read_output", &args).is_some());
+        // Different arguments are a different call.
+        assert!(log
+            .check(
+                "read_output",
+                &serde_json::json!({"session_id": 3, "lines": 50})
+            )
+            .is_none());
+        // Reset clears the log so a fresh context is not haunted by the old one.
+        log.clear();
+        assert!(log.check("read_output", &args).is_none());
+    }
+
+    #[test]
+    fn a_zero_window_disables_suppression() {
+        let mut log = CallLog::new(0);
+        let args = serde_json::json!({});
+        assert!(log.check("list_sessions", &args).is_none());
+        assert!(log.check("list_sessions", &args).is_none());
     }
 
     #[test]
@@ -1191,6 +1376,7 @@ mod tests {
             serde_json::json!({"role": "user", "content": "two"}),
         ];
         age_tool_results(&mut h, 1);
+        // No matching tool_call_id in history: falls back to the bare stub.
         assert_eq!(h[1]["content"], ELIDED_RESULT);
     }
 
@@ -1315,6 +1501,7 @@ mod tests {
             &cfg,
             &client,
             &mut history,
+            &mut CallLog::new(0),
             "do something",
             &event_tx,
             &mut interrupt,
@@ -1359,6 +1546,7 @@ mod tests {
             &cfg,
             &client,
             &mut history,
+            &mut CallLog::new(0),
             "what's running?",
             &event_tx,
             &mut interrupt,
@@ -1408,6 +1596,7 @@ mod tests {
             &cfg,
             &client,
             &mut history,
+            &mut CallLog::new(0),
             "what's running?",
             &event_tx,
             &mut interrupt,
