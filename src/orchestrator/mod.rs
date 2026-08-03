@@ -87,6 +87,13 @@ impl CallLog {
         }
     }
 
+    /// Re-window on a persona swap (autonomous personas legitimately re-read
+    /// more often; the window narrows, it never reaches zero unless the user
+    /// asks for that explicitly).
+    pub(crate) fn set_window(&mut self, secs: u64) {
+        self.window = std::time::Duration::from_secs(secs);
+    }
+
     /// Drop the history (used by /reset, so a fresh context is not haunted by
     /// the calls of the previous one).
     pub(crate) fn clear(&mut self) {
@@ -141,6 +148,10 @@ pub enum OrchestratorMsg {
     },
     /// Out-of-band note (kill approved/denied, etc.).
     SystemNote(String),
+    /// Swap the active persona (config layer) without dropping history.
+    /// In-flight tool calls finish under the old config; the new one applies
+    /// from the next turn.
+    SetConfig(Box<OrchestratorConfig>),
     /// Drop the conversation history (/reset). Anything queued before the
     /// reset is discarded with it; messages after it start the fresh context.
     Reset,
@@ -170,7 +181,7 @@ impl OrchestratorMsg {
                 )
             }
             OrchestratorMsg::SystemNote(note) => format!("[linkshell] {}", note),
-            OrchestratorMsg::Reset => String::new(),
+            OrchestratorMsg::SetConfig(_) | OrchestratorMsg::Reset => String::new(),
         }
     }
 
@@ -221,6 +232,7 @@ fn coalesce_batch(
 
 /// Spawn the orchestrator task. Only valid for API-class providers.
 pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> OrchestratorHandle {
+    let mut cfg = cfg;
     cfg.ensure_agent_files();
     let (tx, mut rx) = mpsc::channel::<OrchestratorMsg>(64);
     let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
@@ -237,6 +249,27 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
             let mut msgs = vec![first];
             while let Ok(next) = rx.try_recv() {
                 msgs.push(next);
+            }
+            // Persona swaps are config, not conversation: apply the last one
+            // in the batch and drop them before the batch becomes a turn.
+            let mut new_cfg = None;
+            msgs.retain(|m| match m {
+                OrchestratorMsg::SetConfig(c) => {
+                    new_cfg = Some((**c).clone());
+                    false
+                }
+                _ => true,
+            });
+            if let Some(c) = new_cfg {
+                let window = c.tool_dedup_secs;
+                cfg = c;
+                calls.set_window(window);
+                let _ = event_tx
+                    .send(AppEvent::OrchestratorPersona(cfg.persona.clone()))
+                    .await;
+            }
+            if msgs.is_empty() {
+                continue;
             }
             let had_reset = msgs.iter().any(|m| matches!(m, OrchestratorMsg::Reset));
             let (user_text, any_user, any_actionable) = coalesce_batch(&msgs, &mut history);
@@ -323,6 +356,22 @@ pub fn spawn(cfg: OrchestratorConfig, event_tx: mpsc::Sender<AppEvent>) -> Orche
 
 /// One logical tool set; converted per provider wire format below.
 /// (name, description, JSON Schema for the arguments)
+/// Filter the tool set by the active persona's allowlist. An empty allowlist
+/// means the full set; `list_sessions` is always kept so the model is never
+/// completely blind.
+fn allowed_specs(cfg: &OrchestratorConfig) -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    let specs = tool_specs();
+    if cfg.allowed_tools.is_empty() {
+        return specs;
+    }
+    specs
+        .into_iter()
+        .filter(|(name, _, _)| {
+            *name == "list_sessions" || cfg.allowed_tools.iter().any(|a| a == name)
+        })
+        .collect()
+}
+
 fn tool_specs() -> Vec<(&'static str, &'static str, serde_json::Value)> {
     vec![
         (
@@ -464,8 +513,8 @@ const EXHAUSTION_NUDGE: &str = "[linkshell] Tool iteration budget for this turn 
 Do not call any more tools. Summarize what you did, what you learned from the tool results \
 above, and what (if anything) remains to be done.";
 
-fn anthropic_tools() -> serde_json::Value {
-    tool_specs()
+fn anthropic_tools(cfg: &OrchestratorConfig) -> serde_json::Value {
+    allowed_specs(cfg)
         .into_iter()
         .map(|(name, desc, schema)| {
             serde_json::json!({"name": name, "description": desc, "input_schema": schema})
@@ -474,8 +523,8 @@ fn anthropic_tools() -> serde_json::Value {
 }
 
 /// OpenAI `tools` array shape.
-fn openai_tools() -> serde_json::Value {
-    tool_specs()
+fn openai_tools(cfg: &OrchestratorConfig) -> serde_json::Value {
+    allowed_specs(cfg)
         .into_iter()
         .map(|(name, desc, schema)| {
             serde_json::json!({
@@ -540,6 +589,21 @@ async fn exec_tool(
     name: &str,
     args: &serde_json::Value,
 ) -> String {
+    if !cfg.allowed_tools.is_empty()
+        && name != "list_sessions"
+        && !cfg.allowed_tools.iter().any(|a| a == name)
+    {
+        return serde_json::json!({
+            "error": "tool_not_available",
+            "detail": format!(
+                "the active persona ({}) does not have {}. Available: {}.",
+                if cfg.persona.is_empty() { "default" } else { &cfg.persona },
+                name,
+                cfg.allowed_tools.join(", ")
+            ),
+        })
+        .to_string();
+    }
     // Repeat-call suppression, before the approval gate: an identical call
     // inside the window is answered rather than executed, so the user is not
     // asked to approve the same proposal twice either.
@@ -778,6 +842,13 @@ and continue; otherwise report what you wanted to do and why.\n",
     // llama.cpp prefix cache) re-serve the static bulk after each write.
     if let Some(memory) = memory_section(cfg) {
         p.push_str(&memory);
+    }
+    // Persona note last of the static text (before memory), so a persona
+    // swap invalidates as little of the cached prefix as possible.
+    if !cfg.persona_note.trim().is_empty() {
+        p.push_str("\n\n## Persona\n\n");
+        p.push_str(cfg.persona_note.trim());
+        p.push('\n');
     }
     p
 }
@@ -1088,8 +1159,9 @@ mod tests {
 
     #[test]
     fn tool_specs_convert_to_both_provider_shapes() {
-        let a = anthropic_tools();
-        let o = openai_tools();
+        let cfg = OrchestratorConfig::default();
+        let a = anthropic_tools(&cfg);
+        let o = openai_tools(&cfg);
         let n = tool_specs().len();
         assert_eq!(a.as_array().unwrap().len(), n);
         assert_eq!(o.as_array().unwrap().len(), n);
@@ -1338,6 +1410,45 @@ mod tests {
         let before = h.clone();
         age_tool_results(&mut h, 10);
         assert_eq!(h, before);
+    }
+
+    #[test]
+    fn a_persona_allowlist_shrinks_the_tool_schema() {
+        let mut cfg = OrchestratorConfig {
+            allowed_tools: vec!["read_output".into()],
+            ..Default::default()
+        };
+        let names: Vec<&str> = allowed_specs(&cfg).iter().map(|(n, _, _)| *n).collect();
+        assert!(names.contains(&"read_output"));
+        // Always kept: the model is never left with no way to see anything.
+        assert!(names.contains(&"list_sessions"));
+        // Removed from the schema entirely, not merely discouraged.
+        assert!(!names.contains(&"send_input"));
+        // Empty allowlist means the full set.
+        cfg.allowed_tools.clear();
+        assert_eq!(allowed_specs(&cfg).len(), tool_specs().len());
+    }
+
+    #[test]
+    fn builtin_personas_layer_over_the_base_config() {
+        let base = OrchestratorConfig {
+            model: "local-qwen".into(),
+            event_cooldown_secs: 30,
+            ..Default::default()
+        };
+        let personas = crate::config::builtin_personas();
+        let assistant = personas.iter().find(|p| p.name == "assistant").unwrap();
+        let cfg = assistant.apply(&base);
+        // Overridden by the persona...
+        assert!(cfg.events.is_empty());
+        assert_eq!(cfg.approval, "propose");
+        assert!(!cfg.allowed_tools.contains(&"send_input".to_string()));
+        // ...while untouched fields are inherited.
+        assert_eq!(cfg.model, "local-qwen");
+        assert_eq!(cfg.persona, "assistant");
+        // The most autonomous persona still cannot disable loop suppression.
+        let orch = personas.iter().find(|p| p.name == "orchestrator").unwrap();
+        assert!(orch.apply(&base).tool_dedup_secs > 0);
     }
 
     #[test]

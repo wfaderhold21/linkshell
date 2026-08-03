@@ -53,7 +53,7 @@ pub async fn run_turn(
     // a moving breakpoint on the last message of each request so the 12
     // iterations of a busy turn re-serve the shared history prefix instead
     // of re-billing it in full every call.
-    let mut tools = super::anthropic_tools();
+    let mut tools = super::anthropic_tools(cfg);
     if let Some(last) = tools.as_array_mut().and_then(|a| a.last_mut()) {
         last["cache_control"] = serde_json::json!({"type": "ephemeral"});
     }

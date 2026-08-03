@@ -19,7 +19,7 @@ pub async fn run_turn(
         anyhow::bail!("no endpoint configured for provider {}", cfg.provider);
     }
     let url = crate::agent_llm::completions_url(&endpoint);
-    let tools = super::openai_tools();
+    let tools = super::openai_tools(cfg);
 
     history.push(serde_json::json!({"role": "user", "content": user_text}));
     super::compact_history(history, cfg);

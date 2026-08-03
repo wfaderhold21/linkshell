@@ -186,6 +186,9 @@ pub enum AppEvent {
     /// pane ("thinking (3/12)", "running read_output", ...). None clears it
     /// when the turn ends.
     OrchestratorStatus(Option<String>),
+    /// The orchestrator task acknowledged a persona swap (name, or empty for
+    /// the bare [orchestrator] config).
+    OrchestratorPersona(String),
     /// Token usage from the orchestrator's own API calls
     OrchestratorUsage {
         input: u64,

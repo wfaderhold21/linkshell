@@ -113,3 +113,35 @@ Local LLMs require `endpoint` and `model`; `system` and `api_key` are optional.
 
 
 - `tool_dedup_secs` (default `45`) — repeat-call suppression window for the orchestrator's tools. `0` disables.
+
+## `[[personas]]`
+
+Named behavioural presets layered over `[orchestrator]`. Every field is
+optional; omitted fields inherit from `[orchestrator]`. Set
+`[orchestrator].persona` to pick the one applied at startup, or switch at
+runtime with `/persona <name>` (history is preserved).
+
+Personas modulate autonomy and eagerness only. Repeat-call suppression,
+tool-result elision stubs and `send_input` evidence are unconditional — a
+persona cannot turn correctness off.
+
+- `name` — the name used by `/persona`. Matching a builtin replaces it.
+- `events`, `event_cooldown_secs` — which session transitions wake the agent, and how often.
+- `approval`, `auto_approve` — propose-mode gating.
+- `allowed_tools` — tools present in the schema at all. `list_sessions` is always kept.
+- `max_tool_iterations`, `tool_dedup_secs`, `max_context_tokens`, `event_tail_lines`.
+- `note` — appended to the system prompt under a `## Persona` heading.
+
+Builtins: `assistant` (reactive, read-only, propose), `monitor` (watches and
+reports, writes gated), `orchestrator` (acts autonomously, tightest dedup
+window).
+
+```toml
+[orchestrator]
+persona = "monitor"
+
+[[personas]]
+name = "monitor"
+event_cooldown_secs = 90
+note = "Be terse. One report per incident."
+```
