@@ -21,6 +21,7 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     pub orchestrator: OrchestratorConfig,
     pub chat: ChatConfig,
+    pub planning: PlanningConfig,
     pub profiles: Vec<Profile>,
     /// User-defined personas; a name matching a builtin replaces it.
     #[serde(default)]
@@ -133,6 +134,15 @@ pub struct OrchestratorConfig {
     /// Longer replies are truncated to the last N lines with a marker.
     /// 0 disables.
     pub wait_ready_max_lines: usize,
+    /// Models offered by the Orchestrator menu's Model row. The menu cycles
+    /// this list; it does not query the provider, because the endpoint may be
+    /// a local server whose loaded model set changes independently of what is
+    /// worth switching between.
+    pub models: Vec<String>,
+    /// Providers offered by the menu's Provider row. Empty = the built-in set.
+    pub providers: Vec<String>,
+    /// Context budgets offered by the menu. Empty = a built-in ladder.
+    pub context_choices: Vec<usize>,
 }
 
 impl Default for OrchestratorConfig {
@@ -178,6 +188,9 @@ impl Default for OrchestratorConfig {
             persona: String::new(),
             tool_dedup_secs: 45,
             wait_ready_max_lines: 80,
+            models: Vec::new(),
+            providers: Vec::new(),
+            context_choices: Vec::new(),
         }
     }
 }
@@ -203,6 +216,98 @@ impl Default for ChatConfig {
     }
 }
 
+// ── [planning] ────────────────────────────────────────────────────────────
+
+/// The planning pane: a persistent, read-only, single-agent design chat.
+///
+/// Backends are selected at runtime from the pane, so several are configured
+/// and none is privileged. A thread can be built cheaply on a local model and
+/// distilled by a frontier one.
+///
+///   [planning]
+///   default_backend = "local"
+///   distill_backend = "opus"      # falls back to default_backend
+///
+///   [planning.backends.local]
+///   provider = "lmstudio"
+///   endpoint = "http://localhost:1234/v1"
+///   model = "qwen3.6-27b"
+///   max_context_tokens = 28000
+///
+///   [planning.backends.opus]
+///   provider = "anthropic"
+///   model = "claude-opus-4-8"
+///   max_context_tokens = 180000
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct PlanningConfig {
+    /// Backend selected when a pane opens. Empty = first by name.
+    pub default_backend: String,
+    /// Backend used by the commit step. Empty = `default_backend`.
+    pub distill_backend: String,
+    /// Sidebar width as a percentage of the pane (15-50).
+    pub sidebar_pct: u16,
+    pub backends: HashMap<String, crate::planning::Backend>,
+    /// Backends inferred from model endpoints configured elsewhere —
+    /// `[agents.*]` and an API-class `[orchestrator]` (see
+    /// `Config::derive_planning_backends`). Without these a config that has
+    /// never named `[planning.backends.*]` offers nothing to pick, and the
+    /// pane's whole point is picking. Explicit entries shadow them by name.
+    ///
+    /// Skipped by serde in both directions: they are not the user's config
+    /// and must not be written back by `save()` as though they were.
+    #[serde(skip)]
+    pub derived: HashMap<String, crate::planning::Backend>,
+}
+
+impl PlanningConfig {
+    /// Backend names in a stable display order for the picker.
+    pub fn backend_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.backends.keys().cloned().collect();
+        for name in self.derived.keys() {
+            if !self.backends.contains_key(name) {
+                names.push(name.clone());
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Look up a backend, stamping its config key into `name` — the key is
+    /// what gets recorded per message, so it must not be lost in
+    /// deserialization.
+    pub fn backend(&self, name: &str) -> Option<crate::planning::Backend> {
+        self.backends.get(name).or(self.derived.get(name)).map(|b| {
+            let mut b = b.clone();
+            b.name = name.to_string();
+            b
+        })
+    }
+
+    /// Backend a newly opened pane starts on.
+    pub fn default_backend(&self) -> Option<crate::planning::Backend> {
+        self.backend(&self.default_backend)
+            .or_else(|| self.backend_names().first().and_then(|n| self.backend(n)))
+    }
+
+    /// Backend the commit step distills with. Chosen independently so the
+    /// artifact that actually gets handed to an agent can use a better model
+    /// than the conversation did.
+    pub fn distill_backend(&self) -> Option<crate::planning::Backend> {
+        self.backend(&self.distill_backend)
+            .or_else(|| self.default_backend())
+    }
+
+    /// Clamped sidebar width.
+    pub fn sidebar_width_pct(&self) -> u16 {
+        if self.sidebar_pct == 0 {
+            28
+        } else {
+            self.sidebar_pct.clamp(15, 50)
+        }
+    }
+}
+
 pub enum ApiProvider {
     Anthropic,
     OpenAi, // also serves LM Studio
@@ -216,6 +321,51 @@ pub enum OrchestratorClass {
 
 impl OrchestratorConfig {
     /// True if this tool call must be approved by the human before running.
+    /// Provider names the menu cycles through.
+    pub fn provider_choices(&self) -> Vec<String> {
+        if !self.providers.is_empty() {
+            return self.providers.clone();
+        }
+        [
+            "anthropic",
+            "openai",
+            "lmstudio",
+            "claude",
+            "codex",
+            "opencode",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Models the menu cycles through. Always includes the configured model,
+    /// so cycling from a hand-edited value can return to it.
+    pub fn model_choices(&self) -> Vec<String> {
+        let mut out = self.models.clone();
+        if !self.model.is_empty() && !out.contains(&self.model) {
+            out.insert(0, self.model.clone());
+        }
+        out
+    }
+
+    /// Context budgets the menu cycles through, in tokens. Always includes
+    /// the configured value so cycling is reversible, and 0 (unlimited) so
+    /// compaction can be turned off from the menu.
+    pub fn context_choices(&self) -> Vec<usize> {
+        let mut out = if self.context_choices.is_empty() {
+            vec![0, 8_000, 16_000, 32_000, 60_000, 100_000, 180_000]
+        } else {
+            self.context_choices.clone()
+        };
+        if !out.contains(&self.max_context_tokens) {
+            out.push(self.max_context_tokens);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     pub fn approval_required(&self, tool: &str) -> bool {
         if self.approval != "propose" {
             return false;
@@ -1068,9 +1218,67 @@ pub fn save_profile(profile: &Profile) -> anyhow::Result<std::path::PathBuf> {
 }
 
 pub fn parse(content: &str) -> anyhow::Result<Config> {
-    let cfg: Config = toml::from_str(content)?;
+    let mut cfg: Config = toml::from_str(content)?;
     validate_profiles(&cfg)?;
+    cfg.derive_planning_backends();
     Ok(cfg)
+}
+
+impl Config {
+    /// Offer the model endpoints already configured elsewhere as planning
+    /// backends, so the picker is usable without a second copy of the same
+    /// endpoint under `[planning.backends.*]`. Explicit entries always win —
+    /// a derived one is a starting point, not an override.
+    pub fn derive_planning_backends(&mut self) {
+        let mut derived: HashMap<String, crate::planning::Backend> = HashMap::new();
+
+        for (name, agent) in &self.agents {
+            derived.insert(
+                name.clone(),
+                crate::planning::Backend {
+                    name: name.clone(),
+                    // `[agents.*]` is defined as OpenAI-compatible.
+                    provider: "openai".to_string(),
+                    endpoint: agent.endpoint.clone(),
+                    model: agent.model.clone(),
+                    api_key: agent.api_key.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Only the API-class orchestrator has an endpoint of its own; the CLI
+        // class is a subprocess with no HTTP surface to borrow.
+        let orch = &self.orchestrator;
+        if matches!(orch.class(), Ok(OrchestratorClass::Api(_))) && !orch.model.is_empty() {
+            let name = if orch.name.is_empty() {
+                "orchestrator".to_string()
+            } else {
+                orch.name.clone()
+            };
+            let mut backend = crate::planning::Backend {
+                name: name.clone(),
+                provider: orch.provider.clone(),
+                // Resolved, not raw: `provider = "lmstudio"` with no endpoint
+                // means localhost:1234, and the planning wire has no notion of
+                // an lmstudio default of its own.
+                endpoint: orch.endpoint_url(),
+                model: orch.model.clone(),
+                api_key: orch.api_key.clone(),
+                auth_token: orch.auth_token.clone(),
+                ..Default::default()
+            };
+            if orch.max_context_tokens > 0 {
+                backend.max_context_tokens = orch.max_context_tokens;
+            }
+            if orch.max_tool_iterations > 0 {
+                backend.max_tool_iterations = orch.max_tool_iterations;
+            }
+            derived.entry(name).or_insert(backend);
+        }
+
+        self.planning.derived = derived;
+    }
 }
 
 pub fn save(config: &Config) -> anyhow::Result<()> {
@@ -1402,6 +1610,64 @@ kind = "codex"
         let empty: Config = toml::from_str("").unwrap();
         assert!(empty.sessions.aliases.is_empty());
     }
+    #[test]
+    fn planning_backends_are_derived_from_agents_and_the_orchestrator() {
+        let cfg = parse(
+            r#"
+[orchestrator]
+name = "agent"
+provider = "lmstudio"
+model = "qwen3.6-27b"
+max_context_tokens = 131072
+
+[agents.qwen]
+endpoint = "http://localhost:8080/v1"
+model = "qwen3.6-8b"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.planning.backend_names(), vec!["agent", "qwen"]);
+        let agent = cfg.planning.backend("agent").unwrap();
+        // An lmstudio orchestrator with no explicit endpoint must not land on
+        // api.openai.com.
+        assert_eq!(agent.endpoint, "http://localhost:1234/v1");
+        assert_eq!(agent.max_context_tokens, 131072);
+        assert_eq!(cfg.planning.backend("qwen").unwrap().provider, "openai");
+        // The picker opens on one of them rather than on nothing.
+        assert!(cfg.planning.default_backend().is_some());
+    }
+
+    #[test]
+    fn explicit_planning_backends_shadow_derived_ones() {
+        let cfg = parse(
+            r#"
+[orchestrator]
+name = "agent"
+provider = "lmstudio"
+model = "from-orchestrator"
+
+[planning.backends.agent]
+provider = "anthropic"
+model = "from-planning"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.planning.backend_names(), vec!["agent"]);
+        assert_eq!(
+            cfg.planning.backend("agent").unwrap().model,
+            "from-planning"
+        );
+    }
+
+    #[test]
+    fn derived_backends_are_not_written_back_to_disk() {
+        let cfg = parse("[agents.qwen]\nendpoint = \"http://x/v1\"\nmodel = \"m\"\n").unwrap();
+        assert!(!cfg.planning.derived.is_empty());
+        let round_tripped = parse(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        // Derived again from [agents.*], never persisted as [planning.backends.*].
+        assert!(round_tripped.planning.backends.is_empty());
+    }
+
     #[test]
     fn agents_table_parses_local_llm_endpoints() {
         let toml = r#"

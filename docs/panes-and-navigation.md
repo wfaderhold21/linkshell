@@ -61,6 +61,9 @@ and shows real token counts while skipping meaningless cost.
 | `alt-o` | Focus next pane |
 | `alt-b` | Toggle broadcast input to all sessions |
 | `alt-g` | Dock the chat pane |
+| `alt-p` | Toggle the planning pane |
+| `alt-shift-p` | Planning pane over the whole output region (docks it first if closed) |
+| `ctrl-space` | Toggle the menu bar |
 | `alt-1` … `alt-8` | Switch to session by number |
 | `alt-←` / `alt-→` | Cycle sessions |
 | `ctrl-q` | Quit (shuts down the server and all sessions; use `alt-d` to leave them running) |
@@ -70,6 +73,96 @@ and shows real token counts while skipping meaningless cost.
 
 All other input is passed through to the active session's PTY. Keybindings are
 configurable — see the [configuration reference](config-reference.md).
+
+### Menu bar keys
+
+`ctrl-space` opens a menu bar across the top (Sessions, View, Pipes,
+Orchestrator, Agenda, Help). It is the runtime settings surface: the
+Orchestrator section cycles persona, provider, model, context budget, approval
+mode and the wake-on-event toggles, and the Agenda section opens the planning
+backend/model picker, all without editing config.toml.
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Move between sections |
+| `↓` | Drop into the section, then move down its items |
+| `↑` | Move up; from the first item, back out to the section row |
+| `Enter` | Activate the item. Value rows (model, context, toggles) cycle in place and leave the menu open |
+| a letter | Jump to the section whose title starts with it |
+| `ctrl-space` / `esc` | Close |
+
+Rows whose action is unavailable are greyed out and do nothing rather than
+closing the menu — the orchestrator lifecycle rows are greyed while it is not
+running, and "Planning Model" is greyed when there is no endpoint to pick from.
+
+The planning backend list does not have to be written out twice: every
+`[agents.NAME]` endpoint, and an API-class `[orchestrator]`, are offered as
+planning backends automatically under their own names. A
+`[planning.backends.NAME]` entry with the same name shadows the derived one,
+so declaring a backend explicitly is how you give it a different model or
+context budget than the agent it came from. Derived backends are never written
+back into config.toml.
+
+### Planning pane keys
+
+`alt-p` docks the planning pane into a split leaf; `alt-shift-p` gives it the
+whole output region, docking it first if it was closed. A plan is a document,
+and a third of a split is not enough room to hold one in your head. The session
+bar and status panel stay visible, so the sessions you are planning against are
+still on screen with their state and token counts updating — only their output
+is covered, and their PTYs keep the size they last laid out at. `esc` steps
+back to the split, and a second `esc` moves focus on.
+
+While the pane is focused these keys apply instead of being passed to a PTY:
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Send the input as a planning turn |
+| `alt-Enter` | Insert a newline (a planning message is usually a paragraph) |
+| `Tab` | Move focus between the thread list and the transcript |
+| `ctrl-b` | Collapse/expand the thread list |
+| `alt-m` | Open the backend/model picker |
+| `ctrl-k` | Commit the thread to a plan revision |
+| `alt-i` | Hand the committed plan to a session as work |
+| `↑` / `↓` | Thread list: change selection. Transcript: scroll |
+| `PageUp` / `PageDown` | Scroll the transcript |
+| `Enter` (list focus) | Open the selected thread |
+| `n` (list focus) | New thread — browse for its scope root |
+| `d` (list focus) | Delete the selected thread (confirms first) |
+| `esc` | Leave fullscreen, else return focus to the other pane |
+
+The backend picker is `alt-m` rather than `ctrl-m` because terminals encode
+`ctrl-m` as carriage return, making it indistinguishable from `Enter`.
+
+It has two levels. The first lists backends — endpoints. On opening, every
+self-hosted endpoint is asked what it is currently serving (`GET /v1/models`,
+2s timeout, cached), and `Enter` or `→` on one descends into that answer to
+pick a model; `←` backs out, `r` re-probes. Hosted catalogues
+(`api.openai.com`, Anthropic) are not asked — they list hundreds of models and
+are not what changes under you — so `Enter` there selects the endpoint on its
+configured model, as does an endpoint that did not respond. A model picked
+this way applies to the next turn and is recorded on each message, so a thread
+shows where it switched models.
+
+`alt-i` hands the thread's latest committed plan to a session you pick. What
+is sent is a path plus a staleness warning, not the conversation: an
+implementation session may run sandboxed, and a read-only bind mount of one
+file is simpler to arrange than replaying a thread. Staleness is recomputed at
+handoff, not reused from commit time, so a plan grounded in files that have
+since moved on says so. The brief queues if the target session is mid-turn.
+
+The status row's context meter shows two numbers: `~868/131k (peak 5.4k)`. The
+first is the thread transcript plus your draft — what the *next* turn starts
+from. The peak is the largest request the last turn actually built, including
+the file contents it read. They diverge sharply, because tool results are
+consumed within a turn and never stored in the thread, so reading a codebase
+moves the peak and barely touches the transcript. The peak is not restored when
+a thread is reopened; it describes a turn, not a thread.
+
+When a thread exceeds the selected backend's context budget the pane shows a
+prompt offering `[c]` compact, `[b]` switch backend, or `[Esc]` dismiss. This
+is deliberately not automatic: compacting silently would drop the early turns,
+which in a planning thread are usually the premises everything else rests on.
 
 ## Command bar
 

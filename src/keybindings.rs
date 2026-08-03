@@ -29,6 +29,8 @@ pub enum Action {
     FocusPaneUp,
     FocusPaneDown,
     BroadcastToggle,
+    DockPlanning,
+    PlanningFullscreen,
     Detach,
 }
 
@@ -75,11 +77,18 @@ fn default_keymap() -> Keymap {
     m.insert((alt, KeyCode::Char('o')), Action::FocusNextPane);
     m.insert((alt, KeyCode::Char('b')), Action::BroadcastToggle);
     m.insert((alt, KeyCode::Char('d')), Action::Detach);
+    m.insert((alt, KeyCode::Char('p')), Action::DockPlanning);
     m.insert((alt, KeyCode::Left), Action::PrevSession);
     m.insert((alt, KeyCode::Right), Action::NextSession);
     m.insert((alt, KeyCode::Tab), Action::NextSession);
     m.insert((alt, KeyCode::BackTab), Action::PrevSession);
     let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+    // Shifted alt-p: the same pane, taking the whole terminal. Registered
+    // under both modifier sets because whether SHIFT is reported alongside an
+    // already-uppercase char depends on the terminal's keyboard protocol —
+    // kitty-style reporting sets it, a plain ESC-prefixed 'P' does not.
+    m.insert((alt_shift, KeyCode::Char('P')), Action::PlanningFullscreen);
+    m.insert((alt, KeyCode::Char('P')), Action::PlanningFullscreen);
     m.insert((alt_shift, KeyCode::PageUp), Action::ScrollUpPage);
     m.insert((alt_shift, KeyCode::PageDown), Action::ScrollDownPage);
     m.insert((alt_shift, KeyCode::Left), Action::FocusPaneLeft);
@@ -166,6 +175,8 @@ fn parse_action(s: &str) -> Option<Action> {
         "scroll_down_line" => Some(Action::ScrollDownLine),
         "toggle_chat" | "chat" => Some(Action::ToggleChat),
         "dock_chat" | "chat_dock" => Some(Action::DockChat),
+        "dock_planning" | "planning" => Some(Action::DockPlanning),
+        "planning_fullscreen" => Some(Action::PlanningFullscreen),
         "open_menu" => Some(Action::OpenMenu),
         "split_pane_right" | "split_right" => Some(Action::SplitPaneRight),
         "split_pane_down" | "split_down" => Some(Action::SplitPaneDown),

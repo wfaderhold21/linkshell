@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, FileBrowserState, NewSessionField, Selection, MENU};
+use crate::app::{App, AppMode, FileBrowserState, MenuAction, NewSessionField, Selection};
 use crate::layout::LayoutTree;
 use crate::session::{SessionKind, SessionState};
 use vt100::Screen;
@@ -197,11 +197,24 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let mut chat_area = Rect::default();
     let mut chat_layout = ChatLayout::default();
 
-    let output_areas = split_output_areas(chunks[0], &app.tree);
+    // Fullscreen planning claims the whole output region, but only that
+    // region: the session bar and status panel stay, so the sessions you are
+    // planning against remain visible and their state keeps updating.
+    let planning_fullscreen = app.planning_fullscreen && app.planning_docked.is_some();
+    let output_areas = if planning_fullscreen {
+        draw_planning_in(f, app, chunks[0], true);
+        // No pane rects: hit-testing must find nothing where no session was
+        // drawn, and the PTYs keep the size they last laid out at.
+        Vec::new()
+    } else {
+        split_output_areas(chunks[0], &app.tree)
+    };
     for (pane_idx, area) in output_areas.iter().copied().enumerate() {
         if app.chat_docked == Some(pane_idx) && output_areas.len() > 1 {
             chat_layout = draw_chat_in(f, app, area, pane_idx == app.focused_pane);
             chat_area = chat_layout.area;
+        } else if app.planning_docked == Some(pane_idx) && output_areas.len() > 1 {
+            draw_planning_in(f, app, area, pane_idx == app.focused_pane);
         } else {
             draw_pane_output(f, app, area, pane_idx, pane_idx == app.focused_pane);
         }
@@ -243,6 +256,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         AppMode::Chat => {
             chat_layout = draw_chat(f, app, size);
             chat_area = chat_layout.area;
+        }
+        AppMode::OrchestratorModel { selected } => {
+            help_area = draw_orchestrator_model_picker(f, app, size, *selected);
         }
         AppMode::Menu { .. } => {
             let menu = draw_menu_bar(f, app, menu_bar_area);
@@ -1171,6 +1187,10 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
         ("alt-\\ / alt--", "Split focused pane right / down"),
         ("alt-w / alt-r / alt-o", "Close / rotate / focus next pane"),
         ("alt-shift-pgup/pgdn", "Scroll output (any session)"),
+        (
+            "alt-p / alt-shift-p",
+            "Planning pane: dock / fill output area",
+        ),
         ("alt-h", "Show this help"),
         ("ctrl-space", "Toggle menu bar"),
         ("ctrl-q", "Quit"),
@@ -1755,12 +1775,20 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
         _ => return (Vec::new(), Rect::default(), Vec::new()),
     };
 
+    // Rebuilt every frame so labels reflect live state — "Stop" vs "Start",
+    // the current model, whether a restart is pending.
+    let sections = app.menu();
+    if sections.is_empty() {
+        return (Vec::new(), Rect::default(), Vec::new());
+    }
+    let selected_top = selected_top.min(sections.len() - 1);
+
     let mut spans = Vec::new();
     let mut item_areas = Vec::new();
     let mut x = area.x;
-    for (idx, (label, _)) in MENU.iter().enumerate() {
-        let text = format!(" {} ", label);
-        let width = text.len() as u16;
+    for (idx, section) in sections.iter().enumerate() {
+        let text = format!(" {} ", section.title);
+        let width = text.chars().count() as u16;
         item_areas.push(Rect {
             x,
             y: area.y,
@@ -1784,8 +1812,16 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
         return (item_areas, Rect::default(), Vec::new());
     };
 
-    let entries = MENU[selected_top].1;
-    let width = entries.iter().map(|s| s.len()).max().unwrap_or(0) as u16 + 4;
+    let entries = &sections[selected_top].items;
+    if entries.is_empty() {
+        return (item_areas, Rect::default(), Vec::new());
+    }
+    let sub_idx = sub_idx.min(entries.len() - 1);
+
+    // Width fits the widest label+detail pair, then is clamped so a long
+    // model id cannot push the popup off the right edge of the terminal.
+    let content_width = entries.iter().map(|e| e.width()).max().unwrap_or(0) as u16;
+    let width = (content_width + 4).min(area.width.max(8));
     let x = item_areas
         .get(selected_top)
         .map(|r| r.x)
@@ -1805,13 +1841,44 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
     let rows: Vec<ListItem> = entries
         .iter()
         .enumerate()
-        .map(|(idx, label)| {
-            let style = if idx == sub_idx {
+        .map(|(idx, item)| {
+            if item.action == MenuAction::Separator {
+                return ListItem::new(Line::from(Span::styled(
+                    "─".repeat(inner.width as usize),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            let selected = idx == sub_idx;
+            let base = if !item.enabled {
+                Style::default().fg(Color::DarkGray)
+            } else if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(format!(" {}", label), style)))
+            // Pad between label and detail so values right-align into a
+            // readable column rather than trailing each label.
+            let label_w = item.label.chars().count();
+            let detail_w = item.detail.chars().count();
+            let avail = inner.width as usize;
+            let mut spans = vec![Span::styled(format!(" {}", item.label), base)];
+            if detail_w > 0 {
+                let used = label_w + detail_w + 2;
+                let pad = avail.saturating_sub(used).max(1);
+                spans.push(Span::styled(" ".repeat(pad), base));
+                let detail_style = if selected || !item.enabled {
+                    base
+                } else {
+                    base.fg(Color::Cyan)
+                };
+                spans.push(Span::styled(format!("{} ", item.detail), detail_style));
+            } else if selected {
+                // Extend the highlight across the row so selection reads as a
+                // bar rather than stopping at the end of the text.
+                let pad = avail.saturating_sub(label_w + 1);
+                spans.push(Span::styled(" ".repeat(pad), base));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     f.render_widget(List::new(rows), inner);
@@ -2214,9 +2281,804 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     }
 }
 
+// ── Planning pane ─────────────────────────────────────────────────────────
+
+/// Contract `$HOME` to `~` for display.
+fn contract_home(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && s.starts_with(&home) => {
+            format!("~{}", &s[home.len()..])
+        }
+        _ => s,
+    }
+}
+
+/// Coarse relative age: the sidebar only needs enough to order things by feel.
+fn relative_age(then: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        86400..=172_799 => "yesterday".to_string(),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// Truncate to `width` columns, ellipsizing when it doesn't fit.
+fn ellipsize(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn spinner_frame() -> char {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    SPINNER[(ms / 120) as usize % SPINNER.len()]
+}
+
+/// Render the planning pane into a split leaf.
+///
+/// The pane is a document, not a log: a thread list on the left, and on the
+/// right a header that says what the thread is grounded in, the transcript,
+/// an input that grows with the paragraph you're writing, and a status row.
+fn draw_planning_in(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    use crate::app::PlanningFocus;
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Planning ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Sidebar collapses to zero width, giving the transcript the whole pane.
+    let (sidebar_area, main_area) = if app.planning.sidebar_collapsed {
+        (Rect { width: 0, ..inner }, inner)
+    } else {
+        let pct = app.config.planning.sidebar_width_pct();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(pct), Constraint::Min(20)])
+            .split(inner);
+        (cols[0], cols[1])
+    };
+
+    if sidebar_area.width > 2 {
+        draw_planning_sidebar(f, app, sidebar_area);
+    }
+
+    let Some(thread) = app.planning.thread.as_ref() else {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no thread — n to start one",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+        f.render_widget(hint, main_area);
+        // The overlays still have to draw: deleting from the list and
+        // switching backend are both things you do with no thread open.
+        draw_planning_overlays(f, app, area);
+        return;
+    };
+
+    // The input grows with its content; the overflow strip and status row take
+    // fixed rows off the top and bottom of what's left for the transcript.
+    let input_rows = {
+        let cols = main_area.width.max(1) as usize;
+        let chars = app.planning.input.chars().count() + 3;
+        (chars.div_ceil(cols)).clamp(1, 5) as u16
+    };
+    let overflow_rows = if app.planning.overflow { 2 } else { 0 };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),             // header
+            Constraint::Min(3),                // transcript
+            Constraint::Length(overflow_rows), // overflow prompt
+            Constraint::Length(input_rows),    // input
+            Constraint::Length(1),             // status
+        ])
+        .split(main_area);
+
+    draw_planning_header(f, app, thread, rows[0]);
+    draw_planning_transcript(f, app, thread, rows[1]);
+    if overflow_rows > 0 {
+        draw_planning_overflow(f, app, rows[2]);
+    }
+    draw_planning_input(
+        f,
+        app,
+        rows[3],
+        focused && app.planning.focus == PlanningFocus::Transcript,
+    );
+    draw_planning_status(f, app, thread, rows[4]);
+
+    draw_planning_overlays(f, app, area);
+}
+
+/// Picker and delete confirmation, drawn over the pane in either state.
+fn draw_planning_overlays(f: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.planning.picker.is_some() {
+        draw_planning_picker(f, app, area);
+    }
+    if app.planning.confirm_delete.is_some() {
+        draw_planning_delete_confirm(f, app, area);
+    }
+    if app.planning.handoff.is_some() {
+        draw_planning_handoff(f, app, area);
+    }
+}
+
+/// Pick the session a committed plan is handed to as work.
+fn draw_planning_handoff(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let targets = app.planning_handoff_targets();
+    let sel = app.planning.handoff.unwrap_or(0);
+    let height = (targets.len() as u16 + 2).min(area.height).max(3);
+    let popup = centered_rect(70, height, area);
+    f.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, (id, name))| {
+            let style = if i == sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {}", name), style),
+                Span::styled(format!("  #{}", id), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(" Hand plan to ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        ),
+        popup,
+    );
+}
+
+/// Thread list: two lines per row so a title has room to breathe.
+fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
+    use crate::app::PlanningFocus;
+
+    let open_id = app.planning.thread.as_ref().map(|t| t.id.as_str());
+    let focused_list = app.planning.focus == PlanningFocus::Sidebar;
+    let width = area.width.saturating_sub(2) as usize;
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        "Threads",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::from(""));
+
+    // Reserve the bottom rows for pinned decisions and the count footer.
+    let decisions = app
+        .planning
+        .thread
+        .as_ref()
+        .map(|t| t.decisions.clone())
+        .unwrap_or_default();
+    let decisions_rows = if decisions.is_empty() {
+        0
+    } else {
+        (decisions.len() + 2).min(area.height as usize / 3)
+    };
+    let list_budget = (area.height as usize)
+        .saturating_sub(3 + decisions_rows)
+        .max(2);
+
+    for (i, t) in app.planning.threads.iter().enumerate() {
+        if lines.len() + 2 > list_budget + 2 {
+            break;
+        }
+        let is_open = open_id == Some(t.id.as_str());
+        let is_sel = i == app.planning.list_selected;
+        let marker = if is_open { "▸ " } else { "  " };
+        // The open thread stays marked even when focus is elsewhere; the
+        // selection highlight only means something while the list has focus.
+        let title_style = if is_open || (is_sel && focused_list) {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(ellipsize(&t.title, width.saturating_sub(2)), title_style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("   {} · {} msg", relative_age(t.updated), t.messages),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Pinned decisions: what you scroll back for is usually "what did we
+    // decide about X", and a list of those is cheaper to scan than the
+    // transcript.
+    if !decisions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Decisions",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for d in decisions.iter().take(decisions_rows.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(
+                format!("· {}", ellipsize(d, width.saturating_sub(2))),
+                Style::default().fg(Color::Green),
+            )));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+
+    // Count footer pinned to the last row.
+    if area.height >= 2 {
+        let footer = Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        };
+        let n = app.planning.threads.len();
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {} thread{}", n, if n == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            )),
+            footer,
+        );
+    }
+}
+
+/// Title, scope root, and grounding state.
+///
+/// Staleness lives in the persistent chrome rather than a status flash: it is
+/// what tells you whether the brief still describes the repo.
+fn draw_planning_header(
+    f: &mut Frame<'_>,
+    _app: &App,
+    thread: &crate::planning::store::Thread,
+    area: Rect,
+) {
+    let stale = thread.stale_reads();
+    let reads = thread.reads.len();
+    let mut scope: Vec<Span> = vec![Span::styled(
+        format!(" {} · {} files read", contract_home(&thread.root), reads),
+        Style::default().fg(Color::DarkGray),
+    )];
+    if !stale.is_empty() {
+        scope.push(Span::styled(
+            format!(" · {} changed since", stale.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" {}", thread.title),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(scope),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The transcript, oldest first, with a rule wherever the model changed.
+fn draw_planning_transcript(
+    f: &mut Frame<'_>,
+    app: &App,
+    thread: &crate::planning::store::Thread,
+    area: Rect,
+) {
+    use crate::planning::store::Role;
+
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut prev_model: Option<String> = None;
+
+    for m in &thread.messages {
+        // Show the model seam: per-message provider/model is recorded so you
+        // can see where a thread switched from a local model to a frontier
+        // one, which is how you judge whether earlier turns deserve a re-run.
+        if m.role == Role::Assistant && !m.model.is_empty() {
+            let changed = prev_model.as_deref() != Some(m.model.as_str());
+            if changed && prev_model.is_some() {
+                let label = format!(" {} ", m.attribution());
+                let rule_w = width.saturating_sub(label.chars().count() + 2);
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}──", "─".repeat(rule_w), label),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            prev_model = Some(m.model.clone());
+        }
+
+        let attribution = m.attribution();
+        // Hand-edited messages lose their metadata by design — markdown wins
+        // on text and metadata degrades rather than lying — so an empty
+        // attribution renders as a generic label, not a blank gutter.
+        let (label, style) = match m.role {
+            Role::User => ("you".to_string(), Style::default().fg(Color::DarkGray)),
+            Role::Assistant if attribution.trim().is_empty() => (
+                "assistant".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Role::Assistant => (attribution, Style::default().fg(Color::Cyan)),
+        };
+        lines.push(Line::from(Span::styled(format!(" {}", label), style)));
+        for l in wrap_text(&m.text, width.saturating_sub(2).max(8)) {
+            lines.push(Line::from(format!("   {}", l)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if app.planning.busy && !app.planning.status.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {} {}", spinner_frame(), app.planning.status),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    // Scroll counts lines up from the tail; 0 pins to the bottom.
+    let h = area.height as usize;
+    let total = lines.len();
+    let scroll_max = total.saturating_sub(h);
+    let end = total.saturating_sub(app.planning.scroll.min(scroll_max));
+    let start = end.saturating_sub(h);
+    let window: Vec<Line> = lines[start..end].to_vec();
+    f.render_widget(Paragraph::new(window), area);
+}
+
+/// Multi-line input. Enter sends; Alt+Enter inserts a newline, because a
+/// planning message is usually a paragraph.
+fn draw_planning_input(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    let dim = app.planning.busy;
+    let mut pos = app.planning.cursor.min(app.planning.input.len());
+    while pos > 0 && !app.planning.input.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let (before, after) = app.planning.input.split_at(pos);
+    let (cursor_ch, rest) = match after.chars().next() {
+        Some(ch) => (&after[..ch.len_utf8()], &after[ch.len_utf8()..]),
+        None => (" ", ""),
+    };
+    let base = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![Span::styled(" > ", Style::default().fg(Color::Cyan))];
+    spans.push(Span::styled(before.replace('\n', "⏎"), base));
+    if focused && !dim {
+        spans.push(Span::styled(
+            cursor_ch.replace('\n', "⏎"),
+            Style::default().fg(Color::Black).bg(Color::White),
+        ));
+    } else {
+        spans.push(Span::styled(cursor_ch.replace('\n', "⏎"), base));
+    }
+    spans.push(Span::styled(rest.replace('\n', "⏎"), base));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Backend, context usage, and whichever of error/status/last-plan matters.
+/// Token counts for the context meter. Sub-1k values keep their digits: the
+/// old `used / 1000` rendered every short thread as "0k", which reads as a
+/// meter that is not measuring anything rather than one reporting a small
+/// number.
+fn fmt_tokens(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{}k", n / 1000)
+    }
+}
+
+fn draw_planning_status(
+    f: &mut Frame<'_>,
+    app: &App,
+    thread: &crate::planning::store::Thread,
+    area: Rect,
+) {
+    let mut spans: Vec<Span> = Vec::new();
+
+    let label = app.planning.backend_label();
+    let backend_style = if app.planning.backend.is_none() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    spans.push(Span::styled(format!(" {}", label), backend_style));
+
+    // Context usage earns permanent space: it is the number whose meaning
+    // changes when you switch models.
+    if let Some(b) = app.planning.backend.as_ref() {
+        if b.max_context_tokens > 0 {
+            let used = crate::planning::estimate_tokens(&thread.messages, &app.planning.input);
+            // Two different numbers, and conflating them is what made this
+            // meter look broken: `used` is what the *next* turn starts from
+            // (the transcript, which never carries tool traffic), while the
+            // peak is what the last turn actually sent — file contents and
+            // all. A turn that reads a codebase moves only the second one.
+            let peak = app.planning.last_peak_tokens;
+            let worst = used.max(peak);
+            let pct = worst * 100 / b.max_context_tokens.max(1);
+            let style = if pct >= 90 {
+                Style::default().fg(Color::Red)
+            } else if pct >= 75 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(
+                format!(
+                    "    ~{}/{}",
+                    fmt_tokens(used),
+                    fmt_tokens(b.max_context_tokens)
+                ),
+                style,
+            ));
+            if peak > used {
+                spans.push(Span::styled(format!(" (peak {})", fmt_tokens(peak)), style));
+            }
+        }
+    }
+
+    if !app.planning.error.is_empty() {
+        spans.push(Span::styled(
+            format!("    {}", app.planning.error),
+            Style::default().fg(Color::Red),
+        ));
+    } else if app.planning.busy {
+        spans.push(Span::styled(
+            format!("    {} {}", spinner_frame(), app.planning.status),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if !app.planning.status.is_empty() {
+        // Commit and handoff both land here: they finish by clearing `busy`
+        // and leaving a confirmation behind, which would otherwise never be
+        // shown because the spinner branch above is the only other reader.
+        spans.push(Span::styled(
+            format!("    {}", app.planning.status),
+            Style::default().fg(Color::Green),
+        ));
+    } else if let Some(p) = crate::planning::store::latest_plan(&thread.id) {
+        spans.push(Span::styled(
+            format!("    {}", contract_home(&p)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The one place the design refuses to be silent. Automatic compaction would
+/// eat the early turns, and in a planning thread those are usually the design
+/// premises everything downstream rests on.
+fn draw_planning_overflow(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let label = app.planning.backend_label();
+    let limit = app
+        .planning
+        .backend
+        .as_ref()
+        .map(|b| b.max_context_tokens)
+        .unwrap_or(0);
+    let used = app
+        .planning
+        .thread
+        .as_ref()
+        .map(|t| crate::planning::estimate_tokens(&t.messages, &app.planning.input))
+        .unwrap_or(0);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(
+                " thread is ~{}k tokens, over {}'s {}k limit",
+                used / 1000,
+                label,
+                limit / 1000
+            ),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            " [c] compact   [b] switch backend   [Esc] dismiss",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Backend picker, reusing the new-session kind-selector idiom rather than
+/// inventing a second dropdown.
+/// The orchestrator's model list, as reported by its endpoint.
+///
+/// A full overlay rather than a menu row: a local server serves dozens of
+/// models, and stepping through those one Enter at a time is not choosing.
+fn draw_orchestrator_model_picker(f: &mut Frame<'_>, app: &App, area: Rect, sel: usize) -> Rect {
+    let models = &app.orchestrator_models;
+    let height = (models.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(3);
+    let popup = centered_rect(60, height, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Orchestrator model · ↵ select · r reprobe · esc ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    if models.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " endpoint reported no models",
+                Style::default().fg(Color::Red),
+            ))
+            .block(block),
+            popup,
+        );
+        return popup;
+    }
+
+    // Keep the highlighted row on screen when the server serves more models
+    // than the popup has rows.
+    let rows = popup.height.saturating_sub(2) as usize;
+    let first = sel.saturating_sub(rows.saturating_sub(1));
+    let current = &app.config.orchestrator.model;
+    let items: Vec<ListItem> = models
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, m)| {
+            let style = if i == sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let marker = if m == current { "●" } else { " " };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!(" {} {}", marker, m),
+                style,
+            )]))
+        })
+        .collect();
+
+    f.render_widget(List::new(items).block(block), popup);
+    popup
+}
+
+fn draw_planning_picker(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let names = app.config.planning.backend_names();
+    let sel = app.planning.picker.unwrap_or(0);
+    if let Some(msel) = app.planning.picker_model {
+        draw_planning_model_picker(
+            f,
+            app,
+            area,
+            names.get(sel).cloned().unwrap_or_default(),
+            msel,
+        );
+        return;
+    }
+    let height = (names.len() as u16 + 2).min(area.height).max(3);
+    let popup = centered_rect(70, height, area);
+    f.render_widget(Clear, popup);
+
+    if names.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " no backends — configure [agents.*] or [planning.backends.*]",
+                Style::default().fg(Color::Red),
+            ))
+            .block(
+                Block::default()
+                    .title(" Backend ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let b = app.config.planning.backend(n);
+            let detail = b
+                .as_ref()
+                .map(|b| {
+                    // Three states worth telling apart: probed with a list,
+                    // probed and told nothing, and never asked.
+                    let probe = match app.planning.model_cache.get(n) {
+                        Some(m) if !m.is_empty() => format!(" · {} models ›", m.len()),
+                        Some(_) => " · endpoint unreachable".to_string(),
+                        None if b.is_probeable() => " · probing…".to_string(),
+                        None => String::new(),
+                    };
+                    format!(
+                        "{} · {} · {}k{}",
+                        b.provider,
+                        if b.model.is_empty() { "—" } else { &b.model },
+                        b.max_context_tokens / 1000,
+                        probe
+                    )
+                })
+                .unwrap_or_default();
+            let style = if i == sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<12}", n), style),
+                Span::styled(
+                    format!("  {}", detail),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(" Backend · ↵/→ models · r reprobe ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
+
+/// The models a backend's endpoint says it is serving right now. Second level
+/// of the picker: an endpoint is not a choice of model, and on a local server
+/// the loaded set changes without the config knowing.
+fn draw_planning_model_picker(
+    f: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    backend: String,
+    sel: usize,
+) {
+    let models = app
+        .planning
+        .model_cache
+        .get(&backend)
+        .cloned()
+        .unwrap_or_default();
+    let current = app.config.planning.backend(&backend).map(|b| b.model);
+
+    // Keep the highlighted row on screen for a server serving more models
+    // than the popup has rows.
+    let height = (models.len() as u16 + 2).min(area.height).max(3);
+    let popup = centered_rect(70, height, area);
+    let rows = popup.height.saturating_sub(2) as usize;
+    let first = sel.saturating_sub(rows.saturating_sub(1));
+    f.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = models
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, m)| {
+            let style = if i == sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let marker = if current.as_deref() == Some(m.as_str()) {
+                "●"
+            } else {
+                " "
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!(" {} {}", marker, m),
+                style,
+            )]))
+        })
+        .collect();
+
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(format!(" Model · {} · ↵ select · ← back ", backend))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
+
+fn draw_planning_delete_confirm(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let target = app.planning.confirm_delete.as_ref().and_then(|id| {
+        app.planning
+            .threads
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| (t.title.clone(), t.root.clone()))
+    });
+    let (title, root) = target.unwrap_or_default();
+    let popup = centered_rect(60, 5, area);
+    f.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::raw(format!(" delete \"{}\"?", ellipsize(&title, 40)))),
+        // Threads are global, so two repos can hold same-named threads. The
+        // root is what tells them apart before an irreversible delete.
+        Line::from(Span::styled(
+            format!(" {}", ellipsize(&contract_home(&root), 50)),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            " [y] delete   [n/Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Confirm ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        popup,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `used / 1000` rendered every thread under 1000 tokens as "0k", which
+    /// reads as a meter that is not measuring anything.
+    #[test]
+    fn the_context_meter_keeps_digits_below_a_thousand_tokens() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(420), "420");
+        assert_eq!(fmt_tokens(1_900), "1.9k");
+        assert_eq!(fmt_tokens(47_000), "47k");
+        assert_eq!(fmt_tokens(131_072), "131k");
+    }
 
     #[test]
     fn palette_popup_never_claims_rows_it_does_not_have() {
@@ -2386,6 +3248,53 @@ mod tests {
         assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
         assert_eq!(wrap_text("", 10), vec![""]);
         assert_eq!(wrap_text("one\ntwo", 10), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn ellipsize_only_truncates_when_it_has_to() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("exactfit", 8), "exactfit");
+        // The ellipsis is part of the budget: the result is `width` columns.
+        assert_eq!(ellipsize("truncate me", 5), "trun…");
+        assert_eq!(ellipsize("anything", 0), "");
+    }
+
+    #[test]
+    fn ellipsize_counts_chars_not_bytes() {
+        // A multi-byte title must not be cut mid-codepoint, and its width is
+        // measured in columns the terminal draws, not bytes.
+        assert_eq!(ellipsize("héllo wörld", 20), "héllo wörld");
+        assert_eq!(ellipsize("héllo wörld", 5), "héll…");
+        assert_eq!(ellipsize("héllo wörld", 5).chars().count(), 5);
+    }
+
+    #[test]
+    fn relative_age_buckets_by_magnitude() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(relative_age(now), "just now");
+        assert_eq!(relative_age(now - 120), "2m");
+        assert_eq!(relative_age(now - 7200), "2h");
+        assert_eq!(relative_age(now - 90_000), "yesterday");
+        assert_eq!(relative_age(now - 3 * 86400), "3d");
+        // A timestamp from the future must not underflow into a huge age.
+        assert_eq!(relative_age(now + 500), "just now");
+    }
+
+    #[test]
+    fn contract_home_only_rewrites_the_home_prefix() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let inside = std::path::PathBuf::from(&home).join("src/linkshell");
+        assert_eq!(contract_home(&inside), "~/src/linkshell");
+        assert_eq!(
+            contract_home(std::path::Path::new("/etc/hosts")),
+            "/etc/hosts"
+        );
     }
 
     #[test]
