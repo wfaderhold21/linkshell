@@ -672,6 +672,10 @@ fn handle_event(app: &mut App, event: AppEvent) {
         } => {
             app.handle_orchestrator_proposal(tool, detail, response_tx);
         }
+        AppEvent::OrchestratorPersona(name) => {
+            app.orchestrator_persona = name;
+            app.needs_redraw = true;
+        }
         AppEvent::OrchestratorStatus(status) => {
             app.orchestrator_status = status.map(|s| (s, std::time::Instant::now()));
             app.needs_redraw = true;

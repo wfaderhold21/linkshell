@@ -22,6 +22,9 @@ pub struct Config {
     pub orchestrator: OrchestratorConfig,
     pub chat: ChatConfig,
     pub profiles: Vec<Profile>,
+    /// User-defined personas; a name matching a builtin replaces it.
+    #[serde(default)]
+    pub personas: Vec<Persona>,
 }
 
 // ── [orchestrator] ────────────────────────────────────────────────────────
@@ -112,6 +115,20 @@ pub struct OrchestratorConfig {
     /// Lines of session output inlined into a [linkshell event]
     /// notification. The orchestrator can always read_output for more.
     pub event_tail_lines: usize,
+    /// Tool names the orchestrator may call. Empty means the full set. This
+    /// is the mechanical half of a persona: a system-prompt instruction to be
+    /// cautious is a suggestion to a small local model, whereas omitting
+    /// `send_input` from the schema is a guarantee.
+    pub allowed_tools: Vec<String>,
+    /// Extra text appended to the system prompt by the active persona.
+    pub persona_note: String,
+    /// Name of the active persona (informational; shown in the status row).
+    pub persona: String,
+    /// Seconds during which an identical (tool, arguments) call is answered
+    /// with a duplicate_call error instead of being re-executed. Bounds the
+    /// cross-turn loops that max_tool_iterations (per-turn) cannot see.
+    /// 0 disables.
+    pub tool_dedup_secs: u64,
     /// Cap on lines returned by send_input wait_ready / `input --wait`.
     /// Longer replies are truncated to the last N lines with a marker.
     /// 0 disables.
@@ -156,6 +173,10 @@ impl Default for OrchestratorConfig {
             max_context_tokens: 60_000,
             tool_result_keep_turns: 3,
             event_tail_lines: 5,
+            allowed_tools: Vec::new(),
+            persona_note: String::new(),
+            persona: String::new(),
+            tool_dedup_secs: 45,
             wait_ready_max_lines: 80,
         }
     }
@@ -398,6 +419,136 @@ impl Default for NotificationsConfig {
             debounce_secs: 30,
         }
     }
+}
+
+/// A named behavioural preset layered over `[orchestrator]`.
+///
+/// Personas modulate *autonomy and eagerness*, not correctness: the loop
+/// suppressor, the elision stubs and the send_input evidence are
+/// unconditional. Every field is optional, and `None` means "inherit from
+/// `[orchestrator]`" — an explicit setting there still wins unless the
+/// persona overrides it.
+///
+///   [[personas]]
+///   name = "assistant"
+///   events = []
+///   approval = "propose"
+///   allowed_tools = ["list_sessions", "read_output", "use_skill", "remember"]
+///   max_tool_iterations = 4
+///   tool_dedup_secs = 300
+///   note = "You observe and advise. You do not drive sessions."
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Persona {
+    pub name: String,
+    pub events: Option<Vec<String>>,
+    pub event_cooldown_secs: Option<u64>,
+    pub approval: Option<String>,
+    pub auto_approve: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub max_tool_iterations: Option<usize>,
+    pub tool_dedup_secs: Option<u64>,
+    pub max_context_tokens: Option<usize>,
+    pub event_tail_lines: Option<usize>,
+    /// Appended to the system prompt.
+    pub note: String,
+}
+
+impl Persona {
+    /// Layer this persona over a base orchestrator config.
+    pub fn apply(&self, base: &OrchestratorConfig) -> OrchestratorConfig {
+        let mut cfg = base.clone();
+        if let Some(v) = &self.events {
+            cfg.events = v.clone();
+        }
+        if let Some(v) = self.event_cooldown_secs {
+            cfg.event_cooldown_secs = v;
+        }
+        if let Some(v) = &self.approval {
+            cfg.approval = v.clone();
+        }
+        if let Some(v) = &self.auto_approve {
+            cfg.auto_approve = v.clone();
+        }
+        if let Some(v) = &self.allowed_tools {
+            cfg.allowed_tools = v.clone();
+        }
+        if let Some(v) = self.max_tool_iterations {
+            cfg.max_tool_iterations = v;
+        }
+        if let Some(v) = self.tool_dedup_secs {
+            cfg.tool_dedup_secs = v;
+        }
+        if let Some(v) = self.max_context_tokens {
+            cfg.max_context_tokens = v;
+        }
+        if let Some(v) = self.event_tail_lines {
+            cfg.event_tail_lines = v;
+        }
+        cfg.persona_note = self.note.clone();
+        cfg.persona = self.name.clone();
+        cfg
+    }
+}
+
+/// The three shipped personas, used when no `[[personas]]` entry matches.
+/// Ordered by autonomy: assistant looks, monitor reports, orchestrator acts.
+pub fn builtin_personas() -> Vec<Persona> {
+    let read_only = vec![
+        "list_sessions".to_string(),
+        "read_output".to_string(),
+        "use_skill".to_string(),
+        "remember".to_string(),
+    ];
+    vec![
+        Persona {
+            name: "assistant".into(),
+            events: Some(Vec::new()),
+            approval: Some("propose".into()),
+            allowed_tools: Some(read_only.clone()),
+            max_tool_iterations: Some(4),
+            tool_dedup_secs: Some(300),
+            note: "You are a reactive assistant. You answer when spoken to. You can \
+                   inspect sessions but cannot drive them; if something needs doing, \
+                   say so and let the user do it."
+                .into(),
+            ..Default::default()
+        },
+        Persona {
+            name: "monitor".into(),
+            events: Some(vec!["waiting".into(), "error".into(), "dead".into()]),
+            event_cooldown_secs: Some(60),
+            approval: Some("propose".into()),
+            allowed_tools: None, // full set, but writes are gated by propose
+            auto_approve: Some(read_only),
+            max_tool_iterations: Some(8),
+            tool_dedup_secs: Some(120),
+            note: "You watch sessions and report. Investigate freely with read-only \
+                   tools; anything that changes a session is proposed for approval \
+                   first. Prefer one clear report over a stream of updates."
+                .into(),
+            ..Default::default()
+        },
+        Persona {
+            name: "orchestrator".into(),
+            events: Some(vec![
+                "ready".into(),
+                "waiting".into(),
+                "error".into(),
+                "dead".into(),
+            ]),
+            event_cooldown_secs: Some(15),
+            approval: Some("auto".into()),
+            max_tool_iterations: Some(12),
+            tool_dedup_secs: Some(45),
+            note: "You actively route work between sessions. Act without asking for \
+                   routine steps. Before repeating an action, check whether the \
+                   previous one had an effect; if you cannot tell, say so rather \
+                   than trying again."
+                .into(),
+            ..Default::default()
+        },
+    ]
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]

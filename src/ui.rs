@@ -1484,7 +1484,17 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let frame = FRAMES[(since.elapsed().as_millis() / 120) as usize % FRAMES.len()];
         lines.push(Line::from(Span::styled(
-            format!("{} {}: {}", frame, app.config.orchestrator.name, status),
+            format!(
+                "{} {}{}: {}",
+                frame,
+                app.config.orchestrator.name,
+                if app.orchestrator_persona.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", app.orchestrator_persona)
+                },
+                status
+            ),
             Style::default().fg(Color::Yellow),
         )));
     }

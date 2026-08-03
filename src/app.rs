@@ -506,6 +506,11 @@ pub struct App {
     /// Live progress of the orchestrator's current turn, plus when it was
     /// set (drives the chat-pane spinner). None while idle.
     pub orchestrator_status: Option<(String, std::time::Instant)>,
+    /// Name of the active persona (empty = bare [orchestrator] config).
+    pub orchestrator_persona: String,
+    /// Pristine [orchestrator] config. Personas layer over *this*, never over
+    /// an already-layered config, so swapping A -> B -> A is idempotent.
+    pub orchestrator_base: Option<crate::config::OrchestratorConfig>,
     /// Per-(session_id, state label) cooldown for proactive orchestrator events
     orch_event_cooldowns: HashMap<(usize, &'static str), std::time::Instant>,
     /// Session behind the most recent permission request surfaced in chat;
@@ -604,6 +609,8 @@ impl App {
             orchestrator_stats: crate::session::TokenStats::default(),
             orchestrator_ctx_max: None,
             orchestrator_status: None,
+            orchestrator_persona: String::new(),
+            orchestrator_base: None,
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
             chat: ChatState::default(),
@@ -2310,6 +2317,29 @@ impl App {
             anyhow::bail!("orchestrator already running");
         }
         self.orchestrator_paused = false;
+        // Remember the unlayered config once, then apply the configured
+        // default persona (if any) before anything reads cfg.
+        // Not get_or_insert_with: the closure would borrow self while
+        // orchestrator_base is already mutably borrowed.
+        let base = match &self.orchestrator_base {
+            Some(b) => b.clone(),
+            None => {
+                let b = self.config.orchestrator.clone();
+                self.orchestrator_base = Some(b.clone());
+                b
+            }
+        };
+        let want = base.persona.clone();
+        if !want.is_empty() && self.orchestrator_persona != want {
+            if let Some(p) = self.personas().into_iter().find(|p| p.name == want) {
+                let mut cfg = (*self.config).clone();
+                cfg.orchestrator = p.apply(&base);
+                self.config = Arc::new(cfg);
+                self.orchestrator_persona = want;
+            } else {
+                self.chat_system(format!("unknown persona \"{}\" in config; ignoring", want));
+            }
+        }
         let cfg = self.config.orchestrator.clone();
         match cfg.class()? {
             crate::config::OrchestratorClass::Api(_) => {
@@ -2472,8 +2502,36 @@ impl App {
                         .insert(session_id, (response_tx, line_offset));
                     return; // reply arrives via check_ipc_replies on READY
                 }
-                s.write_bytes(shape_injected_input(&text));
-                serde_json::json!({"ok": true})
+                // Fire-and-forget, but never a bare {"ok": true}: an
+                // unconditional success is indistinguishable from a send into
+                // a paused or dead session, so the model cannot tell a no-op
+                // from a real action and retries. Report what is knowable
+                // synchronously and point at wait_ready for the rest.
+                if s.paused {
+                    serde_json::json!({
+                        "error": "session is paused (SIGSTOP); resume_session first — \
+                                  input would sit unread in the terminal buffer",
+                        "session_id": session_id
+                    })
+                } else if s.state_label().eq_ignore_ascii_case("dead") {
+                    serde_json::json!({
+                        "error": "session is dead; input was not sent",
+                        "session_id": session_id
+                    })
+                } else {
+                    let before = s.output_lines.len();
+                    s.write_bytes(shape_injected_input(&text));
+                    serde_json::json!({
+                        "ok": true,
+                        "session_id": session_id,
+                        "state_at_send": s.state_label(),
+                        "output_lines_at_send": before,
+                        "note": "input was written to the terminal; this is not \
+                                 confirmation it was accepted or acted on. Use \
+                                 wait_ready=true, or read_output later and compare \
+                                 against output_lines_at_send, to verify."
+                    })
+                }
             }
             OrchestratorReq::PipeAdd {
                 source,
@@ -3771,6 +3829,8 @@ impl App {
                         .to_string()
                 };
             }
+            ["persona"] => self.report_personas(),
+            ["persona", name] => self.set_persona(name),
             ["confirm-kill"] => self.resolve_pending_kill(true),
             ["deny-kill"] => self.resolve_pending_kill(false),
             ["interrupt"] | ["stop"] => self.interrupt_orchestrator(),
@@ -3783,6 +3843,78 @@ impl App {
             ["no", t] => self.answer_permission(Some(t), false),
             _ => {}
         }
+    }
+
+    /// All personas: user-defined entries in [[personas]] shadow builtins of
+    /// the same name.
+    fn personas(&self) -> Vec<crate::config::Persona> {
+        let mut out = crate::config::builtin_personas();
+        for p in &self.config.personas {
+            match out.iter_mut().find(|b| b.name == p.name) {
+                Some(slot) => *slot = p.clone(),
+                None => out.push(p.clone()),
+            }
+        }
+        out
+    }
+
+    fn report_personas(&mut self) {
+        let names: Vec<String> = self
+            .personas()
+            .iter()
+            .map(|p| {
+                if p.name == self.orchestrator_persona {
+                    format!("{}*", p.name)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect();
+        self.command_result = format!("personas: {} (* = active)", names.join(", "));
+    }
+
+    /// Swap the active persona. History is preserved — a persona changes how
+    /// the agent behaves from here, not what it knows. In-flight tool calls
+    /// complete under the old config; the allowlist applies from the next turn.
+    fn set_persona(&mut self, name: &str) {
+        let Some(persona) = self.personas().into_iter().find(|p| p.name == name) else {
+            self.command_result = format!("unknown persona \"{}\"; try /persona", name);
+            return;
+        };
+        // Not get_or_insert_with: the closure would borrow self while
+        // orchestrator_base is already mutably borrowed.
+        let base = match &self.orchestrator_base {
+            Some(b) => b.clone(),
+            None => {
+                let b = self.config.orchestrator.clone();
+                self.orchestrator_base = Some(b.clone());
+                b
+            }
+        };
+        let cfg = persona.apply(&base);
+        let Some(h) = &self.orchestrator else {
+            // No API orchestrator running: still record it so a later
+            // /orchestrator start picks the persona up.
+            let mut config = (*self.config).clone();
+            config.orchestrator = cfg;
+            self.config = Arc::new(config);
+            self.orchestrator_persona = persona.name.clone();
+            self.command_result = format!("persona set to {} (takes effect on start)", name);
+            return;
+        };
+        let tx = h.tx.clone();
+        let boxed = Box::new(cfg.clone());
+        let mut config = (*self.config).clone();
+        config.orchestrator = cfg;
+        self.config = Arc::new(config);
+        self.orchestrator_persona = persona.name.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(crate::orchestrator::OrchestratorMsg::SetConfig(boxed))
+                .await;
+        });
+        self.chat_system(format!("persona → {}", name));
+        self.command_result = format!("persona set to {}", name);
     }
 
     /// Break the orchestrator out of its current turn (/interrupt, /stop).
