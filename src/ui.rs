@@ -476,11 +476,16 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
             // Alternate-screen apps have no vt100 scrollback; show a window of
             // our captured line history instead. history_scroll counts lines
             // up from the tail of output_lines.
-            let total = session.output_lines.len();
-            let end = total.saturating_sub(session.history_scroll);
+            let history = session.history_lines();
+            let total = history.len();
+            let rows = (display_rows as usize).min(total);
+            // Scrolled fully to the top, `total - history_scroll` reaches 0
+            // and the window collapses to nothing — a scrollback that goes
+            // blank exactly when you reach the beginning of it. Hold the
+            // window open at the oldest full page instead.
+            let end = total.saturating_sub(session.history_scroll).max(rows);
             let start = end.saturating_sub(display_rows as usize);
-            session
-                .output_lines
+            history
                 .iter()
                 .skip(start)
                 .take(end - start)
@@ -4248,6 +4253,37 @@ mod tests {
             let second = layout.status_row_areas[1];
             assert!(second.height == 1 && second.width > 0);
         }
+    }
+
+    // ── Scrollback ────────────────────────────────────────────────────────
+
+    /// Scrolled fully to the top, `total - history_scroll` reaches 0 and the
+    /// window collapsed to nothing — the scrollback went blank exactly when
+    /// you reached the beginning of it.
+    #[test]
+    fn the_oldest_page_of_scrollback_is_not_blank() {
+        let mut app = app_with_sessions(&["cx"]);
+        {
+            let s = &mut app.sessions[0];
+            s.kind = crate::session::SessionKind::Codex;
+            for i in 0..40 {
+                s.push_scrollback_line(format!("line-{i}"));
+            }
+        }
+        // main.rs syncs pane_sizes from the drawn layout; do it by hand here
+        // so the clamp knows how tall the visible page is.
+        app.pane_sizes[0] = (12, 78);
+        app.scroll_up(10_000);
+        let body = render_rows(&app, 80, 20)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("line-0"),
+            "the oldest page should show: {body}"
+        );
+        assert!(body.contains("↑"), "and say it is scrolled: {body}");
     }
 
     // ── Status sidebar ────────────────────────────────────────────────────

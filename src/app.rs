@@ -1409,15 +1409,36 @@ impl App {
         }
     }
 
-    /// Unified scrollback. Normal-screen apps (shells) use vt100's native
-    /// scrollback; full-screen TUIs (claude, codex, opencode, ...) occupy the
-    /// alternate screen where vt100 keeps none, so we scroll through our own
-    /// captured `output_lines` history instead. Same keys, every session type.
+    /// Unified scrollback. Shells use vt100's native scrollback; agent TUIs
+    /// scroll through our own captured `output_lines` history, because vt100
+    /// has none to offer them — claude lives on the alternate screen, and
+    /// codex scrolls inside a DECSTBM region, whose evicted lines the spec
+    /// says to discard. Same keys, every session type.
+    ///
+    /// The kind test is in addition to `alternate_screen()`, not instead of
+    /// it: on its own, `alternate_screen()` is what made codex unscrollable,
+    /// since codex is a normal-screen app and so took the vt100 branch where
+    /// there was never anything to find. An alt-screen shell (vim, less)
+    /// still reaches the history captured before it started.
     pub fn scroll_up(&mut self, lines: usize) {
+        // The visible height, so the offset stops at the oldest full page
+        // rather than at the oldest line. Scrolling past that point moves the
+        // indicator without moving the view, which reads as the scrollback
+        // having silently stopped working.
+        let visible = self
+            .pane_sizes
+            .get(self.focused_pane)
+            .map(|(rows, _)| *rows as usize)
+            .unwrap_or(0);
         if let Some(idx) = self.active_idx() {
             if let Some(session) = self.sessions.get_mut(idx) {
-                if session.screen.screen().alternate_screen() {
-                    let max = session.output_lines.len();
+                if session.kind.captures_scrollback() || session.screen.screen().alternate_screen()
+                {
+                    // Clamp against the buffer the view actually renders. For
+                    // an agent TUI that is the captured transcript, not the
+                    // raw line stream — which is far longer, and would let
+                    // the offset run past the end into a blank window.
+                    let max = session.history_lines().len().saturating_sub(visible);
                     session.history_scroll = (session.history_scroll + lines).min(max);
                 } else {
                     let current = session.screen.screen().scrollback();
@@ -9659,16 +9680,44 @@ mod tests {
         app.scroll_up(20);
         assert_eq!(app.sessions[0].history_scroll, 20);
         assert_eq!(app.scroll_offset(), 20);
-        // …is clamped to what exists…
+        // …is clamped so the oldest *page* is the end of the road, not the
+        // oldest line: scrolling past that moves the indicator without moving
+        // the view, which reads as the scrollback having stopped working.
         app.scroll_up(500);
-        assert_eq!(app.sessions[0].history_scroll, 100);
+        let page = app.pane_sizes[app.focused_pane].0 as usize;
+        assert_eq!(app.sessions[0].history_scroll, 100 - page);
         // …new output does NOT yank the view back…
         app.handle_session_bytes(id, b"more output\r\n".to_vec());
-        assert_eq!(app.sessions[0].history_scroll, 100);
+        assert_eq!(app.sessions[0].history_scroll, 100 - page);
         // …and typing returns to the live tail.
         app.write_to_active(b"x");
         assert_eq!(app.sessions[0].history_scroll, 0);
         assert_eq!(app.scroll_offset(), 0);
+    }
+
+    /// The clamp must be against the buffer the view renders. For an agent
+    /// TUI `output_lines` is the raw PTY line stream — hundreds of repaint
+    /// fragments — and clamping to that let the offset run far past the
+    /// captured transcript, into a window with nothing in it.
+    #[tokio::test]
+    async fn scroll_is_clamped_to_the_captured_transcript_not_the_line_stream() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("cx".to_string(), None).unwrap();
+        app.panes[0] = app.sessions.iter().position(|s| s.id == id);
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            s.kind = crate::session::SessionKind::Codex;
+            // A lot of repaint noise, a little real transcript.
+            for i in 0..500 {
+                s.push_output_line(format!("repaint-{i}"));
+            }
+            for i in 0..60 {
+                s.push_scrollback_line(format!("line-{i}"));
+            }
+        }
+        let page = app.pane_sizes[app.focused_pane].0 as usize;
+        app.scroll_up(10_000);
+        assert_eq!(app.sessions[0].history_scroll, 60usize.saturating_sub(page));
     }
 
     fn orch_request(

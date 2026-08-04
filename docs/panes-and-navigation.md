@@ -75,10 +75,16 @@ session's name and state are the last to go.
 ## Scrollback
 
 `alt-shift-PageUp/PageDown` (and `alt-shift-↑/↓`) scroll every session type the
-same way. Shells use the terminal's native scrollback; full-screen TUIs (claude,
-codex, opencode) scroll through linkshell's captured line history, shown dimmed.
-The view holds position while new output streams in — typing returns you to the
-live tail.
+same way. The view holds position while new output streams in — typing returns
+you to the live tail.
+
+Shells use the terminal's native scrollback. Agent TUIs (claude, codex) scroll
+through a transcript linkshell recovers from the screen as it scrolls, shown
+dimmed, because vt100 has no scrollback to offer them — for two different
+reasons. Claude runs on the alternate screen, which has none by design. Codex
+stays on the normal screen but scrolls inside a `DECSTBM` region, and lines
+evicted from a restricted region are discarded rather than retained, per the
+DEC spec. Scrolling stops at the oldest full page.
 
 Mouse text selection works everywhere: drag to select, auto-copies to clipboard.
 

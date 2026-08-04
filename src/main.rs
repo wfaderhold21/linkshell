@@ -913,15 +913,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.planning_key(key);
                 return;
             }
-            // Full-screen agent TUIs (claude, codex) ignore the terminal's
+            // Agent TUIs (claude, codex) ignore the terminal's
             // PageUp/PageDown sequences, so route those keys to linkshell's
             // captured scrollback — the same history the mouse wheel scrolls.
             // Shells and other alt-screen apps (vim, less) still get the keys.
             if key.modifiers.is_empty() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
-                let agent_alt_screen = app.active_session().is_some_and(|s| {
-                    s.kind.captures_alt_scrollback() && s.screen.screen().alternate_screen()
-                });
-                if agent_alt_screen {
+                let agent_tui = app
+                    .active_session()
+                    .is_some_and(|s| s.kind.captures_scrollback());
+                if agent_tui {
                     if key.code == KeyCode::PageUp {
                         app.scroll_up(20);
                     } else {
