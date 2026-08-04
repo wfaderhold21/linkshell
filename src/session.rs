@@ -92,9 +92,17 @@ impl SessionKind {
                 .unwrap_or(false)
     }
 
-    /// True for TUI-based agent sessions whose transcript is useful as scrollback.
-    /// Full-repaint dashboards (htop, btop) would spew garbage if enabled here.
-    pub fn captures_alt_scrollback(&self) -> bool {
+    /// True for TUI-based agent sessions whose transcript is useful as
+    /// scrollback, and which therefore get our own capture rather than
+    /// vt100's. Full-repaint dashboards (htop, btop) would spew garbage if
+    /// enabled here.
+    ///
+    /// Two different reasons these sessions have no usable vt100 scrollback:
+    /// claude lives on the alternate screen, where there is none by design;
+    /// codex stays on the normal screen but scrolls inside a DECSTBM region,
+    /// and vt100 (correctly, per the DEC spec) discards lines evicted from a
+    /// restricted region instead of pushing them to scrollback.
+    pub fn captures_scrollback(&self) -> bool {
         matches!(self, SessionKind::Claude | SessionKind::Codex)
     }
 
@@ -109,6 +117,157 @@ impl SessionKind {
             None
         }
     }
+}
+
+/// Split a chunk after every DECSTBM (`ESC [ params r`) sequence.
+///
+/// Each item is a slice to feed vt100 and, when that slice ended with a
+/// DECSTBM, its parameters — so the caller can mirror the region change vt100
+/// applies but does not expose. The escape stays inside the slice; only the
+/// caller's copy of the region is updated afterwards.
+fn decstbm_segments(data: &[u8]) -> Vec<(&[u8], Option<Vec<u8>>)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] != 0x1b || data[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        while j < data.len() && (data[j].is_ascii_digit() || data[j] == b';') {
+            j += 1;
+        }
+        if j < data.len() && data[j] == b'r' {
+            out.push((&data[start..=j], Some(data[i + 2..j].to_vec())));
+            start = j + 1;
+            i = j + 1;
+        } else {
+            i = j.max(i + 2);
+        }
+    }
+    if start < data.len() || out.is_empty() {
+        out.push((&data[start..], None));
+    }
+    out
+}
+
+/// Upper bound on how finely one segment is split for capture. A burst with
+/// more newlines than this has already replaced everything on screen several
+/// times over, so the older lines are unrecoverable anyway and there is
+/// nothing to buy by rendering the region for each one.
+const MAX_SCROLL_PIECES: usize = 512;
+
+/// Split a segment so each piece performs at most one scroll: after every
+/// newline, which is what scrolls a region in practice.
+fn scroll_pieces(segment: &[u8]) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = Vec::new();
+    let mut start = 0;
+    for (i, b) in segment.iter().enumerate() {
+        if *b == b'\n' {
+            out.push(&segment[start..=i]);
+            start = i + 1;
+            if out.len() >= MAX_SCROLL_PIECES {
+                break;
+            }
+        }
+    }
+    if start < segment.len() {
+        out.push(&segment[start..]);
+    }
+    if out.is_empty() {
+        out.push(segment);
+    }
+    out
+}
+
+/// Whether a slice could possibly scroll the screen. Snapshotting the region
+/// costs a row render, and the overwhelming majority of a repainting TUI's
+/// output is cursor positioning that moves nothing.
+fn may_scroll(segment: &[u8]) -> bool {
+    segment.contains(&b'\n')
+        || segment.contains(&0x0b)
+        || segment.contains(&0x0c)
+        || segment
+            .windows(2)
+            .any(|w| w == b"\x1bD" || w == b"\x1bM" || w == b"\x1bE")
+        || find_final(segment, b'S')
+        || find_final(segment, b'T')
+}
+
+/// True when the slice contains a CSI sequence with the given final byte.
+fn find_final(data: &[u8], final_byte: u8) -> bool {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] != 0x1b || data[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        while j < data.len() && (data[j].is_ascii_digit() || data[j] == b';') {
+            j += 1;
+        }
+        if j < data.len() && data[j] == final_byte {
+            return true;
+        }
+        i = j.max(i + 2);
+    }
+    false
+}
+
+/// Parse DECSTBM parameters (`top;bottom`, 1-based inclusive) into a 0-based
+/// inclusive row range. An empty or degenerate region means "the whole
+/// screen", which is what resets it.
+fn parse_decstbm(params: &[u8], rows: u16) -> Option<(u16, u16)> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut parts = text.split(';');
+    let top: u16 = parts.next().unwrap_or("").trim().parse().unwrap_or(1);
+    let bottom: u16 = parts
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .unwrap_or(rows.max(1));
+    let top = top.max(1) - 1;
+    let bottom = bottom.max(1).min(rows.max(1)) - 1;
+    if top >= bottom {
+        return None;
+    }
+    Some((top, bottom))
+}
+
+/// How many lines scrolled off the top of the region between two snapshots:
+/// where the new top row used to sit in the old ones.
+///
+/// Anchoring on the top row rather than matching the whole overlap is what
+/// makes this work on a live screen. The obvious formulation — the smallest
+/// `k` with `prev[k..] == cur[..n-k]` — never matches in practice, because
+/// the same chunk that scrolled also wrote new content into the bottom rows,
+/// so the two slices always disagree at the tail.
+///
+/// A blank new top row is treated as "no scroll": it identifies nothing, and
+/// blank lines are not worth reconstructing history from. The row below is
+/// checked as corroboration so a screen that merely repeats a line does not
+/// read as having scrolled to it.
+fn scrolled_off(prev: &[String], cur: &[String]) -> usize {
+    let n = prev.len();
+    if n == 0 || cur.is_empty() {
+        return 0;
+    }
+    let head = cur[0].trim();
+    if head.is_empty() {
+        return 0;
+    }
+    for k in 1..n {
+        if prev[k].trim() != head {
+            continue;
+        }
+        if k + 1 < n && cur.len() >= 2 && prev[k + 1] != cur[1] {
+            continue;
+        }
+        return k;
+    }
+    0
 }
 
 /// True when a command basename is `claude` or a claude wrapper following the
@@ -282,16 +441,29 @@ pub struct Session {
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
     /// Send resize events to the PTY writer task
     pub pty_resizer: Option<mpsc::Sender<(u16, u16)>>,
-    /// Scrollback of stripped output lines for pipe extraction
+    /// Stripped output lines as they arrive from the PTY reader, for pattern
+    /// matching, pipe extraction and `read`. For a repainting TUI this is
+    /// mostly repaint fragments — which is fine for those consumers and
+    /// useless as scrollback, hence the separate buffer below.
     pub output_lines: VecDeque<String>,
+    /// The transcript recovered from the screen as it scrolls: what the
+    /// scrollback view walks. Kept apart from `output_lines` because that one
+    /// is a stream of whatever crossed the PTY, and for claude and codex the
+    /// two have almost nothing to do with each other.
+    pub scrollback_lines: VecDeque<String>,
     pub scroll_buffer_lines: usize,
     /// Raw bytes received since the last tick — used to detect active generation
     /// without relying on newlines (Claude Code streams via cursor movement, not \n).
     pub bytes_since_last_tick: usize,
-    /// Scroll offset (in lines) into `output_lines` history. Used when the
-    /// application occupies the alternate screen (full-screen TUIs), where
-    /// vt100 keeps no scrollback; unifies scrolling across session types.
+    /// Scroll offset (in lines) into `output_lines` history. Used for
+    /// sessions whose scrollback we capture ourselves because vt100 has none
+    /// to offer; unifies scrolling across session types.
     pub history_scroll: usize,
+    /// The DECSTBM scrolling region (top, bottom), inclusive and 0-based.
+    /// vt100 tracks this internally but does not expose it, and we need it:
+    /// only rows inside the region move when the app scrolls, so it is the
+    /// only slice of the screen worth diffing for evicted lines.
+    scroll_region: (u16, u16),
     /// Resolved CLI identity: which JSONL watcher / stats pipeline applies.
     /// Defaults from the command's base name; spawn_session refines it with
     /// the config alias table.
@@ -380,9 +552,11 @@ impl Session {
             pty_writer: None,
             pty_resizer: None,
             output_lines: VecDeque::new(),
+            scrollback_lines: VecDeque::new(),
             scroll_buffer_lines,
             bytes_since_last_tick: 0,
             history_scroll: 0,
+            scroll_region: (0, rows.saturating_sub(1)),
             base,
             log_path: None,
             stats_from_watcher: false,
@@ -399,39 +573,13 @@ impl Session {
     pub fn process_bytes(&mut self, data: &[u8], detect_change: bool) -> bool {
         use std::hash::{Hash, Hasher};
 
-        // Capture top-line snapshot BEFORE processing, if this session kind
-        // supports alt-screen scrollback capture and we're on the alternate screen.
-        let prev_top =
-            if self.kind.captures_alt_scrollback() && self.screen.screen().alternate_screen() {
-                self.top_row()
-            } else {
-                None
-            };
-
         self.bytes_since_last_tick += data.len();
-        self.screen.process(data);
-
-        // After processing, check if content scrolled (top row changed)
-        if let Some(ref prev) = prev_top {
-            let current_top: Option<String> = self.top_row();
-
-            // If the top line changed, content scrolled upward. The old top row
-            // was pushed off-screen — capture it for scrollback.
-            if let Some(cur) = current_top {
-                if cur != *prev && !prev.is_empty() {
-                    // Dedupe: skip if identical to last appended line
-                    let dominated = self.output_lines.back().is_some_and(|last| *last == *prev);
-                    if !dominated {
-                        self.push_output_line(prev.clone());
-                    }
-                }
-            } else {
-                // Screen is now empty (left alternate screen?), capture the old top
-                if !prev.is_empty() && self.output_lines.back().is_none_or(|last| *last != *prev) {
-                    self.push_output_line(prev.clone());
-                }
-            }
+        if self.kind.captures_scrollback() {
+            self.process_capturing(data);
+        } else {
+            self.screen.process(data);
         }
+
         if !detect_change {
             // Leave last_screen_hash stale on purpose: the first chunk after the
             // session becomes visible again then reads as changed and redraws.
@@ -447,20 +595,121 @@ impl Session {
         changed
     }
 
-    /// Text of the screen's top row. `Screen::rows` is a lazy iterator, so this
-    /// renders one row — unlike `contents()`, which builds the entire screen
-    /// into a String and was being called twice per PTY chunk.
-    fn top_row(&self) -> Option<String> {
-        let cols = self.screen.screen().size().1;
-        self.screen
-            .screen()
+    /// Process a chunk while recovering the lines it scrolls away.
+    ///
+    /// Two levels of splitting, each for its own reason.
+    ///
+    /// The chunk is split at every DECSTBM sequence so each piece is handled
+    /// under one stable scrolling region. Without that, the region can change
+    /// mid-chunk — codex sets `ESC[1;25r`, scrolls, then resets with `ESC[r`,
+    /// dozens of times a second — and a diff taken across the change compares
+    /// the transcript against the composer codex pins below it, which reads
+    /// as a scroll and captures the composer into the history.
+    ///
+    /// Within a piece that can scroll, it is split again at newlines, because
+    /// a single before/after snapshot only shows the net movement. A chunk
+    /// carrying six newlines scrolls six times, and the lines evicted by the
+    /// first five are gone by the time we look.
+    fn process_capturing(&mut self, data: &[u8]) {
+        for (segment, region) in decstbm_segments(data) {
+            if self.vt100_keeps_no_scrollback() && may_scroll(segment) {
+                for piece in scroll_pieces(segment) {
+                    let prev = self.region_rows();
+                    self.screen.process(piece);
+                    self.capture_evicted(&prev);
+                }
+            } else {
+                self.screen.process(segment);
+            }
+
+            // vt100 has now applied the sequence; mirror it, since vt100
+            // tracks the region internally but does not expose it.
+            if let Some(params) = region {
+                let rows = self.screen.screen().size().0;
+                self.scroll_region =
+                    parse_decstbm(&params, rows).unwrap_or((0, rows.saturating_sub(1)));
+            }
+        }
+    }
+
+    /// Append whatever scrolled off the top of the region since `prev`.
+    fn capture_evicted(&mut self, prev: &[String]) {
+        let cur = self.region_rows();
+        let shift = scrolled_off(prev, &cur);
+        for line in prev.iter().take(shift) {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            if self
+                .scrollback_lines
+                .back()
+                .is_some_and(|last| last == line)
+            {
+                continue;
+            }
+            self.push_scrollback_line(line.to_string());
+        }
+    }
+
+    /// True when vt100 will not retain what scrolls away, so recovering it is
+    /// on us. Two independent reasons, one per agent CLI we support:
+    ///
+    /// - The alternate screen's grid is built as `Grid::new(size, 0)` — zero
+    ///   scrollback, by construction. This is claude.
+    /// - A restricted DECSTBM region: `Grid::scroll_up` only pushes to
+    ///   scrollback `if !self.scroll_region_active()`, which is correct per
+    ///   the DEC spec. This is codex, which stays on the normal screen and so
+    ///   looked like an ordinary app to every check we had.
+    fn vt100_keeps_no_scrollback(&self) -> bool {
+        self.screen.screen().alternate_screen() || self.scroll_region_restricted()
+    }
+
+    /// True when the app has reserved part of the screen for itself.
+    fn scroll_region_restricted(&self) -> bool {
+        let rows = self.screen.screen().size().0;
+        let (top, bottom) = self.scroll_region;
+        top > 0 || bottom + 1 < rows
+    }
+
+    /// The scrolling region's rows as plain text.
+    fn region_rows(&self) -> Vec<String> {
+        let screen = self.screen.screen();
+        let (rows, cols) = screen.size();
+        let (top, bottom) = self.scroll_region;
+        if top >= rows {
+            return Vec::new();
+        }
+        let count = u32::from(bottom.min(rows - 1) - top) + 1;
+        screen
             .rows(0, cols)
-            .next()
-            .map(|s| s.trim_end().trim_end_matches('\t').to_string())
+            .skip(usize::from(top))
+            .take(count as usize)
+            .map(|r| r.trim_end().to_string())
+            .collect()
     }
 
     pub fn resize_screen(&mut self, rows: u16, cols: u16) {
         self.screen.set_size(rows, cols);
+    }
+
+    /// The lines the scrollback view scrolls through. Sessions we capture for
+    /// use the recovered transcript; everything else falls back to the raw
+    /// line stream, which is what an alt-screen shell (vim, less) scrolls
+    /// back into.
+    pub fn history_lines(&self) -> &VecDeque<String> {
+        if self.kind.captures_scrollback() {
+            &self.scrollback_lines
+        } else {
+            &self.output_lines
+        }
+    }
+
+    pub fn push_scrollback_line(&mut self, line: String) {
+        self.scrollback_lines.push_back(line);
+        if self.scrollback_lines.len() > self.scroll_buffer_lines {
+            self.scrollback_lines.pop_front();
+        }
     }
 
     pub fn push_output_line(&mut self, line: String) {
@@ -751,6 +1000,198 @@ pub fn extract_waiting_prompt(lines: &VecDeque<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Scrollback capture ────────────────────────────────────────────────
+
+    fn tui(kind: SessionKind, rows: u16, cols: u16) -> Session {
+        Session::new(0, "s".into(), kind, "/tmp".into(), rows, cols, 1000)
+    }
+
+    fn history(s: &Session) -> Vec<String> {
+        s.scrollback_lines.iter().cloned().collect()
+    }
+
+    #[test]
+    fn decstbm_params_map_to_zero_based_inclusive_rows() {
+        assert_eq!(parse_decstbm(b"1;25", 30), Some((0, 24)));
+        assert_eq!(parse_decstbm(b"8;30", 30), Some((7, 29)));
+        // Empty params mean the whole screen.
+        assert_eq!(parse_decstbm(b"", 30), Some((0, 29)));
+        // Degenerate regions reset rather than invert.
+        assert_eq!(parse_decstbm(b"10;10", 30), None);
+        assert_eq!(parse_decstbm(b"20;5", 30), None);
+        // A bottom past the screen clamps.
+        assert_eq!(parse_decstbm(b"1;99", 30), Some((0, 29)));
+    }
+
+    #[test]
+    fn scrolled_off_locates_the_new_top_row_in_the_old_ones() {
+        let rows = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prev = rows(&["a", "b", "c", "d"]);
+        assert_eq!(scrolled_off(&prev, &rows(&["a", "b", "c", "d"])), 0);
+        assert_eq!(scrolled_off(&prev, &rows(&["b", "c", "d", "e"])), 1);
+        assert_eq!(scrolled_off(&prev, &rows(&["c", "d", "e", "f"])), 2);
+        // A full repaint is not a scroll, and must not be mistaken for one.
+        assert_eq!(scrolled_off(&prev, &rows(&["w", "x", "y", "z"])), 0);
+        // The tail may already hold new content written by the same chunk —
+        // the case exact suffix matching gets wrong.
+        assert_eq!(scrolled_off(&prev, &rows(&["c", "d", "NEW", "NEWER"])), 2);
+        // Blank rows identify nothing, so they never imply a scroll.
+        let blanks = rows(&["", "", "", ""]);
+        assert_eq!(scrolled_off(&blanks, &blanks), 0);
+        // A merely repeated line is not a scroll to that line.
+        assert_eq!(scrolled_off(&prev, &rows(&["b", "ZZ", "YY", "XX"])), 0);
+    }
+
+    /// The bug this exists for: codex never enters the alternate screen and
+    /// scrolls inside a DECSTBM region, whose evicted lines vt100 discards by
+    /// spec. Both of linkshell's old paths therefore produced nothing.
+    #[test]
+    fn codex_style_region_scrolling_is_captured_as_history() {
+        let mut s = tui(SessionKind::Codex, 10, 40);
+        // Reserve the bottom three rows for a composer, exactly as codex does.
+        s.process_bytes(b"\x1b[1;7r", true);
+        assert!(!s.screen.screen().alternate_screen(), "normal screen");
+
+        // Fill the region, then scroll it well past its height.
+        for i in 1..=20 {
+            s.process_bytes(format!("\x1b[7;1H\r\n line {i}").as_bytes(), true);
+        }
+
+        assert_eq!(
+            s.screen.screen().scrollback(),
+            0,
+            "vt100 keeps no scrollback for a restricted region — the premise"
+        );
+        let seen = history(&s);
+        assert!(seen.len() >= 10, "captured {} lines: {seen:?}", seen.len());
+        assert!(seen.iter().any(|l| l.contains("line 1")), "{seen:?}");
+        assert!(seen.iter().any(|l| l.contains("line 9")), "{seen:?}");
+        // In order, and without duplicates from the repeated repaints.
+        let numbers: Vec<usize> = seen
+            .iter()
+            .filter_map(|l| l.trim().strip_prefix("line ")?.parse().ok())
+            .collect();
+        assert!(
+            numbers.windows(2).all(|w| w[1] > w[0]),
+            "out of order or duplicated: {numbers:?}"
+        );
+    }
+
+    /// A chunk can scroll by more than one line — codex emits runs of
+    /// newlines — and the old capture only ever kept the row that happened to
+    /// pass through the top.
+    #[test]
+    fn a_multi_line_scroll_in_one_chunk_keeps_every_line() {
+        let mut s = tui(SessionKind::Codex, 8, 40);
+        s.process_bytes(b"\x1b[1;5r", true); // rows 0..4 scroll, 5..7 pinned
+        s.process_bytes(
+            b"\x1b[5;1Hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n",
+            true,
+        );
+        let seen = history(&s);
+        for want in ["one", "two"] {
+            assert!(
+                seen.iter().any(|l| l.trim() == want),
+                "lost {want}: {seen:?}"
+            );
+        }
+    }
+
+    /// The complement: with no region and no alternate screen, vt100 keeps
+    /// the scrollback itself, and capturing too would double every line.
+    #[test]
+    fn a_full_screen_scroll_is_left_to_vt100() {
+        let mut s = tui(SessionKind::Codex, 6, 40);
+        s.process_bytes(
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\n",
+            true,
+        );
+        // Screen::scrollback() is the current offset, not the stored length,
+        // so ask whether vt100 will scroll back at all.
+        s.screen.set_scrollback(2);
+        assert_eq!(s.screen.screen().scrollback(), 2, "vt100 holds it");
+        assert!(history(&s).is_empty(), "we do not: {:?}", history(&s));
+    }
+
+    /// Codex resets its region dozens of times a second, so a chunk routinely
+    /// straddles the change. Diffing across it compares the transcript with
+    /// the composer pinned below and reads as a scroll — which is what put
+    /// banner and composer fragments into the history.
+    #[test]
+    fn a_region_change_mid_chunk_does_not_capture_the_pinned_rows() {
+        let mut s = tui(SessionKind::Codex, 8, 40);
+        s.process_bytes(b"\x1b[1;5r", true);
+        // Draw a composer into the pinned rows, then scroll the region and
+        // reset it in one chunk, exactly as codex frames its output.
+        s.process_bytes(b"\x1b[7;1H> composer prompt\x1b[8;1Hmodel: gpt", true);
+        s.process_bytes(b"\x1b[5;1Halpha\r\nbeta\r\n\x1b[r", true);
+        s.process_bytes(b"\x1b[1;5r\x1b[5;1Hgamma\r\n\x1b[r", true);
+
+        let seen = history(&s);
+        for banned in ["composer", "model: gpt"] {
+            assert!(
+                !seen.iter().any(|l| l.contains(banned)),
+                "captured a pinned row ({banned}): {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decstbm_segments_split_after_each_region_change() {
+        let segs = decstbm_segments(b"aa\x1b[1;5rbb\x1b[rcc");
+        let parts: Vec<&[u8]> = segs.iter().map(|(b, _)| *b).collect();
+        assert_eq!(
+            parts,
+            vec![&b"aa\x1b[1;5r"[..], &b"bb\x1b[r"[..], &b"cc"[..]]
+        );
+        assert_eq!(segs[0].1.as_deref(), Some(&b"1;5"[..]));
+        assert_eq!(segs[1].1.as_deref(), Some(&b""[..]));
+        assert_eq!(segs[2].1, None);
+        // No DECSTBM: one segment, unchanged.
+        let segs = decstbm_segments(b"plain\x1b[2Jtext");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0, b"plain\x1b[2Jtext");
+    }
+
+    #[test]
+    fn may_scroll_skips_pure_repaints() {
+        assert!(!may_scroll(b"\x1b[1;1H\x1b[Khello\x1b[2;1Hworld"));
+        assert!(may_scroll(b"hello\r\n"));
+        assert!(may_scroll(b"\x1b[2S"));
+        assert!(may_scroll(b"\x1bD"));
+    }
+
+    /// The safety property that lets this run on the normal screen: a TUI
+    /// redrawing in place must not be mistaken for one that scrolled.
+    #[test]
+    fn an_in_place_repaint_captures_nothing() {
+        let mut s = tui(SessionKind::Codex, 6, 40);
+        s.process_bytes(b"\x1b[1;1Halpha\x1b[2;1Hbeta", true);
+        let before = history(&s).len();
+        for _ in 0..20 {
+            // Same content, rewritten — a spinner frame, say.
+            s.process_bytes(b"\x1b[1;1H\x1b[Kalpha\x1b[2;1H\x1b[Kbeta", true);
+        }
+        assert_eq!(history(&s).len(), before, "{:?}", history(&s));
+    }
+
+    #[test]
+    fn shells_are_left_to_vt100s_own_scrollback() {
+        let mut s = tui(SessionKind::Shell, 4, 40);
+        for i in 0..20 {
+            s.process_bytes(format!("line {i}\r\n").as_bytes(), true);
+        }
+        assert!(
+            s.screen.screen().scrollback() > 0 || !s.kind.captures_scrollback(),
+            "a shell scrolls the real grid, so vt100 holds its history"
+        );
+        assert!(
+            history(&s).is_empty(),
+            "and we do not double-capture it: {:?}",
+            history(&s)
+        );
+    }
 
     #[test]
     fn fmt_count_tiers_and_width() {
@@ -1192,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_screen_scrolled_lines_captured_in_output_lines() {
+    fn alt_screen_scrolled_lines_are_captured_as_scrollback() {
         let mut s = Session::new(
             1,
             "codex".into(),
@@ -1206,19 +1647,19 @@ mod tests {
             b"\x1b[?1049h\x1b[HLine A\r\nLine B\r\nLine C\r\nLine D\r\nLine E",
             true,
         );
-        assert!(s.output_lines.is_empty());
+        assert!(s.scrollback_lines.is_empty());
 
         // Scroll up by 1: Line A leaves the top, everything shifts up
         s.process_bytes(b"\x1b[1S", true);
 
-        assert_eq!(s.output_lines.len(), 1);
-        assert_eq!(s.output_lines.front().unwrap(), "Line A");
+        assert_eq!(s.scrollback_lines.len(), 1);
+        assert_eq!(s.scrollback_lines.front().unwrap(), "Line A");
 
         // Scroll up by 1 more: Line B leaves the top
         s.process_bytes(b"\x1b[1S", true);
 
-        assert_eq!(s.output_lines.len(), 2);
-        assert_eq!(s.output_lines.get(1).unwrap(), "Line B");
+        assert_eq!(s.scrollback_lines.len(), 2);
+        assert_eq!(s.scrollback_lines.get(1).unwrap(), "Line B");
     }
 
     #[test]

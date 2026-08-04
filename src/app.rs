@@ -20,6 +20,7 @@ use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
 use crate::session::{
     extract_waiting_prompt, Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS,
 };
+use crate::theme::Theme;
 
 fn expand_home(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
@@ -181,6 +182,10 @@ pub enum AppMode {
     OrchestratorModel {
         selected: usize,
     },
+    /// The status panel as an overlay (alt-s). An overlay rather than a
+    /// split: opening it must not resize any PTY, or every agent repaints
+    /// each time you glance at the panel.
+    Status,
     Search {
         query: String,
         cursor: usize,
@@ -215,6 +220,28 @@ impl SettingsState {
             editing: false,
             edit_buf: String::new(),
             edit_cursor: 0,
+        }
+    }
+}
+
+/// Where the status panel lives. See `[general] status_panel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPlacement {
+    Left,
+    Bottom,
+    Overlay,
+    Off,
+}
+
+impl StatusPlacement {
+    /// Unknown values fall back to the default rather than failing: a typo in
+    /// one optional cosmetic key should not stop linkshell starting.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bottom" | "docked" => Self::Bottom,
+            "overlay" => Self::Overlay,
+            "off" | "none" | "hidden" => Self::Off,
+            _ => Self::Left,
         }
     }
 }
@@ -541,6 +568,14 @@ pub struct App {
     status_rows_hold_at: std::cell::Cell<Option<std::time::Instant>>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub config: Arc<Config>,
+    /// Runtime alt-s state for a docked panel. Not persisted: the config
+    /// says where the panel lives, this says whether you have tucked it away
+    /// for the moment.
+    pub status_hidden: bool,
+    /// Every colour the UI draws with. Lives on App because each `draw_*` fn
+    /// already takes `&App`, so the palette is a field access rather than a
+    /// parameter threaded through forty signatures.
+    pub theme: Theme,
     pub pipes: Vec<Pipe>,
     // Current PTY size derived from each output pane (rows, cols), one per
     // pane slot; length matches `panes`.
@@ -688,6 +723,8 @@ impl App {
             status_rows_hold: std::cell::Cell::new(0),
             status_rows_hold_at: std::cell::Cell::new(None),
             event_tx,
+            status_hidden: false,
+            theme: Theme::resolve(&config.theme),
             config,
             pipes: Vec::new(),
             pane_sizes: vec![(PTY_ROWS, PTY_COLS)],
@@ -1372,15 +1409,36 @@ impl App {
         }
     }
 
-    /// Unified scrollback. Normal-screen apps (shells) use vt100's native
-    /// scrollback; full-screen TUIs (claude, codex, opencode, ...) occupy the
-    /// alternate screen where vt100 keeps none, so we scroll through our own
-    /// captured `output_lines` history instead. Same keys, every session type.
+    /// Unified scrollback. Shells use vt100's native scrollback; agent TUIs
+    /// scroll through our own captured `output_lines` history, because vt100
+    /// has none to offer them — claude lives on the alternate screen, and
+    /// codex scrolls inside a DECSTBM region, whose evicted lines the spec
+    /// says to discard. Same keys, every session type.
+    ///
+    /// The kind test is in addition to `alternate_screen()`, not instead of
+    /// it: on its own, `alternate_screen()` is what made codex unscrollable,
+    /// since codex is a normal-screen app and so took the vt100 branch where
+    /// there was never anything to find. An alt-screen shell (vim, less)
+    /// still reaches the history captured before it started.
     pub fn scroll_up(&mut self, lines: usize) {
+        // The visible height, so the offset stops at the oldest full page
+        // rather than at the oldest line. Scrolling past that point moves the
+        // indicator without moving the view, which reads as the scrollback
+        // having silently stopped working.
+        let visible = self
+            .pane_sizes
+            .get(self.focused_pane)
+            .map(|(rows, _)| *rows as usize)
+            .unwrap_or(0);
         if let Some(idx) = self.active_idx() {
             if let Some(session) = self.sessions.get_mut(idx) {
-                if session.screen.screen().alternate_screen() {
-                    let max = session.output_lines.len();
+                if session.kind.captures_scrollback() || session.screen.screen().alternate_screen()
+                {
+                    // Clamp against the buffer the view actually renders. For
+                    // an agent TUI that is the captured transcript, not the
+                    // raw line stream — which is far longer, and would let
+                    // the offset run past the end into a blank window.
+                    let max = session.history_lines().len().saturating_sub(visible);
                     session.history_scroll = (session.history_scroll + lines).min(max);
                 } else {
                     let current = session.screen.screen().scrollback();
@@ -1416,6 +1474,28 @@ impl App {
             .and_then(|i| self.sessions.get(i))
             .map(|s| s.screen.screen().scrollback().max(s.history_scroll))
             .unwrap_or(0)
+    }
+
+    /// Status-panel height with shrink hysteresis. Growing applies
+    /// immediately; shrinking only after the smaller height has been desired
+    /// for a few seconds. Without this, a session whose inferred state flaps
+    /// (codex repaints re-triggering WAITING↔RUNNING) adds and removes its
+    /// waiting-preview row every few hundred ms; each change resizes the
+    /// output panes, the resized TUI repaints, the repaint re-flaps the
+    /// Where the status panel is configured to live.
+    pub fn status_placement(&self) -> StatusPlacement {
+        StatusPlacement::parse(&self.config.general.status_panel)
+    }
+
+    /// Whether the panel occupies a region of the layout right now — docked
+    /// *and* not hidden. Callers use this to decide whether to reserve rows
+    /// or columns for it.
+    pub fn status_docked(&self) -> bool {
+        !self.status_hidden
+            && matches!(
+                self.status_placement(),
+                StatusPlacement::Left | StatusPlacement::Bottom
+            )
     }
 
     /// Status-panel height with shrink hysteresis. Growing applies
@@ -3045,6 +3125,21 @@ impl App {
                         self.mode = AppMode::Normal;
                         return;
                     }
+                    AppMode::Status => {
+                        // Rows stay clickable inside the overlay; clicking one
+                        // means "take me there", so it also closes.
+                        for (i, row_area) in self.status_row_areas.iter().enumerate() {
+                            if rect_hit(*row_area, col, row) {
+                                if let Some(idx) = self.visible_to_idx(i) {
+                                    self.switch_to(idx);
+                                }
+                                break;
+                            }
+                        }
+                        self.mode = AppMode::Normal;
+                        self.selection = None;
+                        return;
+                    }
                     AppMode::Search { .. } => {
                         self.mode = AppMode::Normal;
                         return;
@@ -3338,13 +3433,13 @@ impl App {
         let session = self.active_session()?;
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
-        let display_rows = self
-            .output_areas
-            .get(self.focused_pane)
-            .copied()
-            .unwrap_or_default()
-            .height
-            .saturating_sub(2);
+        let display_rows = crate::ui::pane_content_area(
+            self.output_areas
+                .get(self.focused_pane)
+                .copied()
+                .unwrap_or_default(),
+        )
+        .height;
         let start_vt_row = screen_rows.saturating_sub(display_rows);
 
         let ((min_row, min_col), (max_row, max_col)) = sel.normalized();
@@ -4596,19 +4691,25 @@ impl App {
                 return;
             }
             let cur = selected_sub.unwrap_or(0) as i32;
-            // Separators are not landable; step past them in the direction of
-            // travel so arrow keys never park on a divider.
+            // Step past anything that cannot be landed on, in the direction of
+            // travel. Disabled rows count: the renderer draws them dim and
+            // never highlights them, so parking on one loses the cursor
+            // entirely — you cannot see where you are or act on it.
             let step = if delta >= 0 { 1 } else { -1 };
             let mut next = (cur + delta).rem_euclid(count);
+            let mut found = false;
             for _ in 0..count {
-                if section.items[next as usize].action != MenuAction::Separator {
+                if section.items[next as usize].is_selectable() {
+                    found = true;
                     break;
                 }
                 next = (next + step).rem_euclid(count);
             }
             self.mode = AppMode::Menu {
                 selected_top,
-                selected_sub: Some(next as usize),
+                // A section with nothing selectable leaves focus on the menu
+                // bar rather than on an invisible selection.
+                selected_sub: found.then_some(next as usize),
             };
         }
     }
@@ -4622,6 +4723,19 @@ impl App {
             // Land on the first selectable row.
             self.menu_move_sub(0);
         }
+    }
+
+    /// Index of the first row in the open section that can be landed on.
+    /// `Up` pops back to the menu bar here rather than wrapping to the
+    /// bottom, which is what "the top of the list" means to someone holding
+    /// the key down — the literal index 0 may be a separator or disabled.
+    pub fn menu_first_selectable(&self) -> Option<usize> {
+        if let AppMode::Menu { selected_top, .. } = self.mode {
+            let sections = self.menu();
+            let section = sections.get(selected_top)?;
+            return section.items.iter().position(|i| i.is_selectable());
+        }
+        None
     }
 
     pub fn menu_close_submenu(&mut self) {
@@ -5248,6 +5362,13 @@ impl MenuItem {
         self
     }
 
+    /// Whether arrow keys may land on this row. Separators are structure and
+    /// disabled rows cannot be acted on; both are rendered without a
+    /// highlight, so selecting one makes the cursor vanish.
+    pub fn is_selectable(&self) -> bool {
+        self.enabled && self.action != MenuAction::Separator
+    }
+
     /// Rendered width needed for label plus detail.
     pub fn width(&self) -> usize {
         if self.detail.is_empty() {
@@ -5267,6 +5388,24 @@ pub struct MenuSection {
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
 impl App {
+    /// alt-s. For a docked panel this hides and shows it in place; for the
+    /// overlay placement it opens and closes the overlay. `off` means off.
+    pub fn toggle_status_panel(&mut self) {
+        match self.status_placement() {
+            StatusPlacement::Left | StatusPlacement::Bottom => {
+                self.status_hidden = !self.status_hidden;
+            }
+            StatusPlacement::Overlay => {
+                self.mode = if matches!(self.mode, AppMode::Status) {
+                    AppMode::Normal
+                } else {
+                    AppMode::Status
+                };
+            }
+            StatusPlacement::Off => {}
+        }
+    }
+
     pub fn toggle_chat(&mut self) {
         if self.chat_docked.is_some() {
             self.undock_chat();
@@ -7496,12 +7635,16 @@ fn byte_index_for_col(text: &str, col: usize) -> usize {
 
 /// Convert absolute terminal coords to (content_col, content_row) inside a bordered rect.
 fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
+    // Must agree with the renderer and the PTY size, or a drag-selection maps
+    // onto the wrong vt100 columns; `pane_content_area` is where that
+    // agreement lives.
+    let content = crate::ui::pane_content_area(area);
     let c = col
-        .saturating_sub(area.x + 1)
-        .min(area.width.saturating_sub(2));
+        .saturating_sub(content.x)
+        .min(content.width.saturating_sub(1));
     let r = row
-        .saturating_sub(area.y + 1)
-        .min(area.height.saturating_sub(2));
+        .saturating_sub(content.y)
+        .min(content.height.saturating_sub(1));
     (c, r)
 }
 
@@ -7603,6 +7746,95 @@ mod tests {
             .position(|i| i.label == label)
             .unwrap_or_else(|| panic!("no {} item in {}", label, section));
         (si, ii, sections[si].items[ii].clone())
+    }
+
+    /// Walking a section with the arrow keys must never leave the cursor
+    /// nowhere. The renderer draws separators and disabled rows without a
+    /// highlight, so landing on one loses the selection visually: you cannot
+    /// see where you are, and Enter does nothing.
+    #[test]
+    fn arrowing_through_a_menu_never_lands_on_an_unselectable_row() {
+        let mut app = make_app();
+        app.open_menu();
+        let sections = app.menu();
+        for (si, section) in sections.iter().enumerate() {
+            if !section
+                .items
+                .iter()
+                .any(|i| i.enabled && i.action != MenuAction::Separator)
+            {
+                continue;
+            }
+            app.mode = AppMode::Menu {
+                selected_top: si,
+                selected_sub: None,
+            };
+            app.menu_open_submenu();
+            // Two full laps, so wrapping is covered in both directions.
+            for delta in [1, -1] {
+                for _ in 0..section.items.len() * 2 {
+                    let AppMode::Menu { selected_sub, .. } = app.mode else {
+                        panic!("left menu mode");
+                    };
+                    let idx = selected_sub
+                        .unwrap_or_else(|| panic!("no selection in section '{}'", section.title));
+                    let row = &section.items[idx];
+                    assert!(
+                        row.enabled && row.action != MenuAction::Separator,
+                        "section '{}' parked on an unselectable row {} ({:?}, enabled={})",
+                        section.title,
+                        idx,
+                        row.label,
+                        row.enabled
+                    );
+                    app.menu_move_sub(delta);
+                }
+            }
+        }
+    }
+
+    /// The exact report: the Orchestrator section's "Show/Hide Session" is
+    /// disabled when no CLI-class orchestrator session exists, and arrowing
+    /// down onto it made the cursor disappear.
+    #[test]
+    fn a_disabled_orchestrator_row_is_stepped_over() {
+        let mut app = make_app();
+        assert!(app.orchestrator_session_id.is_none());
+        let (si, disabled_idx, item) = find_item(&app, "Orchestrator", "Show/Hide Session");
+        assert!(!item.enabled, "precondition: the row is disabled");
+
+        app.mode = AppMode::Menu {
+            selected_top: si,
+            selected_sub: Some(disabled_idx - 1),
+        };
+        app.menu_move_sub(1);
+        let AppMode::Menu { selected_sub, .. } = app.mode else {
+            panic!("left menu mode")
+        };
+        let landed = selected_sub.expect("cursor vanished");
+        assert_ne!(landed, disabled_idx, "stopped on the disabled row");
+        let sections = app.menu();
+        assert!(
+            sections[si].items[landed].enabled,
+            "landed on a disabled row: {:?}",
+            sections[si].items[landed].label
+        );
+    }
+
+    /// Up at the top of a section pops back to the menu bar. The topmost
+    /// selectable row is not always index 0, so keying on the literal 0
+    /// wrapped to the bottom instead.
+    #[test]
+    fn up_from_the_first_selectable_row_returns_to_the_menu_bar() {
+        let mut app = make_app();
+        app.open_menu();
+        app.menu_open_submenu();
+        let first = app.menu_first_selectable();
+        assert!(first.is_some());
+        let AppMode::Menu { selected_sub, .. } = app.mode else {
+            panic!()
+        };
+        assert_eq!(selected_sub, first, "opening lands on the first selectable");
     }
 
     #[test]
@@ -9432,8 +9664,10 @@ mod tests {
         assert!(!rect_hit(rect, 30, 5));
         assert!(!rect_inner_hit(rect, 10, 5));
         assert!(rect_inner_hit(rect, 11, 6));
-        assert_eq!(to_content_coords(rect, 12, 8), (1, 2));
-        assert_eq!(to_content_coords(rect, 99, 99), (18, 8));
+        // Content starts at column x+2 (focus bar, then padding) and row y+1
+        // (the title line) — see ui::pane_content_area.
+        assert_eq!(to_content_coords(rect, 12, 8), (0, 2));
+        assert_eq!(to_content_coords(rect, 99, 99), (17, 8));
     }
 
     #[test]
@@ -9561,16 +9795,44 @@ mod tests {
         app.scroll_up(20);
         assert_eq!(app.sessions[0].history_scroll, 20);
         assert_eq!(app.scroll_offset(), 20);
-        // …is clamped to what exists…
+        // …is clamped so the oldest *page* is the end of the road, not the
+        // oldest line: scrolling past that moves the indicator without moving
+        // the view, which reads as the scrollback having stopped working.
         app.scroll_up(500);
-        assert_eq!(app.sessions[0].history_scroll, 100);
+        let page = app.pane_sizes[app.focused_pane].0 as usize;
+        assert_eq!(app.sessions[0].history_scroll, 100 - page);
         // …new output does NOT yank the view back…
         app.handle_session_bytes(id, b"more output\r\n".to_vec());
-        assert_eq!(app.sessions[0].history_scroll, 100);
+        assert_eq!(app.sessions[0].history_scroll, 100 - page);
         // …and typing returns to the live tail.
         app.write_to_active(b"x");
         assert_eq!(app.sessions[0].history_scroll, 0);
         assert_eq!(app.scroll_offset(), 0);
+    }
+
+    /// The clamp must be against the buffer the view renders. For an agent
+    /// TUI `output_lines` is the raw PTY line stream — hundreds of repaint
+    /// fragments — and clamping to that let the offset run far past the
+    /// captured transcript, into a window with nothing in it.
+    #[tokio::test]
+    async fn scroll_is_clamped_to_the_captured_transcript_not_the_line_stream() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("cx".to_string(), None).unwrap();
+        app.panes[0] = app.sessions.iter().position(|s| s.id == id);
+        {
+            let s = app.sessions.iter_mut().find(|s| s.id == id).unwrap();
+            s.kind = crate::session::SessionKind::Codex;
+            // A lot of repaint noise, a little real transcript.
+            for i in 0..500 {
+                s.push_output_line(format!("repaint-{i}"));
+            }
+            for i in 0..60 {
+                s.push_scrollback_line(format!("line-{i}"));
+            }
+        }
+        let page = app.pane_sizes[app.focused_pane].0 as usize;
+        app.scroll_up(10_000);
+        assert_eq!(app.sessions[0].history_scroll, 60usize.saturating_sub(page));
     }
 
     fn orch_request(

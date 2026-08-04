@@ -1,6 +1,8 @@
 # Panes, Navigation & Keybindings
 
 - [Split panes](#split-panes)
+- [Tab strip](#tab-strip)
+- [Footer](#footer)
 - [Scrollback](#scrollback)
 - [Status panel](#status-panel)
 - [Keybindings](#keybindings)
@@ -9,8 +11,22 @@
 ## Split panes
 
 Split any pane side by side (`alt-\`) or top/bottom (`alt--`), repeatedly and in
-any direction, for arbitrary tiled layouts. The session bar is centered and
-reflows based on how many sessions are open.
+any direction, for arbitrary tiled layouts.
+
+Panes have no boxes. Each carries a title line and a one-column bar down its
+left edge, and that bar does double duty — `▎` in the accent colour marks the
+focused pane, `│` in chrome separates a pane from its neighbour — so a split
+needs neither per-pane borders nor a separate divider:
+
+```
+▎ ● alpha · ~/src/linkshell                    │ ○ beta · /tmp
+▎ $ cargo test                                 │ $
+```
+
+A filled dot and a bright name mean focused; hollow and dim mean not. A pane
+scrolled off the live tail says so in its title (`↑12`). The docked chat and
+planning panes wear the same chrome; the floating chat overlay keeps its box,
+because a floating thing needs an edge to read as floating.
 
 | Key | Action |
 |-----|--------|
@@ -20,29 +36,123 @@ reflows based on how many sessions are open.
 | `alt-r` | Rotate the focused pane's split direction |
 | `alt-o` | Focus next pane |
 
+## Tab strip
+
+One row above the output pane names every visible session:
+
+```
+ 1 alpha  2 beta!  3 gamma✕
+```
+
+The active tab is highlighted; a tab underlined is showing in some other split
+pane. The suffix glyph is the session's state — `!` for WAITING, `✕` for ERROR
+or a dead session, `⏸` for paused, nothing otherwise — so "which agent wants
+me" is legible without the status panel open. Click a tab to focus it.
+
+As the terminal narrows the strip drops names before it drops tabs: first the
+inactive tabs fall back to bare indices, then all of them do. Every session
+keeps a tab.
+
+## Footer
+
+The bottom row reports the focused session:
+
+```
+ claude · opus-4-8   18.0k/180k   ⣾ THINKING   0:42   $0.31   alt-h help
+```
+
+The name is coloured by state — accent while working, amber on WAITING, red
+on ERROR — and a dead session offers `alt-r restart`. The context counter
+turns amber past 80% of the window; when the window size is unknown (a local
+model that was never probed) it renders a bare count with no denominator,
+because there is no percentage to colour against. A paused or dead session
+greys the whole row: its numbers are frozen.
+
+Fields are dropped as the terminal narrows rather than wrapping, which would
+cost a row of output. The hint goes first, then cost, then elapsed; the
+session's name and state are the last to go.
+
 ## Scrollback
 
 `alt-shift-PageUp/PageDown` (and `alt-shift-↑/↓`) scroll every session type the
-same way. Shells use the terminal's native scrollback; full-screen TUIs (claude,
-codex, opencode) scroll through linkshell's captured line history, shown dimmed.
-The view holds position while new output streams in — typing returns you to the
-live tail.
+same way. The view holds position while new output streams in — typing returns
+you to the live tail.
+
+Shells use the terminal's native scrollback. Agent TUIs (claude, codex) scroll
+through a transcript linkshell recovers from the screen as it scrolls, shown
+dimmed, because vt100 has no scrollback to offer them — for two different
+reasons. Claude runs on the alternate screen, which has none by design. Codex
+stays on the normal screen but scrolls inside a `DECSTBM` region, and lines
+evicted from a restricted region are discarded rather than retained, per the
+DEC spec. Scrolling stops at the oldest full page.
 
 Mouse text selection works everywhere: drag to select, auto-copies to clipboard.
 
 ## Status panel
 
-Each session gets one row:
+A permanent sidebar down the left, on by default. `alt-s` tucks it away and
+brings it back.
 
 ```
-1 🟠 →2   THINKING  1m 32s  │  ~450 tok  │  ~$0.02
+ Status                    │▎ ● alpha · ~/src/linkshell
+ ● alpha            1m32s  │▎ $ cargo test
+   READY       18.0k/180k  │▎
+   opus-4-8         $0.31  │▎
+                           │▎
+ ! beta               12s  │▎
+   WAITING           2.1k  │▎
+   sonnet-5         $0.04  │▎
+                           │
+ 2 sess            $0.35   │
 ```
 
-`→2` means this session has an active pipe to session 2. The arrow goes bold for
-one second when the pipe fires. Token counts and cost come from the JSONL logs
-written by Claude and Codex — not from screen scraping. Shell and custom
-sessions show `—`. On Pro/Max subscriptions, linkshell detects the subscription
-and shows real token counts while skipping meaningless cost.
+Each session is a stacked block: name and elapsed, state and context, then
+model and cost. A session with no model (a shell) shows its working directory
+instead — the thing that actually distinguishes it from the shell in the next
+pane. Clicking a block focuses that session.
+
+The sidebar costs **columns instead of rows**, which is the better trade on a
+wide terminal, and it has the full column height — so unlike the bottom
+region it doesn't run out of room at four sessions.
+
+### When the terminal is narrow
+
+Below `status_panel_width + 60` columns the sidebar collapses to a
+three-column rail rather than starving the output pane:
+
+```
+●1 ▎ ● alpha · ~/src/linkshell
+!2 ▎ $ cargo test
+✕3 ▎
+```
+
+State still reaches you — which agent needs you is the sidebar's real job, and
+a glyph plus an index still does it.
+
+### Placement
+
+```toml
+[general]
+status_panel = "left"       # "left" (default) | "bottom" | "overlay" | "off"
+status_panel_width = 28     # columns for the sidebar
+```
+
+- **`left`** — the sidebar above.
+- **`bottom`** — the always-on region below the output, in two-line rows.
+  Its height is capped at a third of the terminal, so past four sessions it
+  drops the detail line to keep every session visible.
+- **`overlay`** — not docked; `alt-s` opens it centered over the output, which
+  costs no layout space and resizes no PTY.
+- **`off`** — never shown, and `alt-s` does nothing.
+
+In `left` and `bottom`, `alt-s` hides and restores the panel. Note that this
+resizes the sessions' PTYs, as any docked panel must; `overlay` is the
+placement that never does.
+
+Token counts and cost come from the JSONL logs written by Claude and Codex —
+not from screen scraping. Shell and custom sessions show `—`. On Pro/Max
+subscriptions, linkshell detects the subscription and shows real token counts
+while skipping meaningless cost.
 
 ## Keybindings
 
@@ -51,6 +161,7 @@ and shows real token counts while skipping meaningless cost.
 | `alt-n` | New session dialog |
 | `alt-c` | Open command bar |
 | `alt-t` | Toggle agent chat pane |
+| `alt-s` | Show/hide the status panel |
 | `alt-h` | Toggle help |
 | `alt-x` | Kill active session |
 | `alt-d` | Detach (sessions keep running) |

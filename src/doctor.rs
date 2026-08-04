@@ -29,6 +29,10 @@ struct Context {
     term: Option<String>,
     colors: Option<u32>,
     nested_mux: Option<&'static str>,
+    /// Raw COLORTERM — what decides whether the truecolor theme is usable.
+    colorterm: Option<String>,
+    /// `[theme] base`, when the config pins one.
+    theme_base: Option<String>,
 }
 
 pub fn run() -> i32 {
@@ -42,6 +46,8 @@ pub fn run() -> i32 {
         path: std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect(),
         term: std::env::var("TERM").ok(),
         colors: terminal_colors(),
+        colorterm: std::env::var("COLORTERM").ok().filter(|v| !v.is_empty()),
+        theme_base: config_theme_base(),
         nested_mux: if std::env::var_os("TMUX").is_some() {
             Some("tmux")
         } else if std::env::var_os("STY").is_some() {
@@ -51,6 +57,14 @@ pub fn run() -> i32 {
         },
     };
     run_with(&context, &mut std::io::stdout())
+}
+
+/// `[theme] base`, if the user pinned one. A broken config is not this
+/// check's problem — "config validity" reports that.
+fn config_theme_base() -> Option<String> {
+    let path = crate::config::config_path()?;
+    let cfg = crate::config::load_strict(&path).ok()?;
+    cfg.theme.base.filter(|b| !b.trim().is_empty())
 }
 
 fn run_with(context: &Context, out: &mut dyn Write) -> i32 {
@@ -149,6 +163,31 @@ fn run_with(context: &Context, out: &mut dyn Write) -> i32 {
                 ),
             );
         }
+    }
+
+    // "Is it my terminal or the layout?" — the theme that actually resolved
+    // is the answer, and it is not otherwise visible from inside the TUI.
+    match context.theme_base.as_deref() {
+        Some(base) => report(
+            "theme",
+            Level::Ok,
+            format!("[theme] base = \"{base}\" (pinned in config)"),
+        ),
+        None if context.colorterm.is_some() => report(
+            "theme",
+            Level::Ok,
+            format!(
+                "COLORTERM={}; using the truecolor 'classic' theme",
+                context.colorterm.as_deref().unwrap_or("")
+            ),
+        ),
+        None => report(
+            "theme",
+            Level::Warn,
+            "COLORTERM unset, so truecolor is assumed absent; using the \
+             'ansi16' theme. Set COLORTERM=truecolor or pin [theme] base."
+                .into(),
+        ),
     }
 
     match context.config.as_deref() {
@@ -288,6 +327,8 @@ mod tests {
             term: Some("xterm-256color".into()),
             colors: Some(256),
             nested_mux: None,
+            colorterm: Some("truecolor".into()),
+            theme_base: None,
         }
     }
 
@@ -305,11 +346,35 @@ mod tests {
             "codex JSONL logs",
             "socket dir",
             "terminal",
+            "theme",
             "config validity",
         ] {
             assert!(output.contains(check), "missing {check} in {output}");
         }
         assert!(!output.contains("fail "));
+    }
+
+    #[test]
+    fn missing_colorterm_warns_about_the_ansi16_fallback() {
+        let temp = tempfile_dir("no-colorterm");
+        let mut context = fixture(&temp);
+        context.colorterm = None;
+        let mut output = Vec::new();
+        run_with(&context, &mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("ansi16"), "{output}");
+    }
+
+    #[test]
+    fn a_pinned_theme_base_is_reported_verbatim() {
+        let temp = tempfile_dir("pinned-theme");
+        let mut context = fixture(&temp);
+        context.theme_base = Some("dark".into());
+        context.colorterm = None;
+        let mut output = Vec::new();
+        run_with(&context, &mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("base = \"dark\""), "{output}");
     }
 
     #[test]

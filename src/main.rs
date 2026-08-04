@@ -20,6 +20,7 @@ mod planning;
 mod protocol;
 mod reattach;
 mod session;
+mod theme;
 mod ui;
 
 use std::sync::{Arc, Mutex};
@@ -428,10 +429,10 @@ async fn run_server() -> anyhow::Result<()> {
                 if idx >= sizes.len() {
                     break;
                 }
-                sizes[idx] = (
-                    area.height.saturating_sub(2).max(1),
-                    area.width.saturating_sub(2).max(1),
-                );
+                // One definition of the pane's inner geometry, shared with
+                // the renderer and the mouse→vt100 column mapping.
+                let content = ui::pane_content_area(*area);
+                sizes[idx] = (content.height.max(1), content.width.max(1));
             }
             let old_sizes = app.pane_sizes.clone();
             app.handle_pane_resize(&sizes);
@@ -862,6 +863,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollDownLine => app.scroll_down(3),
                     Action::OpenMenu => app.open_menu(),
                     Action::ToggleChat => app.toggle_chat(),
+                    Action::ToggleStatus => app.toggle_status_panel(),
                     Action::DockChat => {
                         if app.chat_docked.is_some() {
                             app.undock_chat();
@@ -911,15 +913,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.planning_key(key);
                 return;
             }
-            // Full-screen agent TUIs (claude, codex) ignore the terminal's
+            // Agent TUIs (claude, codex) ignore the terminal's
             // PageUp/PageDown sequences, so route those keys to linkshell's
             // captured scrollback — the same history the mouse wheel scrolls.
             // Shells and other alt-screen apps (vim, less) still get the keys.
             if key.modifiers.is_empty() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
-                let agent_alt_screen = app.active_session().is_some_and(|s| {
-                    s.kind.captures_alt_scrollback() && s.screen.screen().alternate_screen()
-                });
-                if agent_alt_screen {
+                let agent_tui = app
+                    .active_session()
+                    .is_some_and(|s| s.kind.captures_scrollback());
+                if agent_tui {
                     if key.code == KeyCode::PageUp {
                         app.scroll_up(20);
                     } else {
@@ -1079,6 +1081,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             app.chat_key(key);
         }
 
+        AppMode::Status => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Normal,
+            _ => {}
+        },
+
         AppMode::PipeList => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Normal,
             KeyCode::Up => app.pipe_list_move(-1),
@@ -1133,10 +1140,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         app.menu_open_submenu()
                     }
                 }
-                KeyCode::Up => match selected_sub {
-                    Some(0) | None => app.menu_close_submenu(),
-                    Some(_) => app.menu_move_sub(-1),
-                },
+                KeyCode::Up => {
+                    // Pop back to the menu bar from the topmost row that can
+                    // actually be selected, which is not always index 0.
+                    if selected_sub.is_none() || selected_sub == app.menu_first_selectable() {
+                        app.menu_close_submenu();
+                    } else {
+                        app.menu_move_sub(-1);
+                    }
+                }
                 KeyCode::Enter => app.execute_selected_menu_action(),
                 KeyCode::Esc => app.mode = AppMode::Normal,
                 // Mnemonics come from the live section titles, so adding or

@@ -18,6 +18,7 @@ pub enum Action {
     ScrollDownLine,
     OpenMenu,
     ToggleChat,
+    ToggleStatus,
     DockChat,
     SplitPaneRight,
     SplitPaneDown,
@@ -69,6 +70,7 @@ fn default_keymap() -> Keymap {
     m.insert((ctrl, KeyCode::Char('q')), Action::Quit);
     m.insert((ctrl, KeyCode::Char(' ')), Action::OpenMenu);
     m.insert((alt, KeyCode::Char('t')), Action::ToggleChat);
+    m.insert((alt, KeyCode::Char('s')), Action::ToggleStatus);
     m.insert((alt, KeyCode::Char('g')), Action::DockChat);
     m.insert((alt, KeyCode::Char('\\')), Action::SplitPaneRight);
     m.insert((alt, KeyCode::Char('-')), Action::SplitPaneDown);
@@ -84,10 +86,11 @@ fn default_keymap() -> Keymap {
     m.insert((alt, KeyCode::BackTab), Action::PrevSession);
     let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
     // Shifted alt-p: the same pane, taking the whole terminal. Registered
-    // under both modifier sets because whether SHIFT is reported alongside an
-    // already-uppercase char depends on the terminal's keyboard protocol —
-    // kitty-style reporting sets it, a plain ESC-prefixed 'P' does not.
+    // under all observed modifier/character combinations because terminals
+    // disagree on whether SHIFT is reported separately and whether the
+    // character itself is uppercased.
     m.insert((alt_shift, KeyCode::Char('P')), Action::PlanningFullscreen);
+    m.insert((alt_shift, KeyCode::Char('p')), Action::PlanningFullscreen);
     m.insert((alt, KeyCode::Char('P')), Action::PlanningFullscreen);
     m.insert((alt_shift, KeyCode::PageUp), Action::ScrollUpPage);
     m.insert((alt_shift, KeyCode::PageDown), Action::ScrollDownPage);
@@ -174,6 +177,7 @@ fn parse_action(s: &str) -> Option<Action> {
         "scroll_up_line" => Some(Action::ScrollUpLine),
         "scroll_down_line" => Some(Action::ScrollDownLine),
         "toggle_chat" | "chat" => Some(Action::ToggleChat),
+        "toggle_status" | "status" => Some(Action::ToggleStatus),
         "dock_chat" | "chat_dock" => Some(Action::DockChat),
         "dock_planning" | "planning" => Some(Action::DockPlanning),
         "planning_fullscreen" => Some(Action::PlanningFullscreen),
@@ -220,6 +224,26 @@ mod tests {
         assert_eq!(
             map.get(&(KeyModifiers::ALT, KeyCode::Char('o'))),
             Some(&Action::FocusNextPane)
+        );
+    }
+
+    #[test]
+    fn planning_fullscreen_accepts_terminal_shift_variants() {
+        let map = build_keymap(&KeybindingsConfig::default());
+        let alt = KeyModifiers::ALT;
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+
+        assert_eq!(
+            map.get(&(alt_shift, KeyCode::Char('P'))),
+            Some(&Action::PlanningFullscreen)
+        );
+        assert_eq!(
+            map.get(&(alt_shift, KeyCode::Char('p'))),
+            Some(&Action::PlanningFullscreen)
+        );
+        assert_eq!(
+            map.get(&(alt, KeyCode::Char('P'))),
+            Some(&Action::PlanningFullscreen)
         );
     }
 

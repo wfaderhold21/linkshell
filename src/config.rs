@@ -13,6 +13,7 @@ pub struct Config {
     ///   # api_key = "..."          # optional; sent as Bearer if set
     pub agents: HashMap<String, LocalAgent>,
     pub general: GeneralConfig,
+    pub theme: ThemeConfig,
     pub socket: SocketConfig,
     pub sessions: SessionsConfig,
     pub pipe: PipeConfig,
@@ -742,6 +743,45 @@ fn default_extract() -> String {
     "last_block".into()
 }
 
+// ── [theme] ───────────────────────────────────────────────────────────────
+
+/// Palette selection and per-field overrides:
+///
+///   [theme]
+///   base = "dark"          # "classic" | "dark" | "ansi16"
+///   accent = "#5fb3d4"     # any field overridable as #rrggbb
+///
+/// `base` unset auto-detects from `COLORTERM`. See `theme.rs`.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub base: Option<String>,
+    pub bg: Option<String>,
+    pub surface: Option<String>,
+    pub chrome: Option<String>,
+    pub text: Option<String>,
+    pub text_dim: Option<String>,
+    pub text_bright: Option<String>,
+    pub accent: Option<String>,
+    pub warn: Option<String>,
+    pub err: Option<String>,
+    pub ok: Option<String>,
+    pub info: Option<String>,
+    pub ctx: Option<String>,
+    pub cost: Option<String>,
+    pub pipe: Option<String>,
+    pub on_accent: Option<String>,
+    pub sel_bg: Option<String>,
+    pub kind_claude: Option<String>,
+    pub kind_codex: Option<String>,
+    pub kind_opencode: Option<String>,
+    pub kind_ohmypi: Option<String>,
+    pub kind_aider: Option<String>,
+    pub kind_shell: Option<String>,
+    pub kind_custom: Option<String>,
+    pub kind_orch: Option<String>,
+}
+
 // ── [general] ─────────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -752,6 +792,21 @@ pub struct GeneralConfig {
     pub tick_interval_ms: u64,
     pub ipc_state_override_timeout_secs: u64,
     pub menu_key: String,
+    /// Where the status panel lives:
+    ///
+    /// - "left" (default) — a permanent sidebar beside the output. Costs
+    ///   columns instead of rows, and unlike the bottom region it has the
+    ///   full terminal height, so it doesn't run out of room at 4 sessions.
+    /// - "bottom" — the always-on region below the output.
+    /// - "overlay" — not docked; alt-s opens it centered over the output.
+    /// - "off" — never shown.
+    ///
+    /// In "left" and "bottom", alt-s hides and shows the panel at runtime.
+    pub status_panel: String,
+    /// Columns claimed by the left sidebar. Below `status_panel_width` +
+    /// 60 columns of terminal the sidebar collapses to a rail (see
+    /// `ui::SIDEBAR_RAIL_COLS`) rather than starving the output pane.
+    pub status_panel_width: u16,
 }
 
 impl Default for GeneralConfig {
@@ -762,6 +817,8 @@ impl Default for GeneralConfig {
             tick_interval_ms: 100,
             ipc_state_override_timeout_secs: 60,
             menu_key: "ctrl+space".to_string(),
+            status_panel: "left".to_string(),
+            status_panel_width: 28,
         }
     }
 }

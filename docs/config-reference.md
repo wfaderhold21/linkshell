@@ -6,8 +6,43 @@ use these defaults.
 ## `[general]`
 
 `max_ipc_message_bytes = 0`, `scroll_buffer_lines = 2000`,
-`tick_interval_ms = 100`, `ipc_state_override_timeout_secs = 60`, and
-`menu_key = "ctrl+space"`.
+`tick_interval_ms = 100`, `ipc_state_override_timeout_secs = 60`,
+`menu_key = "ctrl+space"`, `status_panel = "left"`, and
+`status_panel_width = 28`.
+
+`status_panel` is `"left"` (a permanent sidebar), `"bottom"` (the always-on
+region below the output), `"overlay"` (alt-s only, claims no layout space) or
+`"off"`. `status_panel_width` is the sidebar's width in columns, clamped to
+16–60; below that width plus 60 columns of terminal the sidebar collapses to a
+narrow rail. See [Status panel](panes-and-navigation.md#status-panel).
+
+## `[theme]`
+
+Every colour the UI draws with. `base` picks a palette; any individual field
+overrides it with a `#rrggbb` hex string.
+
+```toml
+[theme]
+base = "dark"          # "classic" | "dark" | "ansi16"
+accent = "#5fb3d4"
+```
+
+- `classic` — the palette linkshell has always shipped.
+- `dark` — the restyle palette: desaturated chrome, one accent colour used for
+  focus and nothing else.
+- `ansi16` — named ANSI colours only, so a 16- or 256-colour terminal renders
+  *your* colour scheme instead of a quantized approximation of a truecolor one.
+
+`base` unset auto-detects: `classic` when `COLORTERM` contains `truecolor` or
+`24bit`, `ansi16` otherwise. `TERM` is not consulted — it reads
+`xterm-256color` on nearly everything, truecolor-capable or not. Run
+`linkshell doctor` to see which base resolved and why.
+
+Overridable fields: `bg`, `surface`, `chrome`, `text`, `text_dim`,
+`text_bright`, `accent`, `warn`, `err`, `ok`, `info`, `ctx`, `cost`, `pipe`,
+`on_accent`, `sel_bg`, and the per-agent `kind_claude`, `kind_codex`,
+`kind_opencode`, `kind_ohmypi`, `kind_aider`, `kind_shell`, `kind_custom`,
+`kind_orch`. An unparseable value is reported on stderr and ignored.
 
 ## `[socket]`
 
