@@ -3874,9 +3874,19 @@ mod tests {
             .collect()
     }
 
+    /// Config for the rendering tests. The theme base is pinned because
+    /// `Theme::resolve` otherwise reads `COLORTERM` off the real environment
+    /// and hands back `ansi16` where truecolor isn't claimed — which is how
+    /// these assertions pass in a terminal and fail in CI.
+    fn test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.theme.base = Some("classic".into());
+        config
+    }
+
     fn snapshot_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        App::new(tx, std::sync::Arc::new(crate::config::Config::default()))
+        App::new(tx, std::sync::Arc::new(test_config()))
     }
 
     /// Pins the rendered frame so a restyle has to be a deliberate edit to
@@ -4134,7 +4144,7 @@ mod tests {
     /// An app with the status panel placed explicitly, rather than at the
     /// `left` default.
     fn placed_app(placement: &str, names: &[&str]) -> App {
-        let mut config = crate::config::Config::default();
+        let mut config = test_config();
         config.general.status_panel = placement.into();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut app = App::new(tx, std::sync::Arc::new(config));
