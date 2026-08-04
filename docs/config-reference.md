@@ -9,6 +9,34 @@ use these defaults.
 `tick_interval_ms = 100`, `ipc_state_override_timeout_secs = 60`, and
 `menu_key = "ctrl+space"`.
 
+## `[theme]`
+
+Every colour the UI draws with. `base` picks a palette; any individual field
+overrides it with a `#rrggbb` hex string.
+
+```toml
+[theme]
+base = "dark"          # "classic" | "dark" | "ansi16"
+accent = "#5fb3d4"
+```
+
+- `classic` — the palette linkshell has always shipped.
+- `dark` — the restyle palette: desaturated chrome, one accent colour used for
+  focus and nothing else.
+- `ansi16` — named ANSI colours only, so a 16- or 256-colour terminal renders
+  *your* colour scheme instead of a quantized approximation of a truecolor one.
+
+`base` unset auto-detects: `classic` when `COLORTERM` contains `truecolor` or
+`24bit`, `ansi16` otherwise. `TERM` is not consulted — it reads
+`xterm-256color` on nearly everything, truecolor-capable or not. Run
+`linkshell doctor` to see which base resolved and why.
+
+Overridable fields: `bg`, `surface`, `chrome`, `text`, `text_dim`,
+`text_bright`, `accent`, `warn`, `err`, `ok`, `info`, `ctx`, `cost`, `pipe`,
+`on_accent`, `sel_bg`, and the per-agent `kind_claude`, `kind_codex`,
+`kind_opencode`, `kind_ohmypi`, `kind_aider`, `kind_shell`, `kind_custom`,
+`kind_orch`. An unparseable value is reported on stderr and ignored.
+
 ## `[socket]`
 
 `path = "/tmp/linkshell-{pid}.sock"`.

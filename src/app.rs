@@ -20,6 +20,7 @@ use crate::pipe::{self, ExtractMode, Pipe, PipeTrigger};
 use crate::session::{
     extract_waiting_prompt, Session, SessionKind, SessionState, MAX_SESSIONS, PTY_COLS, PTY_ROWS,
 };
+use crate::theme::Theme;
 
 fn expand_home(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
@@ -541,6 +542,10 @@ pub struct App {
     status_rows_hold_at: std::cell::Cell<Option<std::time::Instant>>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub config: Arc<Config>,
+    /// Every colour the UI draws with. Lives on App because each `draw_*` fn
+    /// already takes `&App`, so the palette is a field access rather than a
+    /// parameter threaded through forty signatures.
+    pub theme: Theme,
     pub pipes: Vec<Pipe>,
     // Current PTY size derived from each output pane (rows, cols), one per
     // pane slot; length matches `panes`.
@@ -688,6 +693,7 @@ impl App {
             status_rows_hold: std::cell::Cell::new(0),
             status_rows_hold_at: std::cell::Cell::new(None),
             event_tx,
+            theme: Theme::resolve(&config.theme),
             config,
             pipes: Vec::new(),
             pane_sizes: vec![(PTY_ROWS, PTY_COLS)],

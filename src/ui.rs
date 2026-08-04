@@ -9,6 +9,7 @@ use ratatui::{
 use crate::app::{App, AppMode, FileBrowserState, MenuAction, NewSessionField, Selection};
 use crate::layout::LayoutTree;
 use crate::session::{SessionKind, SessionState};
+use crate::theme::Theme;
 use vt100::Screen;
 
 #[derive(Default)]
@@ -100,41 +101,29 @@ fn prepare_display(s: &str) -> String {
     out
 }
 
-// ── Brand colours ──────────────────────────────────────────────────────────
-const CLAUDE_COLOR: Color = Color::Rgb(255, 140, 0); // orange
-const CODEX_COLOR: Color = Color::Rgb(64, 128, 255); // blue
-const SHELL_COLOR: Color = Color::White;
-const CUSTOM_COLOR: Color = Color::Cyan;
-const OPENCODE_COLOR: Color = Color::Rgb(80, 200, 120); // green
-const OHMYPI_COLOR: Color = Color::Rgb(200, 120, 255); // purple
-const AIDER_COLOR: Color = Color::Rgb(0, 180, 180); // teal
-const ORCH_COLOR: Color = Color::Rgb(255, 215, 0); // gold
-
-fn kind_color(kind: &SessionKind) -> Color {
+fn kind_color(t: &Theme, kind: &SessionKind) -> Color {
     match kind {
-        SessionKind::Claude => CLAUDE_COLOR,
-        SessionKind::Codex => CODEX_COLOR,
-        SessionKind::OpenCode => OPENCODE_COLOR,
-        SessionKind::OhMyPi => OHMYPI_COLOR,
-        SessionKind::Aider => AIDER_COLOR,
-        SessionKind::Shell => SHELL_COLOR,
-        SessionKind::Custom(_) => CUSTOM_COLOR,
+        SessionKind::Claude => t.kind_claude,
+        SessionKind::Codex => t.kind_codex,
+        SessionKind::OpenCode => t.kind_opencode,
+        SessionKind::OhMyPi => t.kind_ohmypi,
+        SessionKind::Aider => t.kind_aider,
+        SessionKind::Shell => t.kind_shell,
+        SessionKind::Custom(_) => t.kind_custom,
     }
 }
 
-fn state_border_style(state: &SessionState, active: bool) -> Style {
+fn state_border_style(t: &Theme, state: &SessionState, active: bool) -> Style {
     match state {
-        SessionState::Waiting => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        SessionState::Waiting => Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
         SessionState::Error => Style::default()
-            .fg(Color::Red)
+            .fg(t.err)
             .add_modifier(Modifier::RAPID_BLINK),
-        SessionState::Dead => Style::default().fg(Color::DarkGray),
+        SessionState::Dead => Style::default().fg(t.text_dim),
         _ if active => Style::default()
-            .fg(Color::White)
+            .fg(t.text_bright)
             .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(t.text_dim),
     }
 }
 
@@ -149,7 +138,7 @@ const MIN_COLS: u16 = 20;
 pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let size = f.size();
     if size.height < MIN_ROWS || size.width < MIN_COLS {
-        draw_too_small(f, size);
+        draw_too_small(f, &app.theme, size);
         // An empty LayoutInfo is safe: every consumer either iterates these
         // vectors or length-checks before indexing, so hit-testing simply finds
         // nothing until the terminal is large enough to lay out again.
@@ -239,7 +228,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             let ns_result = draw_new_session_dialog(f, app, size);
             new_session_area = ns_result.0;
             browse_button_area = ns_result.1;
-            file_browser_area = draw_file_browser(f, &app.file_browser_state, size);
+            file_browser_area = draw_file_browser(f, &app.theme, &app.file_browser_state, size);
         }
         AppMode::CommandBar => {
             command_bar_area = draw_command_bar(f, app, size);
@@ -248,7 +237,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             draw_command_result(f, app, size);
         }
         AppMode::Help => {
-            help_area = draw_help(f, size);
+            help_area = draw_help(f, &app.theme, size);
         }
         AppMode::PipeList => {
             help_area = draw_pipe_list(f, app, size);
@@ -303,6 +292,7 @@ fn split_output_areas(area: Rect, tree: &LayoutTree) -> Vec<Rect> {
 // ── Main output zone ───────────────────────────────────────────────────────
 
 fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, focused: bool) {
+    let t = &app.theme;
     let (title, lines, border_style) = if let Some(idx) = app.panes[pane_idx] {
         let session = &app.sessions[idx];
         let screen = session.screen.screen();
@@ -346,7 +336,7 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
                 .map(|l| {
                     ListItem::new(Line::from(Span::styled(
                         l.clone(),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(t.text),
                     )))
                 })
                 .collect()
@@ -361,11 +351,11 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
                     } else {
                         None
                     };
-                    build_row(screen, vt_row, screen_cols, disp_row, sel, cursor_col)
+                    build_row(t, screen, vt_row, screen_cols, disp_row, sel, cursor_col)
                 })
                 .collect()
         };
-        let style = state_border_style(&session.state, focused);
+        let style = state_border_style(t, &session.state, focused);
         (title, items, style)
     } else {
         let message = if app.sessions.is_empty() {
@@ -381,7 +371,7 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
                 " no session ".to_string()
             },
             items,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         )
     };
 
@@ -397,6 +387,7 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
 // ── Session bar ────────────────────────────────────────────────────────────
 
 fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+    let t = &app.theme;
     // Slots (and the returned click rects) cover visible sessions only;
     // mouse handling maps a slot position back through visible_to_idx.
     let visible = app.visible_indices();
@@ -416,7 +407,7 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         };
         f.render_widget(
             Paragraph::new("[BROADCAST]")
-                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                .style(Style::default().fg(t.err).add_modifier(Modifier::BOLD)),
             indicator,
         );
     }
@@ -450,8 +441,8 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         let is_active = app.active_idx() == Some(idx);
         let is_visible = app.panes.contains(&Some(idx));
         let label = format!("{} {}", i + 1, session.kind.label());
-        let color = kind_color(&session.kind);
-        let border_style = state_border_style(&session.state, is_active);
+        let color = kind_color(t, &session.kind);
+        let border_style = state_border_style(t, &session.state, is_active);
 
         let title_style = if is_active {
             Style::default().fg(color).add_modifier(Modifier::BOLD)
@@ -470,16 +461,16 @@ fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
         // State dot inside slot
         let state_dot = if session.paused {
-            Span::styled("⏸", Style::default().fg(Color::DarkGray))
+            Span::styled("⏸", Style::default().fg(t.text_dim))
         } else {
             match session.state {
-                SessionState::Waiting => Span::styled("⚡", Style::default().fg(Color::Yellow)),
-                SessionState::Error => Span::styled("✗", Style::default().fg(Color::Red)),
-                SessionState::Thinking => Span::styled("…", Style::default().fg(CLAUDE_COLOR)),
-                SessionState::Running => Span::styled("▶", Style::default().fg(Color::Green)),
-                SessionState::Ready => Span::styled("●", Style::default().fg(Color::Green)),
-                SessionState::Dead => Span::styled("✗", Style::default().fg(Color::DarkGray)),
-                SessionState::Starting => Span::styled("○", Style::default().fg(Color::Gray)),
+                SessionState::Waiting => Span::styled("⚡", Style::default().fg(t.warn)),
+                SessionState::Error => Span::styled("✗", Style::default().fg(t.err)),
+                SessionState::Thinking => Span::styled("…", Style::default().fg(t.kind_claude)),
+                SessionState::Running => Span::styled("▶", Style::default().fg(t.ok)),
+                SessionState::Ready => Span::styled("●", Style::default().fg(t.ok)),
+                SessionState::Dead => Span::styled("✗", Style::default().fg(t.text_dim)),
+                SessionState::Starting => Span::styled("○", Style::default().fg(t.text)),
             }
         };
 
@@ -536,8 +527,9 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn orchestrator_row(app: &App) -> Option<OrchRow> {
-    let green = Style::default().fg(Color::Green);
-    let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let t = &app.theme;
+    let green = Style::default().fg(t.ok);
+    let red = Style::default().fg(t.err).add_modifier(Modifier::BOLD);
 
     if let Some(h) = &app.orchestrator {
         // API-class: in-process task. Failed when its channel is gone.
@@ -562,13 +554,11 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
             state_style: if !alive {
                 red
             } else if app.orchestrator_paused {
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)
             } else if busy {
-                Style::default().fg(CLAUDE_COLOR)
+                Style::default().fg(t.kind_claude)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(t.text_dim)
             },
             tokens: if total == 0 {
                 "—".into()
@@ -605,11 +595,9 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
         state_style: if failed {
             red
         } else if s.paused {
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(t.ok)
         },
         tokens: s.tokens_display(),
         ctx: s.context_display(),
@@ -618,6 +606,7 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
 }
 
 fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+    let t = &app.theme;
     let title = match &app.council {
         Some(r) if r.complete => format!(" Status ── council '{}' done ", r.group),
         Some(r) => format!(
@@ -635,9 +624,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
     // Header row
     if inner.height > 0 {
-        let hdr_style = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD);
+        let hdr_style = Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD);
         let header_spans = vec![
             Span::styled("  ⏻ ", hdr_style),
             Span::styled("│ ", hdr_style),
@@ -688,29 +675,24 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
         // Health indicator: red when the agent has failed (Error/Dead),
         // green once it is connected and healthy again.
         let (health_dot, health_style) = match session.state {
-            SessionState::Error | SessionState::Dead => (
-                "●",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            SessionState::Starting => ("○", Style::default().fg(Color::Gray)),
-            _ => ("●", Style::default().fg(Color::Green)),
+            SessionState::Error | SessionState::Dead => {
+                ("●", Style::default().fg(t.err).add_modifier(Modifier::BOLD))
+            }
+            SessionState::Starting => ("○", Style::default().fg(t.text)),
+            _ => ("●", Style::default().fg(t.ok)),
         };
-        let kind_style = Style::default().fg(kind_color(&session.kind));
+        let kind_style = Style::default().fg(kind_color(t, &session.kind));
         let state_style = if session.paused {
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)
         } else {
             match session.state {
-                SessionState::Waiting => Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-                SessionState::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                SessionState::Thinking => Style::default().fg(CLAUDE_COLOR),
-                SessionState::Running => Style::default().fg(Color::Green),
-                SessionState::Ready => Style::default().fg(Color::DarkGray),
-                SessionState::Dead => Style::default().fg(Color::DarkGray),
-                SessionState::Starting => Style::default().fg(Color::Gray),
+                SessionState::Waiting => Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                SessionState::Error => Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+                SessionState::Thinking => Style::default().fg(t.kind_claude),
+                SessionState::Running => Style::default().fg(t.ok),
+                SessionState::Ready => Style::default().fg(t.text_dim),
+                SessionState::Dead => Style::default().fg(t.text_dim),
+                SessionState::Starting => Style::default().fg(t.text),
             }
         };
 
@@ -746,11 +728,11 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             Span::raw("│ "),
             Span::styled(
                 format!("{:<12} ", model_display(session.model.as_deref())),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(t.text),
             ),
             Span::raw("│ "),
             Span::styled(format!("{:<20} ", pipe_label), {
-                let s = Style::default().fg(Color::Cyan);
+                let s = Style::default().fg(t.info);
                 if all_inactive {
                     s.add_modifier(Modifier::DIM)
                 } else if pipe_recently_fired {
@@ -762,19 +744,13 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             Span::raw("│ "),
             Span::styled(format!("{:<8} ", session.state_label()), state_style),
             Span::raw("│ "),
-            Span::styled(
-                format!("{:>6}  ", elapsed),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format!("{:>6}  ", elapsed), Style::default().fg(t.text)),
             Span::raw("│ "),
-            Span::styled(format!("{:>6}  ", tokens), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:>6}  ", tokens), Style::default().fg(t.info)),
             Span::raw("│ "),
-            Span::styled(
-                format!("{:>13}  ", context),
-                Style::default().fg(Color::Magenta),
-            ),
+            Span::styled(format!("{:>13}  ", context), Style::default().fg(t.ctx)),
             Span::raw("│ "),
-            Span::styled(format!("{:>7}", cost), Style::default().fg(Color::Green)),
+            Span::styled(format!("{:>7}", cost), Style::default().fg(t.ok)),
         ];
 
         let line = Paragraph::new(Line::from(spans));
@@ -798,34 +774,30 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
                 Span::raw("│ "),
                 Span::styled(
                     format!("{:<8} ", truncate(&o.name, 8)),
-                    Style::default().fg(ORCH_COLOR).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(t.kind_orch)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("│ "),
                 Span::styled(
                     format!("{:<12} ", model_display(o.model.as_deref())),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(t.text),
                 ),
                 Span::raw("│ "),
                 Span::styled(
                     format!("{:<20} ", "orchestrator"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(t.text_dim),
                 ),
                 Span::raw("│ "),
                 Span::styled(format!("{:<8} ", o.state), o.state_style),
                 Span::raw("│ "),
-                Span::styled(format!("{:>6}  ", ""), Style::default().fg(Color::Gray)),
+                Span::styled(format!("{:>6}  ", ""), Style::default().fg(t.text)),
                 Span::raw("│ "),
-                Span::styled(
-                    format!("{:>6}  ", o.tokens),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(format!("{:>6}  ", o.tokens), Style::default().fg(t.info)),
                 Span::raw("│ "),
-                Span::styled(
-                    format!("{:>13}  ", o.ctx),
-                    Style::default().fg(Color::Magenta),
-                ),
+                Span::styled(format!("{:>13}  ", o.ctx), Style::default().fg(t.ctx)),
                 Span::raw("│ "),
-                Span::styled(format!("{:>7}", o.cost), Style::default().fg(Color::Green)),
+                Span::styled(format!("{:>7}", o.cost), Style::default().fg(t.ok)),
             ];
             f.render_widget(Paragraph::new(Line::from(spans)), row);
         }
@@ -841,12 +813,10 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
             height: 1,
         };
         let footer = Paragraph::new(Line::from(vec![
-            Span::styled("  sock: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  sock: ", Style::default().fg(t.text_dim)),
             Span::styled(
                 sock,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
+                Style::default().fg(t.text_dim).add_modifier(Modifier::DIM),
             ),
         ]));
         f.render_widget(footer, footer_row);
@@ -859,6 +829,7 @@ fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
 
 /// Returns (popup_rect, browse_button_rect).
 pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rect, Rect) {
+    let t = &app.theme;
     let ns = &app.new_session_state;
     let height = if ns.is_custom() { 16 } else { 13 };
     let popup = centered_rect(50, height, area);
@@ -874,10 +845,10 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     let kind_active = ns.active_field == NewSessionField::Kind;
     let kind_style = if kind_active {
         Style::default()
-            .fg(Color::White)
+            .fg(t.text_bright)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(t.text_dim)
     };
     let kind_label = crate::session::KIND_LABELS
         .get(ns.selected_kind)
@@ -895,11 +866,8 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
         .borders(Borders::ALL)
         .border_style(kind_style);
     let kind_text = Line::from(vec![
-        Span::styled(
-            format!(" {}", kind_label),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::styled(format!("  {}", arrow), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" {}", kind_label), Style::default().fg(t.warn)),
+        Span::styled(format!("  {}", arrow), Style::default().fg(t.text_dim)),
     ]);
     f.render_widget(Paragraph::new(kind_text).block(kind_block), kind_field);
 
@@ -908,6 +876,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     // Name field
     draw_input_field(
         f,
+        t,
         "Name",
         &ns.name,
         ns.name_cursor,
@@ -925,6 +894,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     let cwd_input_w = inner.width.saturating_sub(BROWSE_BTN_W);
     draw_input_field(
         f,
+        t,
         "CWD",
         &ns.cwd,
         ns.cwd_cursor,
@@ -944,7 +914,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
         width: BROWSE_BTN_W,
         height: 3,
     };
-    let browse_style = Style::default().fg(Color::Cyan);
+    let browse_style = Style::default().fg(t.info);
     let browse_block = Block::default()
         .borders(Borders::ALL)
         .border_style(browse_style);
@@ -957,6 +927,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
     if ns.is_custom() {
         draw_input_field(
             f,
+            t,
             "Command",
             &ns.custom_cmd,
             ns.custom_cmd_cursor,
@@ -977,7 +948,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
         " Tab: next field  Alt+B: browse  Enter: create  Esc: cancel "
     };
     let hint = Paragraph::new(hint_text)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(t.text_dim))
         .alignment(Alignment::Center);
     f.render_widget(
         hint,
@@ -995,7 +966,7 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
         f.render_widget(Clear, list);
         let list_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White));
+            .border_style(Style::default().fg(t.text_bright));
         let list_inner = list_block.inner(list);
         f.render_widget(list_block, list);
         for (i, label) in crate::session::KIND_LABELS.iter().enumerate() {
@@ -1005,11 +976,11 @@ pub fn draw_new_session_dialog(f: &mut Frame<'_>, app: &App, area: Rect) -> (Rec
             }
             let style = if i == ns.selected_kind {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
+                    .fg(t.on_accent)
+                    .bg(t.text_bright)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(t.text)
             };
             let row = Rect {
                 x: list_inner.x,
@@ -1043,7 +1014,12 @@ pub fn kind_dropdown_list_rect(popup: Rect) -> Rect {
 
 pub const FILE_BROWSER_VISIBLE_ROWS: usize = 16;
 
-pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect) -> Rect {
+pub fn draw_file_browser(
+    f: &mut Frame<'_>,
+    t: &Theme,
+    state: &FileBrowserState,
+    area: Rect,
+) -> Rect {
     const VISIBLE_ROWS: u16 = FILE_BROWSER_VISIBLE_ROWS as u16;
     let popup = centered_rect(60, VISIBLE_ROWS + 6, area);
     f.render_widget(Clear, popup);
@@ -1051,13 +1027,13 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
     let block = Block::default()
         .title(" Browse Directory ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(t.info));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     // Current path line
     let path_str = state.current_dir.to_string_lossy();
-    let path_line = Paragraph::new(path_str.as_ref()).style(Style::default().fg(Color::Yellow));
+    let path_line = Paragraph::new(path_str.as_ref()).style(Style::default().fg(t.warn));
     f.render_widget(
         path_line,
         Rect {
@@ -1069,8 +1045,8 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
     );
 
     // Separator
-    let sep = Paragraph::new("─".repeat(inner.width as usize))
-        .style(Style::default().fg(Color::DarkGray));
+    let sep =
+        Paragraph::new("─".repeat(inner.width as usize)).style(Style::default().fg(t.text_dim));
     f.render_widget(
         sep,
         Rect {
@@ -1096,11 +1072,11 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
             let label = state.entry_label(i);
             let style = if i == state.selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(t.on_accent)
+                    .bg(t.info)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(t.text_bright)
             };
             ListItem::new(format!(" {label}")).style(style)
         })
@@ -1112,7 +1088,7 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
     // Footer
     let footer =
         Paragraph::new(" ↑↓: navigate  Enter: open dir  Space: select current  Esc: cancel ")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(t.text_dim))
             .alignment(Alignment::Center);
     f.render_widget(
         footer,
@@ -1129,6 +1105,7 @@ pub fn draw_file_browser(f: &mut Frame<'_>, state: &FileBrowserState, area: Rect
 
 fn draw_input_field(
     f: &mut Frame<'_>,
+    t: &Theme,
     label: &str,
     value: &str,
     cursor_pos: usize,
@@ -1136,9 +1113,9 @@ fn draw_input_field(
     active: bool,
 ) {
     let style = if active {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(t.info)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(t.text_dim)
     };
     let block = Block::default()
         .title(format!(" {} ", label))
@@ -1157,7 +1134,7 @@ fn draw_input_field(
         } else {
             (" ", "")
         };
-        let cursor_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+        let cursor_style = Style::default().bg(t.info).fg(t.on_accent);
         let line = Line::from(vec![
             Span::raw(before),
             Span::styled(cursor_ch, cursor_style),
@@ -1172,7 +1149,7 @@ fn draw_input_field(
 
 // ── Help overlay ───────────────────────────────────────────────────────────
 
-fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
+fn draw_help(f: &mut Frame<'_>, t: &Theme, area: Rect) -> Rect {
     const BINDINGS: &[(&str, &str)] = &[
         ("alt-n", "New session dialog"),
         ("alt-tab", "Next session"),
@@ -1207,11 +1184,9 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let key_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(t.warn).add_modifier(Modifier::BOLD);
     let desc_style = Style::default();
-    let sep_style = Style::default().fg(Color::DarkGray);
+    let sep_style = Style::default().fg(t.text_dim);
 
     let rows: Vec<ListItem> = BINDINGS
         .iter()
@@ -1228,7 +1203,7 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
     f.render_widget(list, inner);
 
     let footer = Paragraph::new(" press any key to close ")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(t.text_dim))
         .alignment(Alignment::Center);
     f.render_widget(
         footer,
@@ -1244,6 +1219,7 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) -> Rect {
 }
 
 fn draw_pipe_list(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let t = &app.theme;
     let height = (app.pipes.len() as u16 + 4).clamp(6, 18);
     let popup = centered_rect(90, height, area);
     f.render_widget(Clear, popup);
@@ -1287,9 +1263,9 @@ fn draw_pipe_list(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
                     if pipe.active { "active" } else { "paused" },
                 );
                 let style = if index == app.pipe_list_selected {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                    Style::default().fg(t.on_accent).bg(t.info)
                 } else if !pipe.active {
-                    Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+                    Style::default().fg(t.text).add_modifier(Modifier::DIM)
                 } else {
                     Style::default()
                 };
@@ -1347,17 +1323,13 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn chat_from_style(from: &str) -> Style {
+fn chat_from_style(t: &Theme, from: &str) -> Style {
     if from.starts_with("you") {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(t.info).add_modifier(Modifier::BOLD)
     } else if from == "linkshell" {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(t.text_dim)
     } else {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(t.warn).add_modifier(Modifier::BOLD)
     }
 }
 
@@ -1410,6 +1382,7 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
 /// Render the chat into an exact rect — used by both the centered overlay
 /// and the docked split pane. `focused` drives the border colour.
 fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> ChatLayout {
+    let t = &app.theme;
     f.render_widget(Clear, popup);
 
     let target = app
@@ -1424,11 +1397,7 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
             target
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(if focused { t.info } else { t.text_dim }));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1446,13 +1415,13 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
         Some(ch) => (&after[..ch.len_utf8()], &after[ch.len_utf8()..]),
         None => (" ", ""),
     };
-    let prompt_style = Style::default().fg(Color::Cyan);
-    let cursor_style = Style::default().fg(Color::Black).bg(Color::White);
+    let prompt_style = Style::default().fg(t.info);
+    let cursor_style = Style::default().fg(t.on_accent).bg(t.text_bright);
     // Pasted newlines stay in the string but render as a single '⏎' glyph so
     // the char↔cell math below holds.
     let display = |c: char, style: Style| {
         if c == '\n' {
-            ('⏎', style.patch(Style::default().fg(Color::DarkGray)))
+            ('⏎', style.patch(Style::default().fg(t.text_dim)))
         } else {
             (c, style)
         }
@@ -1483,7 +1452,7 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
         for (i, l) in wrap_text(&m.text, body_width).into_iter().enumerate() {
             if i == 0 {
                 lines.push(Line::from(vec![
-                    Span::styled(prefix.clone(), chat_from_style(&m.from)),
+                    Span::styled(prefix.clone(), chat_from_style(t, &m.from)),
                     Span::raw(l),
                 ]));
             } else {
@@ -1495,7 +1464,7 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
         let waiting: Vec<&str> = app.chat.pending.iter().map(|p| p.name.as_str()).collect();
         lines.push(Line::from(Span::styled(
             format!("… awaiting {}", waiting.join(", ")),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         )));
     }
     if let Some((status, since)) = &app.orchestrator_status {
@@ -1515,7 +1484,7 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
                 },
                 status
             ),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warn),
         )));
     }
     if let Some(p) = &app.pending_proposal {
@@ -1524,9 +1493,7 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
                 "⏸ {} proposes {}: {}  (/approve · /deny [reason])",
                 app.config.orchestrator.name, p.tool, p.detail
             ),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.ctx).add_modifier(Modifier::BOLD),
         )));
     }
 
@@ -1592,7 +1559,7 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             sep_text,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         ))),
         sep,
     );
@@ -1641,9 +1608,9 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
                 .enumerate()
                 .map(|(index, entry)| {
                     let style = if index == app.chat.palette.selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                        Style::default().fg(t.on_accent).bg(t.info)
                     } else {
-                        Style::default().fg(Color::White).bg(Color::DarkGray)
+                        Style::default().fg(t.text_bright).bg(t.text_dim)
                     };
                     Line::from(vec![
                         Span::styled(format!(" {:<30}", entry.template), style),
@@ -1678,6 +1645,7 @@ fn palette_popup_rows(match_len: usize, area_height: u16) -> u16 {
 }
 
 fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let t = &app.theme;
     if area.height == 0 || area.width == 0 {
         return Rect::default();
     }
@@ -1698,9 +1666,9 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
             .enumerate()
             .map(|(index, entry)| {
                 let style = if index == app.palette.selected {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                    Style::default().fg(t.on_accent).bg(t.info)
                 } else {
-                    Style::default().fg(Color::White).bg(Color::DarkGray)
+                    Style::default().fg(t.text_bright).bg(t.text_dim)
                 };
                 Line::from(vec![
                     Span::styled(format!(" {:<38}", entry.template), style),
@@ -1735,16 +1703,17 @@ fn draw_command_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         Span::raw(before.to_string()),
         Span::styled(
             cursor_ch.to_string(),
-            Style::default().fg(Color::Black).bg(Color::White),
+            Style::default().fg(t.on_accent).bg(t.text_bright),
         ),
         Span::raw(after.to_string()),
     ]);
-    let p = Paragraph::new(line).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    let p = Paragraph::new(line).style(Style::default().fg(t.text_bright).bg(t.text_dim));
     f.render_widget(p, bar);
     bar
 }
 
 fn draw_command_result(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let bar = Rect {
         x: area.x,
         y: area.y + area.height - 1,
@@ -1753,20 +1722,21 @@ fn draw_command_result(f: &mut Frame<'_>, app: &App, area: Rect) {
     };
     f.render_widget(Clear, bar);
     let line = Line::from(vec![
-        Span::styled("» ", Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+        Span::styled("» ", Style::default().fg(t.warn).bg(t.text_dim)),
         Span::raw(app.command_result.clone()),
         Span::styled(
             "  [any key to close]",
-            Style::default().fg(Color::Gray).bg(Color::DarkGray),
+            Style::default().fg(t.text).bg(t.text_dim),
         ),
     ]);
     f.render_widget(
-        Paragraph::new(line).style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+        Paragraph::new(line).style(Style::default().fg(t.text_bright).bg(t.text_dim)),
         bar,
     );
 }
 
 fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, Vec<Rect>) {
+    let t = &app.theme;
     let (selected_top, selected_sub) = match app.mode {
         AppMode::Menu {
             selected_top,
@@ -1804,7 +1774,7 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
         spans.push(Span::styled(text, style));
     }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(t.text_dim)),
         area,
     );
 
@@ -1845,12 +1815,12 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
             if item.action == MenuAction::Separator {
                 return ListItem::new(Line::from(Span::styled(
                     "─".repeat(inner.width as usize),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(t.text_dim),
                 )));
             }
             let selected = idx == sub_idx;
             let base = if !item.enabled {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(t.text_dim)
             } else if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -1869,7 +1839,7 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
                 let detail_style = if selected || !item.enabled {
                     base
                 } else {
-                    base.fg(Color::Cyan)
+                    base.fg(t.info)
                 };
                 spans.push(Span::styled(format!("{} ", item.detail), detail_style));
             } else if selected {
@@ -1898,6 +1868,7 @@ fn draw_menu_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> (Vec<Rect>, Rect, 
 // ── Search overlay ─────────────────────────────────────────────────────────
 
 fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let t = &app.theme;
     let (query, cursor, matches, selected) = match &app.mode {
         AppMode::Search {
             query,
@@ -1916,7 +1887,7 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let block = Block::default()
         .title(" Search (↑↓ navigate  Enter jump  Esc cancel) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(t.info));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1944,9 +1915,9 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     } else {
         (" ", "")
     };
-    let cursor_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let cursor_style = Style::default().bg(t.info).fg(t.on_accent);
     let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Yellow)),
+        Span::styled("> ", Style::default().fg(t.warn)),
         Span::raw(before.to_string()),
         Span::styled(cursor_ch.to_string(), cursor_style),
         Span::raw(after.to_string()),
@@ -1964,8 +1935,7 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         height: 1,
     };
     f.render_widget(
-        Paragraph::new("─".repeat(inner.width as usize))
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("─".repeat(inner.width as usize)).style(Style::default().fg(t.text_dim)),
         sep_area,
     );
 
@@ -1989,9 +1959,9 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         .map(|(i, &line_idx)| {
             let text = session_lines.get(line_idx).cloned().unwrap_or_default();
             let style = if i == selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().fg(t.on_accent).bg(t.info)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(t.text)
             };
             ListItem::new(format!(" {:4}: {}", line_idx + 1, text)).style(style)
         })
@@ -2017,11 +1987,7 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         };
         f.render_widget(
             Paragraph::new(count_text)
-                .style(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                )
+                .style(Style::default().fg(t.text_dim).add_modifier(Modifier::DIM))
                 .alignment(Alignment::Center),
             footer_area,
         );
@@ -2033,6 +1999,7 @@ fn draw_search_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
 // ── Settings overlay ────────────────────────────────────────────────────────
 
 fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let t = &app.theme;
     let ss = &app.settings_state;
     let n_fields = ss.fields.len() as u16;
     let height = (n_fields + 6).min(area.height);
@@ -2042,7 +2009,7 @@ fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let block = Block::default()
         .title(" Settings (↑↓ navigate  Enter edit  s save  Esc cancel) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(t.warn));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -2077,9 +2044,9 @@ fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
             };
 
             let row_style = if is_selected {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
+                Style::default().fg(t.on_accent).bg(t.warn)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(t.text_bright)
             };
             let text = format!(" {:<28} │  {}", field.label, value_str);
             ListItem::new(text).style(row_style)
@@ -2098,11 +2065,7 @@ fn draw_settings_overlay(f: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
         };
         f.render_widget(
             Paragraph::new("Changes are saved to ~/.config/linkshell/config.toml")
-                .style(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                )
+                .style(Style::default().fg(t.text_dim).add_modifier(Modifier::DIM))
                 .alignment(Alignment::Center),
             footer_area,
         );
@@ -2150,6 +2113,7 @@ fn style_preserves_spaces(style: Style) -> bool {
 
 /// Build one display row, applying per-cell colors, selection highlight, and cursor.
 fn build_row(
+    t: &Theme,
     screen: &Screen,
     vt_row: u16,
     screen_cols: u16,
@@ -2158,6 +2122,7 @@ fn build_row(
     cursor_col: Option<u16>,
 ) -> ListItem<'static> {
     ListItem::new(build_row_line(
+        t,
         screen,
         vt_row,
         screen_cols,
@@ -2170,6 +2135,7 @@ fn build_row(
 /// Assemble the styled spans for one row. Split out from `build_row` so tests
 /// can inspect the rendered text directly.
 fn build_row_line(
+    t: &Theme,
     screen: &Screen,
     vt_row: u16,
     screen_cols: u16,
@@ -2177,7 +2143,7 @@ fn build_row_line(
     sel: Option<&Selection>,
     cursor_col: Option<u16>,
 ) -> Line<'static> {
-    let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
+    let sel_style = Style::default().bg(t.sel_bg).fg(t.text_bright);
     let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2242,21 +2208,19 @@ fn build_row_line(
 
 /// Fallback frame for terminals below the minimum layout size. Deliberately
 /// uses no arithmetic on the area beyond ratatui's own clipping.
-fn draw_too_small(f: &mut Frame<'_>, size: Rect) {
+fn draw_too_small(f: &mut Frame<'_>, t: &Theme, size: Rect) {
     f.render_widget(Clear, size);
     let text = vec![
         Line::from(Span::styled(
             "terminal too small",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!(
                 "{}x{} — need {}x{}",
                 size.width, size.height, MIN_COLS, MIN_ROWS
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         )),
     ];
     f.render_widget(
@@ -2340,6 +2304,7 @@ fn spinner_frame() -> char {
 /// right a header that says what the thread is grounded in, the transcript,
 /// an input that grows with the paragraph you're writing, and a status row.
 fn draw_planning_in(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    let t = &app.theme;
     use crate::app::PlanningFocus;
 
     f.render_widget(Clear, area);
@@ -2347,11 +2312,7 @@ fn draw_planning_in(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     let block = Block::default()
         .title(" Planning ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(if focused { t.info } else { t.text_dim }));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -2379,7 +2340,7 @@ fn draw_planning_in(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             Line::from(""),
             Line::from(Span::styled(
                 "  no thread — n to start one",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.text_dim),
             )),
         ]);
         f.render_widget(hint, main_area);
@@ -2440,6 +2401,7 @@ fn draw_planning_overlays(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Pick the session a committed plan is handed to as work.
 fn draw_planning_handoff(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let targets = app.planning_handoff_targets();
     let sel = app.planning.handoff.unwrap_or(0);
     let height = (targets.len() as u16 + 2).min(area.height).max(3);
@@ -2457,7 +2419,7 @@ fn draw_planning_handoff(f: &mut Frame<'_>, app: &App, area: Rect) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {}", name), style),
-                Span::styled(format!("  #{}", id), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  #{}", id), Style::default().fg(t.text_dim)),
             ]))
         })
         .collect();
@@ -2467,7 +2429,7 @@ fn draw_planning_handoff(f: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Hand plan to ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(t.ok)),
         ),
         popup,
     );
@@ -2475,6 +2437,7 @@ fn draw_planning_handoff(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Thread list: two lines per row so a title has room to breathe.
 fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     use crate::app::PlanningFocus;
 
     let open_id = app.planning.thread.as_ref().map(|t| t.id.as_str());
@@ -2503,11 +2466,11 @@ fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
         .saturating_sub(3 + decisions_rows)
         .max(2);
 
-    for (i, t) in app.planning.threads.iter().enumerate() {
+    for (i, thread) in app.planning.threads.iter().enumerate() {
         if lines.len() + 2 > list_budget + 2 {
             break;
         }
-        let is_open = open_id == Some(t.id.as_str());
+        let is_open = open_id == Some(thread.id.as_str());
         let is_sel = i == app.planning.list_selected;
         let marker = if is_open { "▸ " } else { "  " };
         // The open thread stays marked even when focus is elsewhere; the
@@ -2519,11 +2482,18 @@ fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
-            Span::styled(ellipsize(&t.title, width.saturating_sub(2)), title_style),
+            Span::styled(
+                ellipsize(&thread.title, width.saturating_sub(2)),
+                title_style,
+            ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("   {} · {} msg", relative_age(t.updated), t.messages),
-            Style::default().fg(Color::DarkGray),
+            format!(
+                "   {} · {} msg",
+                relative_age(thread.updated),
+                thread.messages
+            ),
+            Style::default().fg(t.text_dim),
         )));
     }
 
@@ -2539,7 +2509,7 @@ fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
         for d in decisions.iter().take(decisions_rows.saturating_sub(2)) {
             lines.push(Line::from(Span::styled(
                 format!("· {}", ellipsize(d, width.saturating_sub(2))),
-                Style::default().fg(Color::Green),
+                Style::default().fg(t.ok),
             )));
         }
     }
@@ -2558,7 +2528,7 @@ fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 format!(" {} thread{}", n, if n == 1 { "" } else { "s" }),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.text_dim),
             )),
             footer,
         );
@@ -2571,20 +2541,21 @@ fn draw_planning_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) {
 /// what tells you whether the brief still describes the repo.
 fn draw_planning_header(
     f: &mut Frame<'_>,
-    _app: &App,
+    app: &App,
     thread: &crate::planning::store::Thread,
     area: Rect,
 ) {
+    let t = &app.theme;
     let stale = thread.stale_reads();
     let reads = thread.reads.len();
     let mut scope: Vec<Span> = vec![Span::styled(
         format!(" {} · {} files read", contract_home(&thread.root), reads),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.text_dim),
     )];
     if !stale.is_empty() {
         scope.push(Span::styled(
             format!(" · {} changed since", stale.len()),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warn),
         ));
     }
     let lines = vec![
@@ -2604,6 +2575,7 @@ fn draw_planning_transcript(
     thread: &crate::planning::store::Thread,
     area: Rect,
 ) {
+    let t = &app.theme;
     use crate::planning::store::Role;
 
     let width = area.width.saturating_sub(2) as usize;
@@ -2621,7 +2593,7 @@ fn draw_planning_transcript(
                 let rule_w = width.saturating_sub(label.chars().count() + 2);
                 lines.push(Line::from(Span::styled(
                     format!("{}{}──", "─".repeat(rule_w), label),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(t.text_dim),
                 )));
             }
             prev_model = Some(m.model.clone());
@@ -2632,12 +2604,11 @@ fn draw_planning_transcript(
         // on text and metadata degrades rather than lying — so an empty
         // attribution renders as a generic label, not a blank gutter.
         let (label, style) = match m.role {
-            Role::User => ("you".to_string(), Style::default().fg(Color::DarkGray)),
-            Role::Assistant if attribution.trim().is_empty() => (
-                "assistant".to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Role::Assistant => (attribution, Style::default().fg(Color::Cyan)),
+            Role::User => ("you".to_string(), Style::default().fg(t.text_dim)),
+            Role::Assistant if attribution.trim().is_empty() => {
+                ("assistant".to_string(), Style::default().fg(t.text_dim))
+            }
+            Role::Assistant => (attribution, Style::default().fg(t.info)),
         };
         lines.push(Line::from(Span::styled(format!(" {}", label), style)));
         for l in wrap_text(&m.text, width.saturating_sub(2).max(8)) {
@@ -2649,7 +2620,7 @@ fn draw_planning_transcript(
     if app.planning.busy && !app.planning.status.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" {} {}", spinner_frame(), app.planning.status),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warn),
         )));
     }
 
@@ -2666,6 +2637,7 @@ fn draw_planning_transcript(
 /// Multi-line input. Enter sends; Alt+Enter inserts a newline, because a
 /// planning message is usually a paragraph.
 fn draw_planning_input(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    let t = &app.theme;
     let dim = app.planning.busy;
     let mut pos = app.planning.cursor.min(app.planning.input.len());
     while pos > 0 && !app.planning.input.is_char_boundary(pos) {
@@ -2677,16 +2649,16 @@ fn draw_planning_input(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) 
         None => (" ", ""),
     };
     let base = if dim {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(t.text_dim)
     } else {
         Style::default()
     };
-    let mut spans = vec![Span::styled(" > ", Style::default().fg(Color::Cyan))];
+    let mut spans = vec![Span::styled(" > ", Style::default().fg(t.info))];
     spans.push(Span::styled(before.replace('\n', "⏎"), base));
     if focused && !dim {
         spans.push(Span::styled(
             cursor_ch.replace('\n', "⏎"),
-            Style::default().fg(Color::Black).bg(Color::White),
+            Style::default().fg(t.on_accent).bg(t.text_bright),
         ));
     } else {
         spans.push(Span::styled(cursor_ch.replace('\n', "⏎"), base));
@@ -2719,13 +2691,14 @@ fn draw_planning_status(
     thread: &crate::planning::store::Thread,
     area: Rect,
 ) {
+    let t = &app.theme;
     let mut spans: Vec<Span> = Vec::new();
 
     let label = app.planning.backend_label();
     let backend_style = if app.planning.backend.is_none() {
-        Style::default().fg(Color::Red)
+        Style::default().fg(t.err)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(t.text_dim)
     };
     spans.push(Span::styled(format!(" {}", label), backend_style));
 
@@ -2743,11 +2716,11 @@ fn draw_planning_status(
             let worst = used.max(peak);
             let pct = worst * 100 / b.max_context_tokens.max(1);
             let style = if pct >= 90 {
-                Style::default().fg(Color::Red)
+                Style::default().fg(t.err)
             } else if pct >= 75 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(t.warn)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(t.text_dim)
             };
             spans.push(Span::styled(
                 format!(
@@ -2766,12 +2739,12 @@ fn draw_planning_status(
     if !app.planning.error.is_empty() {
         spans.push(Span::styled(
             format!("    {}", app.planning.error),
-            Style::default().fg(Color::Red),
+            Style::default().fg(t.err),
         ));
     } else if app.planning.busy {
         spans.push(Span::styled(
             format!("    {} {}", spinner_frame(), app.planning.status),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warn),
         ));
     } else if !app.planning.status.is_empty() {
         // Commit and handoff both land here: they finish by clearing `busy`
@@ -2779,12 +2752,12 @@ fn draw_planning_status(
         // shown because the spinner branch above is the only other reader.
         spans.push(Span::styled(
             format!("    {}", app.planning.status),
-            Style::default().fg(Color::Green),
+            Style::default().fg(t.ok),
         ));
     } else if let Some(p) = crate::planning::store::latest_plan(&thread.id) {
         spans.push(Span::styled(
             format!("    {}", contract_home(&p)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         ));
     }
 
@@ -2795,6 +2768,7 @@ fn draw_planning_status(
 /// eat the early turns, and in a planning thread those are usually the design
 /// premises everything downstream rests on.
 fn draw_planning_overflow(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let label = app.planning.backend_label();
     let limit = app
         .planning
@@ -2816,11 +2790,11 @@ fn draw_planning_overflow(f: &mut Frame<'_>, app: &App, area: Rect) {
                 label,
                 limit / 1000
             ),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warn),
         )),
         Line::from(Span::styled(
             " [c] compact   [b] switch backend   [Esc] dismiss",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         )),
     ];
     f.render_widget(Paragraph::new(lines), area);
@@ -2833,6 +2807,7 @@ fn draw_planning_overflow(f: &mut Frame<'_>, app: &App, area: Rect) {
 /// A full overlay rather than a menu row: a local server serves dozens of
 /// models, and stepping through those one Enter at a time is not choosing.
 fn draw_orchestrator_model_picker(f: &mut Frame<'_>, app: &App, area: Rect, sel: usize) -> Rect {
+    let t = &app.theme;
     let models = &app.orchestrator_models;
     let height = (models.len() as u16 + 2)
         .min(area.height.saturating_sub(4))
@@ -2843,13 +2818,13 @@ fn draw_orchestrator_model_picker(f: &mut Frame<'_>, app: &App, area: Rect, sel:
     let block = Block::default()
         .title(" Orchestrator model · ↵ select · r reprobe · esc ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(t.info));
 
     if models.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(
                 " endpoint reported no models",
-                Style::default().fg(Color::Red),
+                Style::default().fg(t.err),
             ))
             .block(block),
             popup,
@@ -2886,6 +2861,7 @@ fn draw_orchestrator_model_picker(f: &mut Frame<'_>, app: &App, area: Rect, sel:
 }
 
 fn draw_planning_picker(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let names = app.config.planning.backend_names();
     let sel = app.planning.picker.unwrap_or(0);
     if let Some(msel) = app.planning.picker_model {
@@ -2906,13 +2882,13 @@ fn draw_planning_picker(f: &mut Frame<'_>, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 " no backends — configure [agents.*] or [planning.backends.*]",
-                Style::default().fg(Color::Red),
+                Style::default().fg(t.err),
             ))
             .block(
                 Block::default()
                     .title(" Backend ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(t.info)),
             ),
             popup,
         );
@@ -2951,10 +2927,7 @@ fn draw_planning_picker(f: &mut Frame<'_>, app: &App, area: Rect) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:<12}", n), style),
-                Span::styled(
-                    format!("  {}", detail),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("  {}", detail), Style::default().fg(t.text_dim)),
             ]))
         })
         .collect();
@@ -2964,7 +2937,7 @@ fn draw_planning_picker(f: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Backend · ↵/→ models · r reprobe ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(t.info)),
         ),
         popup,
     );
@@ -2980,6 +2953,7 @@ fn draw_planning_model_picker(
     backend: String,
     sel: usize,
 ) {
+    let t = &app.theme;
     let models = app
         .planning
         .model_cache
@@ -3024,13 +2998,14 @@ fn draw_planning_model_picker(
             Block::default()
                 .title(format!(" Model · {} · ↵ select · ← back ", backend))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(t.info)),
         ),
         popup,
     );
 }
 
 fn draw_planning_delete_confirm(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let target = app.planning.confirm_delete.as_ref().and_then(|id| {
         app.planning
             .threads
@@ -3047,11 +3022,11 @@ fn draw_planning_delete_confirm(f: &mut Frame<'_>, app: &App, area: Rect) {
         // root is what tells them apart before an irreversible delete.
         Line::from(Span::styled(
             format!(" {}", ellipsize(&contract_home(&root), 50)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         )),
         Line::from(Span::styled(
             " [y] delete   [n/Esc] cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.text_dim),
         )),
     ];
     f.render_widget(
@@ -3059,7 +3034,7 @@ fn draw_planning_delete_confirm(f: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Confirm ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(t.err)),
         ),
         popup,
     );
@@ -3068,6 +3043,88 @@ fn draw_planning_delete_confirm(f: &mut Frame<'_>, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render `draw()` into an offscreen buffer and flatten it to rows of
+    /// `(text, fg)` — a snapshot fine-grained enough to catch a colour
+    /// regression, coarse enough not to churn on unrelated edits.
+    fn render_rows(app: &App, width: u16, height: u16) -> Vec<(String, Vec<Color>)> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                let mut text = String::new();
+                let mut fgs = Vec::new();
+                for x in 0..width {
+                    let cell = buffer.get(x, y);
+                    text.push_str(cell.symbol());
+                    fgs.push(cell.fg);
+                }
+                (text.trim_end().to_string(), fgs)
+            })
+            .collect()
+    }
+
+    fn snapshot_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        App::new(tx, std::sync::Arc::new(crate::config::Config::default()))
+    }
+
+    /// Pins the rendered frame so a restyle has to be a deliberate edit to
+    /// this expectation rather than a silent change nobody reviewed. Sessions
+    /// can't be spawned in a unit test (each needs a real PTY), so this covers
+    /// the empty-workspace frame: the output pane, the session bar and the
+    /// status panel chrome, which is where the theme refactor touched most.
+    #[test]
+    fn the_empty_frame_renders_from_the_theme_unchanged() {
+        let app = snapshot_app();
+        let rows = render_rows(&app, 60, 14);
+        let text: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
+
+        assert_eq!(
+            text[0],
+            "┌ linkshell ───────────────────────────────────────────────┐"
+        );
+        assert_eq!(
+            text[1],
+            "│ No sessions. Press alt-n to create one.                  │"
+        );
+        assert!(text[6].starts_with("└"), "{:?}", text[6]);
+        // Session bar: bordered slot boxes, three rows of chrome.
+        assert_eq!(
+            text[9],
+            "└──────────────────────────────────────────────────────────┘"
+        );
+        assert!(text[10].contains("Status"), "{:?}", text[10]);
+        assert!(
+            text[11].contains("Kind"),
+            "status header missing: {:?}",
+            text[11]
+        );
+        assert!(text[12].contains("sock:"), "{:?}", text[12]);
+
+        // The empty-pane border is `text_dim`, not some other grey.
+        let t = Theme::classic();
+        assert_eq!(rows[0].1[0], t.text_dim);
+    }
+
+    #[test]
+    fn a_theme_override_reaches_the_rendered_frame() {
+        let mut config = crate::config::Config::default();
+        config.theme.base = Some("classic".into());
+        config.theme.text_dim = Some("#ff00ff".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let app = App::new(tx, std::sync::Arc::new(config));
+
+        let rows = render_rows(&app, 60, 14);
+        assert_eq!(rows[0].1[0], Color::Rgb(0xff, 0, 0xff));
+    }
 
     /// `used / 1000` rendered every thread under 1000 tokens as "0k", which
     /// reads as a meter that is not measuring anything.
@@ -3126,6 +3183,7 @@ mod tests {
 
     #[test]
     fn build_row_skips_wide_continuation_cells() {
+        let t = Theme::classic();
         // A double-width glyph occupies two vt100 cells; the second is a
         // continuation marker. It must not render as an extra space, or every
         // wide char shifts the rest of the line right by one column.
@@ -3135,15 +3193,16 @@ mod tests {
         assert!(screen.cell(0, 0).unwrap().is_wide());
         assert!(screen.cell(0, 1).unwrap().is_wide_continuation());
 
-        let line = build_row_line(screen, 0, 20, 0, None, None);
+        let line = build_row_line(&t, &screen, 0, 20, 0, None, None);
         assert_eq!(line_text(&line), "\u{4e16}x plain");
     }
 
     #[test]
     fn build_row_renders_plain_ascii_unchanged() {
+        let t = Theme::classic();
         let mut parser = vt100::Parser::new(2, 20, 0);
         parser.process(b"hello world");
-        let line = build_row_line(parser.screen(), 0, 20, 0, None, None);
+        let line = build_row_line(&t, parser.screen(), 0, 20, 0, None, None);
         assert_eq!(line_text(&line), "hello world");
     }
 
@@ -3185,42 +3244,48 @@ mod tests {
 
     #[test]
     fn kind_color_assigns_distinct_brand_colors() {
-        assert_eq!(kind_color(&SessionKind::Claude), CLAUDE_COLOR);
-        assert_eq!(kind_color(&SessionKind::Codex), CODEX_COLOR);
-        assert_eq!(kind_color(&SessionKind::OpenCode), OPENCODE_COLOR);
-        assert_eq!(kind_color(&SessionKind::OhMyPi), OHMYPI_COLOR);
-        assert_eq!(kind_color(&SessionKind::Aider), AIDER_COLOR);
-        assert_eq!(kind_color(&SessionKind::Shell), SHELL_COLOR);
-        assert_eq!(kind_color(&SessionKind::Custom("x".into())), CUSTOM_COLOR);
+        let t = Theme::classic();
+        assert_eq!(kind_color(&t, &SessionKind::Claude), t.kind_claude);
+        assert_eq!(kind_color(&t, &SessionKind::Codex), t.kind_codex);
+        assert_eq!(kind_color(&t, &SessionKind::OpenCode), t.kind_opencode);
+        assert_eq!(kind_color(&t, &SessionKind::OhMyPi), t.kind_ohmypi);
+        assert_eq!(kind_color(&t, &SessionKind::Aider), t.kind_aider);
+        assert_eq!(kind_color(&t, &SessionKind::Shell), t.kind_shell);
+        assert_eq!(
+            kind_color(&t, &SessionKind::Custom("x".into())),
+            t.kind_custom
+        );
     }
 
     #[test]
     fn state_border_style_highlights_waiting_error_and_active_states() {
+        let t = Theme::classic();
         assert_eq!(
-            state_border_style(&SessionState::Waiting, false).fg,
-            Some(Color::Yellow)
+            state_border_style(&t, &SessionState::Waiting, false).fg,
+            Some(t.warn)
         );
         assert_eq!(
-            state_border_style(&SessionState::Error, false).fg,
-            Some(Color::Red)
+            state_border_style(&t, &SessionState::Error, false).fg,
+            Some(t.err)
         );
         assert_eq!(
-            state_border_style(&SessionState::Ready, true).fg,
-            Some(Color::White)
+            state_border_style(&t, &SessionState::Ready, true).fg,
+            Some(t.text_bright)
         );
         assert_eq!(
-            state_border_style(&SessionState::Ready, false).fg,
-            Some(Color::DarkGray)
+            state_border_style(&t, &SessionState::Ready, false).fg,
+            Some(t.text_dim)
         );
     }
 
     #[test]
     fn style_preserves_spaces_for_background_or_reverse_styles_only() {
-        assert!(style_preserves_spaces(Style::default().bg(Color::Blue)));
+        let t = Theme::classic();
+        assert!(style_preserves_spaces(Style::default().bg(t.sel_bg)));
         assert!(style_preserves_spaces(
             Style::default().add_modifier(Modifier::REVERSED)
         ));
-        assert!(!style_preserves_spaces(Style::default().fg(Color::Green)));
+        assert!(!style_preserves_spaces(Style::default().fg(t.ok)));
     }
 
     #[test]

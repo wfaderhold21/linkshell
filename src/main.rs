@@ -20,6 +20,7 @@ mod planning;
 mod protocol;
 mod reattach;
 mod session;
+mod theme;
 mod ui;
 
 use std::sync::{Arc, Mutex};
