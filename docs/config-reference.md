@@ -6,8 +6,12 @@ use these defaults.
 ## `[general]`
 
 `max_ipc_message_bytes = 0`, `scroll_buffer_lines = 2000`,
-`tick_interval_ms = 100`, `ipc_state_override_timeout_secs = 60`, and
-`menu_key = "ctrl+space"`.
+`tick_interval_ms = 100`, `ipc_state_override_timeout_secs = 60`,
+`menu_key = "ctrl+space"`, and `status_panel = "overlay"`.
+
+`status_panel` is `"overlay"` (the panel is an alt-s overlay and claims no
+layout rows) or `"docked"` (always on, in a region below the output, as it was
+before). See [Status panel](panes-and-navigation.md#status-panel).
 
 ## `[theme]`
 

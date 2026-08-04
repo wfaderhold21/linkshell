@@ -182,6 +182,10 @@ pub enum AppMode {
     OrchestratorModel {
         selected: usize,
     },
+    /// The status panel as an overlay (alt-s). An overlay rather than a
+    /// split: opening it must not resize any PTY, or every agent repaints
+    /// each time you glance at the panel.
+    Status,
     Search {
         query: String,
         cursor: usize,
@@ -1431,6 +1435,15 @@ impl App {
     /// waiting-preview row every few hundred ms; each change resizes the
     /// output panes, the resized TUI repaints, the repaint re-flaps the
     /// state, and the whole UI oscillates.
+    /// Whether the status panel is always-on in its own region rather than
+    /// an alt-s overlay.
+    pub fn status_docked(&self) -> bool {
+        self.config
+            .general
+            .status_panel
+            .eq_ignore_ascii_case("docked")
+    }
+
     pub fn stabilized_status_rows(&self, desired: u16) -> u16 {
         const HOLD: std::time::Duration = std::time::Duration::from_secs(3);
         let held = self.status_rows_hold.get();
@@ -3049,6 +3062,21 @@ impl App {
                     }
                     AppMode::PipeList => {
                         self.mode = AppMode::Normal;
+                        return;
+                    }
+                    AppMode::Status => {
+                        // Rows stay clickable inside the overlay; clicking one
+                        // means "take me there", so it also closes.
+                        for (i, row_area) in self.status_row_areas.iter().enumerate() {
+                            if rect_hit(*row_area, col, row) {
+                                if let Some(idx) = self.visible_to_idx(i) {
+                                    self.switch_to(idx);
+                                }
+                                break;
+                            }
+                        }
+                        self.mode = AppMode::Normal;
+                        self.selection = None;
                         return;
                     }
                     AppMode::Search { .. } => {
@@ -5273,6 +5301,20 @@ pub struct MenuSection {
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
 impl App {
+    /// alt-s. A no-op when the panel is docked: it is already on screen, and
+    /// opening an overlay copy of it would be answering a question nobody
+    /// asked.
+    pub fn toggle_status_panel(&mut self) {
+        if self.status_docked() {
+            return;
+        }
+        self.mode = if matches!(self.mode, AppMode::Status) {
+            AppMode::Normal
+        } else {
+            AppMode::Status
+        };
+    }
+
     pub fn toggle_chat(&mut self) {
         if self.chat_docked.is_some() {
             self.undock_chat();

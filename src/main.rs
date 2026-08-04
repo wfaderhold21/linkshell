@@ -863,6 +863,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     Action::ScrollDownLine => app.scroll_down(3),
                     Action::OpenMenu => app.open_menu(),
                     Action::ToggleChat => app.toggle_chat(),
+                    Action::ToggleStatus => app.toggle_status_panel(),
                     Action::DockChat => {
                         if app.chat_docked.is_some() {
                             app.undock_chat();
@@ -1079,6 +1080,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         AppMode::Chat => {
             app.chat_key(key);
         }
+
+        AppMode::Status => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Normal,
+            _ => {}
+        },
 
         AppMode::PipeList => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Normal,

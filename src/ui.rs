@@ -171,13 +171,27 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     } else {
         0
     };
-    let desired_status_rows = app.visible_indices().len().max(1) as u16 + 4 + orch_row;
-    let capped = desired_status_rows.min((body.height / 3).max(4));
-    // Hysteresis so a changing row count can't oscillate the pane layout
-    // (and with it the sessions' PTY sizes).
-    let status_rows = app
-        .stabilized_status_rows(capped)
-        .min((body.height / 3).max(4));
+    // Overlay mode is the default and claims no rows at all: the panel is
+    // drawn over the output, so opening it resizes no PTY. Docked mode keeps
+    // the region — and with two-line rows it wants twice the height, which
+    // the height/3 cap reaches sooner; `draw_status_panel` drops the detail
+    // line past four sessions rather than showing half the sessions.
+    let docked = app.status_docked();
+    let status_rows = if docked {
+        let rows_per_session = if app.visible_indices().len() <= 4 {
+            2
+        } else {
+            1
+        };
+        let desired = app.visible_indices().len().max(1) as u16 * rows_per_session + 3 + orch_row;
+        let capped = desired.min((body.height / 3).max(4));
+        // Hysteresis so a changing row count can't oscillate the pane layout
+        // (and with it the sessions' PTY sizes).
+        app.stabilized_status_rows(capped)
+            .min((body.height / 3).max(4))
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -216,7 +230,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     }
     let slot_areas = draw_tab_strip(f, app, chunks[0]);
     draw_rule(f, &app.theme, chunks[1]);
-    let status_row_areas = draw_status_panel(f, app, chunks[3]);
+    let mut status_row_areas = draw_status_panel(f, app, chunks[3], docked);
     draw_footer(f, app, chunks[4]);
 
     // ── Overlays ───────────────────────────────────────────────────────────
@@ -268,6 +282,13 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         }
         AppMode::Settings => {
             help_area = draw_settings_overlay(f, app, size);
+        }
+        AppMode::Status => {
+            // Sized to its content, capped at the terminal: an overlay that
+            // is mostly empty box reads as a panel that failed to load.
+            let rows = app.visible_indices().len().max(1) as u16 * 2 + 3 + orch_row * 2;
+            help_area = centered_rect(70, rows.min(size.height), size);
+            status_row_areas = draw_status_panel(f, app, help_area, false);
         }
         AppMode::Normal => {}
     }
@@ -730,7 +751,11 @@ fn draw_footer(f: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width as usize;
     let mut spans = head;
     let mut used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let hint = " alt-h help ";
+    let hint = if app.status_docked() {
+        " alt-h help "
+    } else {
+        " alt-s status "
+    };
     let hint_w = hint.chars().count();
     for segment in segments {
         let seg_w: usize = segment.iter().map(|s| s.content.chars().count()).sum();
@@ -782,10 +807,6 @@ struct OrchRow {
     tokens: String,
     ctx: String,
     cost: String,
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }
 
 fn orchestrator_row(app: &App) -> Option<OrchRow> {
@@ -867,222 +888,286 @@ fn orchestrator_row(app: &App) -> Option<OrchRow> {
     })
 }
 
-fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+/// One session's two lines in the status panel.
+///
+/// Line 1 is the vitals; line 2 is the identity — model, working directory,
+/// and which sessions this one is piped to or from. The pipe direction is
+/// genuinely new: the old column table had a 20-column `Pipe` cell that
+/// truncated a second peer out of existence.
+fn status_block(
+    app: &App,
+    session: &crate::session::Session,
+    width: usize,
+) -> (Line<'static>, Line<'static>) {
     let t = &app.theme;
-    let title = match &app.council {
+    let (dot, dot_style) = match session.state {
+        SessionState::Error | SessionState::Dead => {
+            ("●", Style::default().fg(t.err).add_modifier(Modifier::BOLD))
+        }
+        SessionState::Starting => ("○", Style::default().fg(t.text)),
+        _ => ("●", Style::default().fg(t.ok)),
+    };
+    let state_style = if session.paused {
+        Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)
+    } else {
+        match session.state {
+            SessionState::Waiting => Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+            SessionState::Error => Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+            SessionState::Thinking => Style::default().fg(t.kind_claude),
+            SessionState::Running => Style::default().fg(t.ok),
+            SessionState::Ready => Style::default().fg(t.text_dim),
+            SessionState::Dead => Style::default().fg(t.text_dim),
+            SessionState::Starting => Style::default().fg(t.text),
+        }
+    };
+
+    // Right-aligned numbers get fixed-width padding rather than `│`
+    // separators. The separators were what drifted out of alignment whenever
+    // a field rendered wider than its column, and they carried no meaning
+    // that the padding doesn't.
+    let vitals = Line::from(vec![
+        Span::styled(format!(" {dot} "), dot_style),
+        Span::styled(
+            format!("{:<14} ", ellipsize(&session.name, 14)),
+            Style::default()
+                .fg(kind_color(t, &session.kind))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{:<9} ", session.state_label()), state_style),
+        Span::styled(
+            format!("{:>7}  ", session.elapsed_display()),
+            Style::default().fg(t.text_dim),
+        ),
+        Span::styled(
+            format!("{:>8}  ", session.tokens_display()),
+            Style::default().fg(t.info),
+        ),
+        Span::styled(
+            format!("{:>13}  ", session.context_display()),
+            Style::default().fg(t.ctx),
+        ),
+        Span::styled(
+            format!("{:>8}", session.cost_display()),
+            Style::default().fg(t.cost),
+        ),
+    ]);
+
+    let mut detail = model_display(session.model.as_deref());
+    if !session.cwd.is_empty() {
+        detail.push_str(" · ");
+        detail.push_str(&contract_home(std::path::Path::new(&session.cwd)));
+    }
+    let glyphs = app.pipe_summary_for(session.id, std::time::Instant::now());
+    let (out, inn): (Vec<_>, Vec<_>) = glyphs.iter().partition(|g| g.outgoing);
+    for (arrow, group) in [("→", &out), ("←", &inn)] {
+        if group.is_empty() {
+            continue;
+        }
+        let peers: Vec<&str> = group.iter().map(|g| g.peer.as_str()).collect();
+        detail.push_str(&format!(" · {arrow} {}", peers.join(",")));
+    }
+
+    let detail = Line::from(Span::styled(
+        format!("     {}", ellipsize(&detail, width.saturating_sub(5))),
+        Style::default().fg(t.text_dim),
+    ));
+    (vitals, detail)
+}
+
+/// Header for the status panel — the council round is the only thing here
+/// that changes, and it changes often enough to be worth the row.
+fn status_title(app: &App) -> String {
+    match &app.council {
         Some(r) if r.complete => format!(" Status ── council '{}' done ", r.group),
         Some(r) => format!(
             " Status ── council '{}' round {}/{} ",
             r.group, r.round, r.max_rounds
         ),
         None => " Status ".to_string(),
-    };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
+    }
+}
 
+/// The status panel, in either of its two modes.
+///
+/// `docked` draws it into a region below the output, as it always was;
+/// otherwise it is the alt-s overlay, which claims no layout rows and so
+/// resizes no PTY when it opens. Returns one click rect per visible session,
+/// in `visible_indices` order — `app.rs` maps a hit back through
+/// `visible_to_idx`, and that holds in both modes.
+fn draw_status_panel(f: &mut Frame<'_>, app: &App, area: Rect, docked: bool) -> Vec<Rect> {
+    let t = &app.theme;
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let visible = app.visible_indices();
+
+    let block = if docked {
+        Block::default()
+            .title(status_title(app))
+            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+    } else {
+        f.render_widget(Clear, area);
+        Block::default()
+            .title(Span::styled(
+                status_title(app),
+                Style::default()
+                    .fg(t.text_bright)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.chrome))
+            .style(Style::default().bg(t.surface))
+    };
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    // Header row
-    if inner.height > 0 {
-        let hdr_style = Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD);
-        let header_spans = vec![
-            Span::styled("  ⏻ ", hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:<8} ", "Kind"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:<12} ", "Model"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:<20} ", "Pipe"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:<8} ", "State"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:>6}  ", "Time"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:>6}  ", "Tokens"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:>13}  ", "Ctx"), hdr_style),
-            Span::styled("│ ", hdr_style),
-            Span::styled(format!("{:>7}", "Cost"), hdr_style),
-        ];
-        let header_row = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        };
-        f.render_widget(Paragraph::new(Line::from(header_spans)), header_row);
+    if inner.height == 0 {
+        return Vec::new();
     }
+
+    // Docked mode reserves rows from the output pane, and a two-line row
+    // doubles what it takes. Past four sessions that is more of the screen
+    // than the panel is worth, so the detail line is what gives way — the
+    // overlay still has it, and alt-s is one keystroke.
+    let two_line = !docked || visible.len() <= 4;
+    let per_row: u16 = if two_line { 2 } else { 1 };
+    // The last inner row belongs to the totals footer.
+    let body_rows = inner.height.saturating_sub(1);
 
     let mut row_areas = Vec::new();
-    let mut row_y = inner.y + 1;
-    // Rows (and the returned click rects) cover visible sessions only, in
-    // the same order as the session bar slots.
-    for idx in app.visible_indices() {
-        let session = &app.sessions[idx];
-        if row_y >= inner.y + inner.height {
+    let mut y = inner.y;
+    for &idx in &visible {
+        if y + per_row > inner.y + body_rows {
             break;
         }
-
+        let session = &app.sessions[idx];
+        let (vitals, detail) = status_block(app, session, inner.width as usize);
         let row = Rect {
             x: inner.x,
-            y: row_y,
+            y,
             width: inner.width,
             height: 1,
         };
-        row_y += 1;
+        f.render_widget(Paragraph::new(vitals), row);
+        // The click rect is the vitals line only: a two-row target would
+        // overlap the next session's block on the boundary.
         row_areas.push(row);
-
-        // Health indicator: red when the agent has failed (Error/Dead),
-        // green once it is connected and healthy again.
-        let (health_dot, health_style) = match session.state {
-            SessionState::Error | SessionState::Dead => {
-                ("●", Style::default().fg(t.err).add_modifier(Modifier::BOLD))
-            }
-            SessionState::Starting => ("○", Style::default().fg(t.text)),
-            _ => ("●", Style::default().fg(t.ok)),
-        };
-        let kind_style = Style::default().fg(kind_color(t, &session.kind));
-        let state_style = if session.paused {
-            Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)
-        } else {
-            match session.state {
-                SessionState::Waiting => Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
-                SessionState::Error => Style::default().fg(t.err).add_modifier(Modifier::BOLD),
-                SessionState::Thinking => Style::default().fg(t.kind_claude),
-                SessionState::Running => Style::default().fg(t.ok),
-                SessionState::Ready => Style::default().fg(t.text_dim),
-                SessionState::Dead => Style::default().fg(t.text_dim),
-                SessionState::Starting => Style::default().fg(t.text),
-            }
-        };
-
-        let tokens = session.tokens_display();
-        let context = session.context_display();
-        let cost = session.cost_display();
-        let elapsed = session.elapsed_display();
-
-        let glyphs = app.pipe_summary_for(session.id, std::time::Instant::now());
-        let mut labels: Vec<String> = glyphs
-            .iter()
-            .take(2)
-            .map(|glyph| {
-                format!(
-                    "{}{}{}",
-                    if glyph.outgoing { "→" } else { "←" },
-                    glyph.peer,
-                    if glyph.recent { " ●" } else { "" }
-                )
-            })
-            .collect();
-        if glyphs.len() > 2 {
-            labels.push(format!("+{}", glyphs.len() - 2));
+        y += 1;
+        if two_line {
+            f.render_widget(
+                Paragraph::new(detail),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+            y += 1;
         }
-        let pipe_label = labels.join(",");
-        let pipe_recently_fired = glyphs.iter().any(|glyph| glyph.recent);
-        let all_inactive = !glyphs.is_empty() && glyphs.iter().all(|glyph| !glyph.active);
-
-        let spans = vec![
-            Span::styled(format!("  {health_dot} "), health_style),
-            Span::raw("│ "),
-            Span::styled(format!("{:<8} ", session.kind.label()), kind_style),
-            Span::raw("│ "),
-            Span::styled(
-                format!("{:<12} ", model_display(session.model.as_deref())),
-                Style::default().fg(t.text),
-            ),
-            Span::raw("│ "),
-            Span::styled(format!("{:<20} ", pipe_label), {
-                let s = Style::default().fg(t.info);
-                if all_inactive {
-                    s.add_modifier(Modifier::DIM)
-                } else if pipe_recently_fired {
-                    s.add_modifier(Modifier::BOLD)
-                } else {
-                    s
-                }
-            }),
-            Span::raw("│ "),
-            Span::styled(format!("{:<8} ", session.state_label()), state_style),
-            Span::raw("│ "),
-            Span::styled(format!("{:>6}  ", elapsed), Style::default().fg(t.text)),
-            Span::raw("│ "),
-            Span::styled(format!("{:>6}  ", tokens), Style::default().fg(t.info)),
-            Span::raw("│ "),
-            Span::styled(format!("{:>13}  ", context), Style::default().fg(t.ctx)),
-            Span::raw("│ "),
-            Span::styled(format!("{:>7}", cost), Style::default().fg(t.ok)),
-        ];
-
-        let line = Paragraph::new(Line::from(spans));
-        f.render_widget(line, row);
     }
 
-    // Orchestrator agent row — after the session rows so the returned click
-    // rects still map 1:1 onto visible sessions. Covers both flavors: the
+    // Orchestrator row — after the session rows so the returned click rects
+    // still map 1:1 onto visible sessions. Covers both flavors: the
     // in-process API-class handle and the hidden CLI-class session.
-    let orch = orchestrator_row(app);
-    if let Some(o) = orch {
-        if row_y < inner.y + inner.height {
-            let row = Rect {
-                x: inner.x,
-                y: row_y,
-                width: inner.width,
-                height: 1,
-            };
+    if let Some(o) = orchestrator_row(app) {
+        if y < inner.y + body_rows {
             let spans = vec![
-                Span::styled(format!("  {} ", o.dot), o.dot_style),
-                Span::raw("│ "),
+                Span::styled(format!(" {} ", o.dot), o.dot_style),
                 Span::styled(
-                    format!("{:<8} ", truncate(&o.name, 8)),
+                    format!("{:<14} ", ellipsize(&o.name, 14)),
                     Style::default()
                         .fg(t.kind_orch)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("│ "),
-                Span::styled(
-                    format!("{:<12} ", model_display(o.model.as_deref())),
-                    Style::default().fg(t.text),
-                ),
-                Span::raw("│ "),
-                Span::styled(
-                    format!("{:<20} ", "orchestrator"),
-                    Style::default().fg(t.text_dim),
-                ),
-                Span::raw("│ "),
-                Span::styled(format!("{:<8} ", o.state), o.state_style),
-                Span::raw("│ "),
-                Span::styled(format!("{:>6}  ", ""), Style::default().fg(t.text)),
-                Span::raw("│ "),
-                Span::styled(format!("{:>6}  ", o.tokens), Style::default().fg(t.info)),
-                Span::raw("│ "),
+                Span::styled(format!("{:<9} ", o.state), o.state_style),
+                Span::styled(format!("{:>7}  ", ""), Style::default().fg(t.text_dim)),
+                Span::styled(format!("{:>8}  ", o.tokens), Style::default().fg(t.info)),
                 Span::styled(format!("{:>13}  ", o.ctx), Style::default().fg(t.ctx)),
-                Span::raw("│ "),
-                Span::styled(format!("{:>7}", o.cost), Style::default().fg(t.ok)),
+                Span::styled(format!("{:>8}", o.cost), Style::default().fg(t.cost)),
             ];
-            f.render_widget(Paragraph::new(Line::from(spans)), row);
+            f.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+            y += 1;
+            if two_line && y < inner.y + body_rows {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("     orchestrator · {}", model_display(o.model.as_deref())),
+                        Style::default().fg(t.text_dim),
+                    )),
+                    Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            }
         }
     }
 
-    // Socket path footer — always at the last row of inner area
-    if inner.height > 0 {
-        let sock = crate::ipc::socket_path(&app.config);
-        let footer_row = Rect {
+    // Totals footer — always the last inner row.
+    let total_tokens: u64 = visible
+        .iter()
+        .map(|&i| app.sessions[i].stats.input_tokens + app.sessions[i].stats.output_tokens)
+        .sum();
+    let total_cost: f64 = visible
+        .iter()
+        .map(|&i| app.sessions[i].stats.total_cost_usd)
+        .sum();
+    let mut footer = vec![
+        Span::styled(
+            format!(
+                " {} session{}",
+                visible.len(),
+                if visible.len() == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(t.text),
+        ),
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            crate::session::fmt_count(total_tokens),
+            Style::default().fg(t.info),
+        ),
+        Span::styled(" tokens", Style::default().fg(t.text_dim)),
+    ];
+    if total_cost > 0.0 {
+        footer.push(Span::styled("   ", Style::default()));
+        footer.push(Span::styled(
+            format!("${total_cost:.3}"),
+            Style::default().fg(t.cost),
+        ));
+    }
+    if docked {
+        // The socket path has no home in the overlay, which is transient; in
+        // the always-on panel it is the thing you copy to point an agent here.
+        footer.push(Span::styled("   ", Style::default()));
+        footer.push(Span::styled(
+            format!("sock: {}", crate::ipc::socket_path(&app.config)),
+            Style::default().fg(t.text_dim).add_modifier(Modifier::DIM),
+        ));
+    } else {
+        footer.push(Span::styled("   ", Style::default()));
+        footer.push(Span::styled(
+            "esc to close",
+            Style::default().fg(t.text_dim),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(footer)),
+        Rect {
             x: inner.x,
             y: inner.y + inner.height - 1,
             width: inner.width,
             height: 1,
-        };
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled("  sock: ", Style::default().fg(t.text_dim)),
-            Span::styled(
-                sock,
-                Style::default().fg(t.text_dim).add_modifier(Modifier::DIM),
-            ),
-        ]));
-        f.render_widget(footer, footer_row);
-    }
+        },
+    );
 
     row_areas
 }
@@ -3345,8 +3430,6 @@ mod tests {
     #[test]
     fn the_empty_frame_renders_its_chrome_in_the_expected_rows() {
         let app = snapshot_app();
-        // 15 rows, one more than the layout's minimum, so the footer is the
-        // row that gets added rather than one the output pane gives up.
         let rows = render_rows(&app, 60, 15);
         let text: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
 
@@ -3360,17 +3443,12 @@ mod tests {
             text[3],
             "│ No sessions. Press alt-n to create one.                  │"
         );
-        assert!(
-            text[8].starts_with("└"),
-            "output pane closes: {:?}",
-            text[8]
+        // In the default overlay mode the panel claims no rows, so the output
+        // pane runs to the footer.
+        assert_eq!(
+            text[13],
+            "└──────────────────────────────────────────────────────────┘"
         );
-        // The status panel keeps its own chrome; its height flexes with the
-        // terminal, so this asserts presence and order, not row numbers.
-        let status = text[9..14].join("\n");
-        assert!(status.contains("Status"), "{status}");
-        assert!(status.contains("Kind"), "{status}");
-        assert!(status.contains("sock:"), "{status}");
         assert_eq!(text[14], " no session — alt-n to create one");
 
         // The rule is chrome, and the empty-pane border is text_dim.
@@ -3493,6 +3571,150 @@ mod tests {
         );
     }
 
+    // ── Status panel ──────────────────────────────────────────────────────
+
+    /// The regression this whole mode exists to avoid. A docked panel takes
+    /// rows from the output pane, so toggling it resizes every PTY and makes
+    /// every full-screen agent repaint. The overlay is drawn *over* the
+    /// output; the pane rects must be identical open and closed.
+    #[test]
+    fn opening_the_overlay_does_not_resize_any_pane() {
+        let mut app = app_with_sessions(&["alpha", "beta"]);
+        let closed = layout_of(&app, 80, 30).output_areas;
+        app.toggle_status_panel();
+        assert!(matches!(app.mode, AppMode::Status));
+        let open = layout_of(&app, 80, 30).output_areas;
+        assert_eq!(closed, open);
+    }
+
+    fn layout_of(app: &App, width: u16, height: u16) -> LayoutInfo {
+        let mut layout = LayoutInfo::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| {
+                layout = draw(f, app);
+            })
+            .unwrap();
+        layout
+    }
+
+    fn docked_app(names: &[&str]) -> App {
+        let mut config = crate::config::Config::default();
+        config.general.status_panel = "docked".into();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut app = App::new(tx, std::sync::Arc::new(config));
+        for name in names {
+            app.spawn_headless_session((*name).to_string(), None)
+                .unwrap();
+        }
+        app
+    }
+
+    #[test]
+    fn overlay_mode_gives_its_rows_back_to_the_output_pane() {
+        let overlay = app_with_sessions(&["alpha", "beta"]);
+        let docked = docked_app(&["alpha", "beta"]);
+        let overlay_h = layout_of(&overlay, 80, 30).output_areas[0].height;
+        let docked_h = layout_of(&docked, 80, 30).output_areas[0].height;
+        assert!(
+            overlay_h > docked_h,
+            "overlay {overlay_h} should beat docked {docked_h}"
+        );
+    }
+
+    #[test]
+    fn a_docked_panel_is_always_on_and_alt_s_does_not_open_a_second_one() {
+        let mut app = docked_app(&["alpha"]);
+        let rows: Vec<String> = render_rows(&app, 80, 30)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("Status")), "{rows:#?}");
+
+        app.toggle_status_panel();
+        assert!(matches!(app.mode, AppMode::Normal), "alt-s is a no-op");
+    }
+
+    #[test]
+    fn the_overlay_shows_two_lines_per_session_with_model_and_cwd() {
+        let mut app = app_with_sessions(&["alpha"]);
+        app.sessions[0].model = Some("claude-opus-4-8".into());
+        app.sessions[0].cwd = "/tmp/work".into();
+        app.mode = AppMode::Status;
+        let rows: Vec<String> = render_rows(&app, 80, 30)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let body = rows.join("\n");
+        assert!(body.contains("alpha"), "{body}");
+        assert!(body.contains("opus-4-8 · /tmp/work"), "{body}");
+        assert!(body.contains("1 session"), "totals row: {body}");
+        assert!(body.contains("esc to close"), "{body}");
+        // No column separators survived the rewrite.
+        assert!(!body.contains("│ Kind"), "{body}");
+    }
+
+    #[test]
+    fn the_detail_line_names_pipe_peers_in_both_directions() {
+        let mut app = app_with_sessions(&["alpha", "beta", "gamma"]);
+        for (source, dest) in [(0, 1), (2, 0)] {
+            app.pipes.push(crate::pipe::Pipe {
+                source,
+                dest,
+                trigger: crate::pipe::PipeTrigger::Manual,
+                extract: crate::pipe::ExtractMode::LastBlock,
+                prefix: None,
+                active: true,
+                last_fired: None,
+                condition: None,
+            });
+        }
+        app.mode = AppMode::Status;
+        let body = render_rows(&app, 80, 30)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("→ beta"), "outgoing: {body}");
+        assert!(body.contains("← gamma"), "incoming: {body}");
+    }
+
+    /// Two-line rows double what a docked panel costs, and the height/3 cap
+    /// reaches that sooner. Dropping the detail line beats showing half the
+    /// sessions — the overlay still has the detail, one keystroke away.
+    #[test]
+    fn a_crowded_docked_panel_drops_the_detail_line_not_the_sessions() {
+        let app = docked_app(&["a", "b", "c", "d", "e"]);
+        let layout = layout_of(&app, 80, 40);
+        assert_eq!(layout.status_row_areas.len(), 5);
+        for pair in layout.status_row_areas.windows(2) {
+            assert_eq!(pair[1].y - pair[0].y, 1, "rows should be one line each");
+        }
+
+        let app = docked_app(&["a", "b", "c", "d"]);
+        let layout = layout_of(&app, 80, 40);
+        assert_eq!(layout.status_row_areas.len(), 4);
+        for pair in layout.status_row_areas.windows(2) {
+            assert_eq!(pair[1].y - pair[0].y, 2, "rows should be two lines each");
+        }
+    }
+
+    #[test]
+    fn click_to_focus_works_in_both_modes() {
+        for mut app in [
+            app_with_sessions(&["alpha", "beta"]),
+            docked_app(&["alpha", "beta"]),
+        ] {
+            if !app.status_docked() {
+                app.mode = AppMode::Status;
+            }
+            let layout = layout_of(&app, 80, 30);
+            assert_eq!(layout.status_row_areas.len(), 2);
+            let second = layout.status_row_areas[1];
+            assert!(second.height == 1 && second.width > 0);
+        }
+    }
+
     // ── Footer ────────────────────────────────────────────────────────────
 
     fn footer_row(app: &App, width: u16) -> (String, Vec<Color>) {
@@ -3507,7 +3729,7 @@ mod tests {
         let (text, _) = footer_row(&app, 80);
         assert!(text.starts_with(" alpha · opus-4-8"), "{text:?}");
         assert!(text.contains("READY"), "{text:?}");
-        assert!(text.contains("alt-h help"), "{text:?}");
+        assert!(text.contains("alt-s status"), "{text:?}");
     }
 
     #[test]
@@ -3566,7 +3788,7 @@ mod tests {
     fn the_hint_is_shed_before_the_cost_and_the_cost_before_the_state() {
         let mut app = app_with_sessions(&["alpha"]);
         app.sessions[0].stats.total_cost_usd = 1.25;
-        assert!(footer_row(&app, 80).0.contains("alt-h help"));
+        assert!(footer_row(&app, 80).0.contains("alt-s status"));
 
         let (text, _) = footer_row(&app, 34);
         assert!(

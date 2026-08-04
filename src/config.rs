@@ -792,6 +792,10 @@ pub struct GeneralConfig {
     pub tick_interval_ms: u64,
     pub ipc_state_override_timeout_secs: u64,
     pub menu_key: String,
+    /// "overlay" (default): the status panel is an alt-s overlay, and the
+    /// rows it used to occupy go to the output pane. "docked": it is always
+    /// on, in a region below the output, as it used to be.
+    pub status_panel: String,
 }
 
 impl Default for GeneralConfig {
@@ -802,6 +806,7 @@ impl Default for GeneralConfig {
             tick_interval_ms: 100,
             ipc_state_override_timeout_secs: 60,
             menu_key: "ctrl+space".to_string(),
+            status_panel: "overlay".to_string(),
         }
     }
 }
