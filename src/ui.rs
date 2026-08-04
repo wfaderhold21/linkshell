@@ -128,10 +128,10 @@ fn state_border_style(t: &Theme, state: &SessionState, active: bool) -> Style {
 }
 
 /// Smallest terminal the main layout can be solved for: the vertical split
-/// below asks for a 5-row main pane, a 3-row session bar and a status panel of
-/// at least 4 rows. Under that, ratatui's solver starts handing back
-/// zero-height rects and the geometry arithmetic downstream has nothing valid
-/// to work from.
+/// below asks for a tab strip and its rule (2 rows), a 5-row main pane and a
+/// status panel of at least 4 rows. Under that, ratatui's solver starts
+/// handing back zero-height rects and the geometry arithmetic downstream has
+/// nothing valid to work from.
 const MIN_ROWS: u16 = 12;
 const MIN_COLS: u16 = 20;
 
@@ -161,7 +161,11 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     };
 
     // ── Top-level vertical split ───────────────────────────────────────────
-    // main output | session bar | status panel
+    // tab strip | rule | main output | status panel
+    //
+    // The strip sits above the output rather than below it: it names what is
+    // in the pane, and a label under the thing it labels reads as a caption
+    // for whatever comes next.
     let orch_row = if app.orchestrator.is_some() || app.orchestrator_session_id.is_some() {
         1u16
     } else {
@@ -177,8 +181,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),           // tab strip
+            Constraint::Length(1),           // rule
             Constraint::Min(5),              // main output
-            Constraint::Length(3),           // session bar
             Constraint::Length(status_rows), // status panel
         ])
         .split(body);
@@ -191,12 +196,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     // planning against remain visible and their state keeps updating.
     let planning_fullscreen = app.planning_fullscreen && app.planning_docked.is_some();
     let output_areas = if planning_fullscreen {
-        draw_planning_in(f, app, chunks[0], true);
+        draw_planning_in(f, app, chunks[2], true);
         // No pane rects: hit-testing must find nothing where no session was
         // drawn, and the PTYs keep the size they last laid out at.
         Vec::new()
     } else {
-        split_output_areas(chunks[0], &app.tree)
+        split_output_areas(chunks[2], &app.tree)
     };
     for (pane_idx, area) in output_areas.iter().copied().enumerate() {
         if app.chat_docked == Some(pane_idx) && output_areas.len() > 1 {
@@ -208,8 +213,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             draw_pane_output(f, app, area, pane_idx, pane_idx == app.focused_pane);
         }
     }
-    let slot_areas = draw_session_bar(f, app, chunks[1]);
-    let status_row_areas = draw_status_panel(f, app, chunks[2]);
+    let slot_areas = draw_tab_strip(f, app, chunks[0]);
+    draw_rule(f, &app.theme, chunks[1]);
+    let status_row_areas = draw_status_panel(f, app, chunks[3]);
 
     // ── Overlays ───────────────────────────────────────────────────────────
     let mut new_session_area = Rect::default();
@@ -266,7 +272,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
 
     LayoutInfo {
         output_areas,
-        session_bar_area: chunks[1],
+        session_bar_area: chunks[0],
         session_slot_areas: slot_areas,
         status_row_areas,
         new_session_area,
@@ -384,111 +390,224 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
     f.render_widget(list, area);
 }
 
-// ── Session bar ────────────────────────────────────────────────────────────
+// ── Tab strip ──────────────────────────────────────────────────────────────
 
-fn draw_session_bar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+/// Longest session name a tab will render before ellipsizing. Past this a
+/// single verbosely-named session starts costing its neighbours their names.
+const MAX_TAB_NAME: usize = 12;
+
+/// A session's state as a suffix glyph on its tab.
+///
+/// The bordered slot boxes this replaced carried state in their border
+/// colour, which a one-row strip has nowhere to put. A glyph is what keeps
+/// the at-a-glance property when the status panel is closed — the point of
+/// the strip is that you can stop keeping the panel open, and that only works
+/// if "which agent wants me" survives the move.
+fn tab_marker(t: &Theme, session: &crate::session::Session) -> Option<(&'static str, Style)> {
+    if session.paused {
+        return Some(("⏸", Style::default().fg(t.text_dim)));
+    }
+    match session.state {
+        SessionState::Waiting => Some((
+            "!",
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        )),
+        SessionState::Error => Some(("✕", Style::default().fg(t.err).add_modifier(Modifier::BOLD))),
+        SessionState::Dead => Some(("✕", Style::default().fg(t.text_dim))),
+        _ => None,
+    }
+}
+
+/// Width of one tab, given its rendered name: `" N name! "`.
+fn tab_width(number: usize, name: &str, marked: bool) -> u16 {
+    let digits = if number >= 10 { 2 } else { 1 };
+    let name_w = if name.is_empty() {
+        0
+    } else {
+        name.chars().count() + 1
+    };
+    (1 + digits + name_w + usize::from(marked) + 1) as u16
+}
+
+/// A single-row tab strip, replacing the three-row bar of bordered slot
+/// boxes. Returns one click rect per visible session, in `visible_indices`
+/// order, exactly as the slot boxes did — `app.rs` maps a hit back through
+/// `visible_to_idx`, and that contract is what makes click-to-focus work.
+fn draw_tab_strip(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
     let t = &app.theme;
-    // Slots (and the returned click rects) cover visible sessions only;
-    // mouse handling maps a slot position back through visible_to_idx.
     let visible = app.visible_indices();
-    let n = visible.len();
 
-    // outer block
-    let outer = Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
-    f.render_widget(outer, area);
+    f.render_widget(Paragraph::new("").style(Style::default().bg(t.bg)), area);
 
-    // Broadcast mode indicator
+    let mut x = area.x;
+    let right = area.x + area.width;
+
+    // Broadcast is a mode that changes where every keystroke goes; it earns
+    // the leading columns and pushes the tabs right rather than overlaying
+    // them.
     if app.broadcast_mode {
-        let indicator = Rect {
-            x: area.x + 1,
-            y: area.y,
-            width: 13,
-            height: 1,
-        };
+        let label = " BROADCAST ";
+        let w = (label.chars().count() as u16).min(area.width);
         f.render_widget(
-            Paragraph::new("[BROADCAST]")
-                .style(Style::default().fg(t.err).add_modifier(Modifier::BOLD)),
-            indicator,
+            Paragraph::new(Span::styled(
+                label,
+                Style::default()
+                    .fg(t.on_accent)
+                    .bg(t.err)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Rect {
+                x,
+                y: area.y,
+                width: w,
+                height: 1,
+            },
         );
+        x += w;
     }
 
-    if n == 0 {
+    if visible.is_empty() {
         return vec![];
     }
 
-    // inner area (remove outer border)
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
+    // Overflow ladder: full names, then names only on the active tab, then
+    // bare indices, then truncate. Trying each in turn is cheaper to reason
+    // about than solving for a width budget, and there are only three rungs.
+    let active = app.active_idx();
+    let budget = right.saturating_sub(x);
+    // The session name, not its kind: three shells all reading "shell" is
+    // the case the strip most needs to disambiguate, and the kind is already
+    // carried by the tab's colour.
+    let names: Vec<String> = visible
+        .iter()
+        .map(|&idx| {
+            let session = &app.sessions[idx];
+            let name = if session.name.is_empty() {
+                session.kind.label()
+            } else {
+                session.name.as_str()
+            };
+            ellipsize(name, MAX_TAB_NAME)
+        })
+        .collect();
+    let marked: Vec<bool> = visible
+        .iter()
+        .map(|&idx| tab_marker(t, &app.sessions[idx]).is_some())
+        .collect();
+    let total = |names: &[String]| -> u16 {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| tab_width(i + 1, n, marked[i]))
+            .sum()
+    };
+    let names = if total(&names) <= budget {
+        names
+    } else {
+        let active_only: Vec<String> = visible
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| {
+                if Some(idx) == active {
+                    names[i].clone()
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        if total(&active_only) <= budget {
+            active_only
+        } else {
+            vec![String::new(); visible.len()]
+        }
     };
 
-    // Center the slots
-    let slot_w = (inner.width as usize / n).min(16) as u16;
-    let total_w = slot_w * n as u16;
-    let offset_x = inner.x + (inner.width.saturating_sub(total_w)) / 2;
-
+    let mut rects = Vec::with_capacity(visible.len());
     for (i, &idx) in visible.iter().enumerate() {
         let session = &app.sessions[idx];
-        let slot = Rect {
-            x: offset_x + i as u16 * slot_w,
-            y: inner.y,
-            width: slot_w,
-            height: inner.height,
+        let is_active = active == Some(idx);
+        let in_pane = app.panes.contains(&Some(idx));
+        let marker = tab_marker(t, session);
+        let want = tab_width(i + 1, &names[i], marker.is_some());
+        let avail = right.saturating_sub(x);
+        if avail == 0 {
+            // Out of room entirely: the remaining tabs still need click rects
+            // or their indices would silently shift against visible_to_idx.
+            rects.push(Rect {
+                x: right,
+                y: area.y,
+                width: 0,
+                height: 1,
+            });
+            continue;
+        }
+        let w = want.min(avail);
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
         };
 
-        let is_active = app.active_idx() == Some(idx);
-        let is_visible = app.panes.contains(&Some(idx));
-        let label = format!("{} {}", i + 1, session.kind.label());
-        let color = kind_color(t, &session.kind);
-        let border_style = state_border_style(t, &session.state, is_active);
-
-        let title_style = if is_active {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        } else if is_visible {
-            Style::default()
-                .fg(color)
-                .add_modifier(Modifier::UNDERLINED)
+        // Active tab: reversed accent, so focus is legible without relying on
+        // the agent's brand colour, which varies in contrast by kind.
+        let (base, num_style, name_style) = if is_active {
+            let base = Style::default().bg(t.accent).fg(t.on_accent);
+            (
+                base,
+                base.add_modifier(Modifier::BOLD),
+                base.add_modifier(Modifier::BOLD),
+            )
         } else {
-            Style::default().fg(color)
+            let base = Style::default().bg(t.bg);
+            let name = Style::default().fg(kind_color(t, &session.kind));
+            (
+                base,
+                Style::default().fg(t.text_dim),
+                if in_pane {
+                    name.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    name
+                },
+            )
         };
 
-        let block = Block::default()
-            .title(Span::styled(label, title_style))
-            .borders(Borders::ALL)
-            .border_style(border_style);
+        let mut spans = vec![
+            Span::styled(" ", base),
+            Span::styled(format!("{}", i + 1), num_style),
+        ];
+        if !names[i].is_empty() {
+            spans.push(Span::styled(" ", base));
+            spans.push(Span::styled(names[i].clone(), name_style));
+        }
+        if let Some((glyph, style)) = marker {
+            // On the active tab the marker sits on the accent fill, so it
+            // needs that background or it punches a hole in the highlight.
+            spans.push(Span::styled(
+                glyph,
+                if is_active { style.bg(t.accent) } else { style },
+            ));
+        }
+        spans.push(Span::styled(" ", base));
 
-        // State dot inside slot
-        let state_dot = if session.paused {
-            Span::styled("⏸", Style::default().fg(t.text_dim))
-        } else {
-            match session.state {
-                SessionState::Waiting => Span::styled("⚡", Style::default().fg(t.warn)),
-                SessionState::Error => Span::styled("✗", Style::default().fg(t.err)),
-                SessionState::Thinking => Span::styled("…", Style::default().fg(t.kind_claude)),
-                SessionState::Running => Span::styled("▶", Style::default().fg(t.ok)),
-                SessionState::Ready => Span::styled("●", Style::default().fg(t.ok)),
-                SessionState::Dead => Span::styled("✗", Style::default().fg(t.text_dim)),
-                SessionState::Starting => Span::styled("○", Style::default().fg(t.text)),
-            }
-        };
-
-        let para = Paragraph::new(Line::from(vec![state_dot]))
-            .block(block)
-            .alignment(Alignment::Center);
-
-        f.render_widget(para, slot);
+        f.render_widget(Paragraph::new(Line::from(spans)), rect);
+        rects.push(rect);
+        x += w;
     }
 
-    (0..n)
-        .map(|i| Rect {
-            x: offset_x + i as u16 * slot_w,
-            y: inner.y,
-            width: slot_w,
-            height: inner.height,
-        })
-        .collect()
+    rects
+}
+
+/// The rule under the tab strip: structure, not information.
+fn draw_rule(f: &mut Frame<'_>, t: &Theme, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let line = "─".repeat(area.width as usize);
+    f.render_widget(
+        Paragraph::new(Span::styled(line, Style::default().fg(t.chrome))),
+        area,
+    );
 }
 
 // ── Status panel ───────────────────────────────────────────────────────────
@@ -3078,40 +3197,155 @@ mod tests {
 
     /// Pins the rendered frame so a restyle has to be a deliberate edit to
     /// this expectation rather than a silent change nobody reviewed. Sessions
-    /// can't be spawned in a unit test (each needs a real PTY), so this covers
-    /// the empty-workspace frame: the output pane, the session bar and the
-    /// status panel chrome, which is where the theme refactor touched most.
+    /// spawned here are headless, so this is the frame's chrome: the tab
+    /// strip and its rule, the output pane, and the status panel.
     #[test]
-    fn the_empty_frame_renders_from_the_theme_unchanged() {
+    fn the_empty_frame_renders_its_chrome_in_the_expected_rows() {
         let app = snapshot_app();
         let rows = render_rows(&app, 60, 14);
         let text: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
 
+        assert_eq!(text[0], "", "no sessions: the strip is blank");
+        assert_eq!(text[1], "─".repeat(60));
         assert_eq!(
-            text[0],
+            text[2],
             "┌ linkshell ───────────────────────────────────────────────┐"
         );
         assert_eq!(
-            text[1],
+            text[3],
             "│ No sessions. Press alt-n to create one.                  │"
         );
-        assert!(text[6].starts_with("└"), "{:?}", text[6]);
-        // Session bar: bordered slot boxes, three rows of chrome.
-        assert_eq!(
-            text[9],
-            "└──────────────────────────────────────────────────────────┘"
-        );
+        assert!(text[9].starts_with("└"), "{:?}", text[9]);
         assert!(text[10].contains("Status"), "{:?}", text[10]);
-        assert!(
-            text[11].contains("Kind"),
-            "status header missing: {:?}",
-            text[11]
-        );
+        assert!(text[11].contains("Kind"), "{:?}", text[11]);
         assert!(text[12].contains("sock:"), "{:?}", text[12]);
 
-        // The empty-pane border is `text_dim`, not some other grey.
+        // The rule is chrome, and the empty-pane border is text_dim.
         let t = Theme::classic();
-        assert_eq!(rows[0].1[0], t.text_dim);
+        assert_eq!(rows[1].1[0], t.chrome);
+        assert_eq!(rows[2].1[0], t.text_dim);
+    }
+
+    fn app_with_sessions(names: &[&str]) -> App {
+        let mut app = snapshot_app();
+        for name in names {
+            app.spawn_headless_session((*name).to_string(), None)
+                .unwrap();
+        }
+        app
+    }
+
+    #[test]
+    fn tabs_are_one_row_and_name_every_visible_session() {
+        let app = app_with_sessions(&["a", "b", "c"]);
+        let rows = render_rows(&app, 60, 14);
+        // Headless sessions are SessionKind::Shell, so every tab reads
+        // "N shell"; what is pinned here is the layout, not the label.
+        assert_eq!(rows[0].0, " 1 a  2 b  3 c");
+        assert_eq!(rows[1].0, "─".repeat(60));
+    }
+
+    #[test]
+    fn a_waiting_session_is_marked_without_the_status_panel() {
+        let mut app = app_with_sessions(&["a", "b"]);
+        app.sessions[1].state = SessionState::Waiting;
+        app.sessions[0].state = SessionState::Error;
+        let rows = render_rows(&app, 60, 14);
+        assert_eq!(rows[0].0, " 1 a✕  2 b!");
+
+        // The glyphs carry the state colour, not just the shape.
+        let t = Theme::classic();
+        assert_eq!(rows[0].1[4], t.err);
+        assert_eq!(rows[0].1[10], t.warn);
+    }
+
+    #[test]
+    fn the_active_tab_is_reversed_into_the_accent() {
+        let app = app_with_sessions(&["a", "b"]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let t = Theme::classic();
+        // Session 1 is active (spawning claims pane 0).
+        assert_eq!(buffer.get(1, 0).bg, t.accent);
+        assert_eq!(buffer.get(1, 0).fg, t.on_accent);
+        // Session 2 is not.
+        assert_eq!(buffer.get(10, 0).bg, t.bg);
+    }
+
+    #[test]
+    fn four_tabs_fit_in_sixty_columns() {
+        let app = app_with_sessions(&["a", "b", "c", "d"]);
+        let rows = render_rows(&app, 60, 14);
+        assert_eq!(rows[0].0, " 1 a  2 b  3 c  4 d");
+    }
+
+    #[test]
+    fn a_narrow_strip_drops_names_before_it_drops_tabs() {
+        // 4 × " N review " is 40 columns. At 24 the middle rung applies: the
+        // active tab keeps its name, the rest fall back to bare indices.
+        let app = app_with_sessions(&["review", "review", "review", "review"]);
+        assert_eq!(render_rows(&app, 24, 14)[0].0, " 1 review  2  3  4");
+
+        // Six sessions leave no room even for that, so every tab drops to
+        // its index rather than any tab being dropped outright.
+        let app = app_with_sessions(&["review", "review", "review", "review", "review", "review"]);
+        assert_eq!(render_rows(&app, 20, 14)[0].0, " 1  2  3  4  5  6");
+    }
+
+    /// Click-to-focus reads `session_slot_areas` positionally and maps index
+    /// i back through `visible_to_idx`, so the strip must return exactly one
+    /// rect per visible session even when a tab is squeezed to nothing.
+    #[test]
+    fn every_visible_session_gets_a_click_rect() {
+        let app = app_with_sessions(&["a", "b", "c", "d"]);
+        // MIN_COLS is 20; below it draw() bails to the too-small placeholder
+        // and deliberately returns no rects at all.
+        for width in [60u16, 36, 24, 20] {
+            let mut layout = LayoutInfo::default();
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            terminal
+                .draw(|f| {
+                    layout = draw(f, &app);
+                })
+                .unwrap();
+            assert_eq!(
+                layout.session_slot_areas.len(),
+                4,
+                "width {width} returned {} rects",
+                layout.session_slot_areas.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_rect_lands_on_the_tab_it_names() {
+        let app = app_with_sessions(&["a", "b", "c"]);
+        let mut layout = LayoutInfo::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal
+            .draw(|f| {
+                layout = draw(f, &app);
+            })
+            .unwrap();
+        // " 1 a " is 5 wide, so tab 2 owns columns 5..10 on row 0.
+        let second = layout.session_slot_areas[1];
+        assert_eq!(
+            (second.x, second.y, second.width, second.height),
+            (5, 0, 5, 1)
+        );
+    }
+
+    #[test]
+    fn broadcast_pushes_the_tabs_right_instead_of_covering_them() {
+        let mut app = app_with_sessions(&["a"]);
+        app.broadcast_mode = true;
+        let rows = render_rows(&app, 60, 14);
+        assert_eq!(rows[0].0, " BROADCAST  1 a");
     }
 
     #[test]
@@ -3123,7 +3357,8 @@ mod tests {
         let app = App::new(tx, std::sync::Arc::new(config));
 
         let rows = render_rows(&app, 60, 14);
-        assert_eq!(rows[0].1[0], Color::Rgb(0xff, 0, 0xff));
+        // The empty output pane's border is drawn in text_dim.
+        assert_eq!(rows[2].1[0], Color::Rgb(0xff, 0, 0xff));
     }
 
     /// `used / 1000` rendered every thread under 1000 tokens as "0k", which

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The session bar is now a one-row tab strip above the output pane instead of three rows of bordered slot boxes below it, and it names sessions rather than kinds — three shells all reading "shell" was the case it most needed to disambiguate. State moved from the slot's border colour, which a single row has nowhere to put, to a suffix glyph: `!` for WAITING, `✕` for ERROR or dead, `⏸` for paused. That is what keeps "which agent wants me" legible with the status panel closed, which is the point of shrinking the chrome. As the terminal narrows the strip drops names before it drops tabs — inactive tabs first, then all of them — so every session keeps a clickable tab.
+
 - Added a `[theme]` table: `base` selects `classic` (the palette linkshell has always shipped), `dark` (a quieter restyle palette with a single accent colour), or `ansi16` (named ANSI colours only), and any individual colour is overridable as a hex string. With `base` unset the theme is picked from `COLORTERM`: truecolor terminals get `classic`, everything else gets `ansi16`, because a `Color::Rgb` on a 256-colour terminal is quantized to whatever is nearest — which is how a carefully-chosen "dim" ends up indistinguishable from "text". `linkshell doctor` now reports which base resolved and why.
 
 - Fixed the menu bar's Down arrow doing nothing past the first press: it was wired to "open the submenu", which selects item 0 unconditionally, so every press re-selected the same row and the items below the first were unreachable by keyboard. Up now walks back up and pops out to the section row from the first item. This is what made the planning backend picker (Agenda → Planning Model, the second item) look like it did not exist.

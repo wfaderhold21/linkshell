@@ -1,6 +1,7 @@
 # Panes, Navigation & Keybindings
 
 - [Split panes](#split-panes)
+- [Tab strip](#tab-strip)
 - [Scrollback](#scrollback)
 - [Status panel](#status-panel)
 - [Keybindings](#keybindings)
@@ -9,8 +10,7 @@
 ## Split panes
 
 Split any pane side by side (`alt-\`) or top/bottom (`alt--`), repeatedly and in
-any direction, for arbitrary tiled layouts. The session bar is centered and
-reflows based on how many sessions are open.
+any direction, for arbitrary tiled layouts.
 
 | Key | Action |
 |-----|--------|
@@ -19,6 +19,23 @@ reflows based on how many sessions are open.
 | `alt-w` | Close focused pane (sibling reclaims the space) |
 | `alt-r` | Rotate the focused pane's split direction |
 | `alt-o` | Focus next pane |
+
+## Tab strip
+
+One row above the output pane names every visible session:
+
+```
+ 1 alpha  2 beta!  3 gamma✕
+```
+
+The active tab is highlighted; a tab underlined is showing in some other split
+pane. The suffix glyph is the session's state — `!` for WAITING, `✕` for ERROR
+or a dead session, `⏸` for paused, nothing otherwise — so "which agent wants
+me" is legible without the status panel open. Click a tab to focus it.
+
+As the terminal narrows the strip drops names before it drops tabs: first the
+inactive tabs fall back to bare indices, then all of them do. Every session
+keeps a tab.
 
 ## Scrollback
 
