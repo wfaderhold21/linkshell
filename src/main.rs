@@ -429,10 +429,10 @@ async fn run_server() -> anyhow::Result<()> {
                 if idx >= sizes.len() {
                     break;
                 }
-                sizes[idx] = (
-                    area.height.saturating_sub(2).max(1),
-                    area.width.saturating_sub(2).max(1),
-                );
+                // One definition of the pane's inner geometry, shared with
+                // the renderer and the mouse→vt100 column mapping.
+                let content = ui::pane_content_area(*area);
+                sizes[idx] = (content.height.max(1), content.width.max(1));
             }
             let old_sizes = app.pane_sizes.clone();
             app.handle_pane_resize(&sizes);

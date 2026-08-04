@@ -3372,13 +3372,13 @@ impl App {
         let session = self.active_session()?;
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
-        let display_rows = self
-            .output_areas
-            .get(self.focused_pane)
-            .copied()
-            .unwrap_or_default()
-            .height
-            .saturating_sub(2);
+        let display_rows = crate::ui::pane_content_area(
+            self.output_areas
+                .get(self.focused_pane)
+                .copied()
+                .unwrap_or_default(),
+        )
+        .height;
         let start_vt_row = screen_rows.saturating_sub(display_rows);
 
         let ((min_row, min_col), (max_row, max_col)) = sel.normalized();
@@ -7544,12 +7544,16 @@ fn byte_index_for_col(text: &str, col: usize) -> usize {
 
 /// Convert absolute terminal coords to (content_col, content_row) inside a bordered rect.
 fn to_content_coords(area: Rect, col: u16, row: u16) -> (u16, u16) {
+    // Must agree with the renderer and the PTY size, or a drag-selection maps
+    // onto the wrong vt100 columns; `pane_content_area` is where that
+    // agreement lives.
+    let content = crate::ui::pane_content_area(area);
     let c = col
-        .saturating_sub(area.x + 1)
-        .min(area.width.saturating_sub(2));
+        .saturating_sub(content.x)
+        .min(content.width.saturating_sub(1));
     let r = row
-        .saturating_sub(area.y + 1)
-        .min(area.height.saturating_sub(2));
+        .saturating_sub(content.y)
+        .min(content.height.saturating_sub(1));
     (c, r)
 }
 
@@ -9480,8 +9484,10 @@ mod tests {
         assert!(!rect_hit(rect, 30, 5));
         assert!(!rect_inner_hit(rect, 10, 5));
         assert!(rect_inner_hit(rect, 11, 6));
-        assert_eq!(to_content_coords(rect, 12, 8), (1, 2));
-        assert_eq!(to_content_coords(rect, 99, 99), (18, 8));
+        // Content starts at column x+2 (focus bar, then padding) and row y+1
+        // (the title line) — see ui::pane_content_area.
+        assert_eq!(to_content_coords(rect, 12, 8), (0, 2));
+        assert_eq!(to_content_coords(rect, 99, 99), (17, 8));
     }
 
     #[test]

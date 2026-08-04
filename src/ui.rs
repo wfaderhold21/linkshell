@@ -113,20 +113,6 @@ fn kind_color(t: &Theme, kind: &SessionKind) -> Color {
     }
 }
 
-fn state_border_style(t: &Theme, state: &SessionState, active: bool) -> Style {
-    match state {
-        SessionState::Waiting => Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
-        SessionState::Error => Style::default()
-            .fg(t.err)
-            .add_modifier(Modifier::RAPID_BLINK),
-        SessionState::Dead => Style::default().fg(t.text_dim),
-        _ if active => Style::default()
-            .fg(t.text_bright)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(t.text_dim),
-    }
-}
-
 /// Smallest terminal the main layout can be solved for: the vertical split
 /// below asks for a tab strip and its rule (2 rows), a 5-row main pane, a
 /// status panel of at least 4 rows and a footer row. Under that, ratatui's solver starts
@@ -220,7 +206,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     };
     for (pane_idx, area) in output_areas.iter().copied().enumerate() {
         if app.chat_docked == Some(pane_idx) && output_areas.len() > 1 {
-            chat_layout = draw_chat_in(f, app, area, pane_idx == app.focused_pane);
+            chat_layout = draw_chat_in(f, app, area, pane_idx == app.focused_pane, false);
             chat_area = chat_layout.area;
         } else if app.planning_docked == Some(pane_idx) && output_areas.len() > 1 {
             draw_planning_in(f, app, area, pane_idx == app.focused_pane);
@@ -320,28 +306,141 @@ fn split_output_areas(area: Rect, tree: &LayoutTree) -> Vec<Rect> {
 
 // ── Main output zone ───────────────────────────────────────────────────────
 
+/// Where a pane's content lives inside its outer rect — the single definition
+/// of that geometry.
+///
+/// Three consumers have to agree on this number: the renderer, the PTY size
+/// sent to the session, and the mouse→vt100 column mapping for selection. When
+/// they were three separate `saturating_sub(2)`s spread across `ui.rs`,
+/// `main.rs` and `app.rs`, changing the chrome meant changing all three and
+/// noticing if you didn't — a silently 2-column-wider PTY renders fine and
+/// mis-maps every drag-selection. They now all call this.
+///
+/// The layout: column 0 is the focus bar, column 1 is padding, row 0 is the
+/// title. Content width is deliberately `width - 2`, identical to what
+/// `Borders::ALL` yielded, so replacing the box resized no PTY. Height is
+/// `height - 1` rather than `height - 2`: dropping the bottom border is a row
+/// of output back.
+pub fn pane_content_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(1),
+    }
+}
+
+/// Draw a pane's chrome and return its content rect.
+///
+/// In place of a box: a title line, and a one-column bar down the left edge.
+/// That bar does double duty — `▎` in the accent marks the focused pane, `│`
+/// in chrome separates a pane from its neighbour — so a split needs no
+/// per-pane boxes and no separate divider.
+fn draw_pane_frame(
+    f: &mut Frame<'_>,
+    t: &Theme,
+    area: Rect,
+    focused: bool,
+    title: Vec<Span<'static>>,
+) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return pane_content_area(area);
+    }
+    let (glyph, style) = if focused {
+        ("▎", Style::default().fg(t.accent))
+    } else {
+        ("│", Style::default().fg(t.chrome))
+    };
+    for y in area.y..area.y + area.height {
+        f.render_widget(
+            Paragraph::new(Span::styled(glyph, style)),
+            Rect {
+                x: area.x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    if area.width > 2 {
+        f.render_widget(
+            Paragraph::new(Line::from(title)),
+            Rect {
+                x: area.x + 2,
+                y: area.y,
+                width: area.width - 2,
+                height: 1,
+            },
+        );
+    }
+    pane_content_area(area)
+}
+
+/// A pane title: `● alpha · ~/src/linkshell`. Filled dot and a bright name
+/// when focused, hollow and dim when not — the same distinction the border
+/// colour used to carry, in the one row that replaced it.
+fn pane_title(
+    t: &Theme,
+    focused: bool,
+    kind: Color,
+    name: &str,
+    detail: &str,
+    trailing: Option<(String, Style)>,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            if focused { "● " } else { "○ " },
+            Style::default().fg(if focused { kind } else { t.chrome }),
+        ),
+        Span::styled(
+            name.to_string(),
+            if focused {
+                Style::default()
+                    .fg(t.text_bright)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.text_dim)
+            },
+        ),
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(t.chrome)));
+        spans.push(Span::styled(
+            detail.to_string(),
+            Style::default().fg(t.text_dim),
+        ));
+    }
+    if let Some((text, style)) = trailing {
+        spans.push(Span::styled(text, style));
+    }
+    spans
+}
+
 fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, focused: bool) {
     let t = &app.theme;
-    let (title, lines, border_style) = if let Some(idx) = app.panes[pane_idx] {
+    let (title, lines) = if let Some(idx) = app.panes[pane_idx] {
         let session = &app.sessions[idx];
         let screen = session.screen.screen();
         let (screen_rows, screen_cols) = screen.size();
-        let display_rows = area.height.saturating_sub(2);
+        let display_rows = pane_content_area(area).height;
         let scroll_offset = screen.scrollback().max(session.history_scroll) as u16;
         // vt100 handles the scrollback offset internally via set_scrollback;
         // just display the bottom display_rows rows of the virtual screen.
         let start_row = screen_rows.saturating_sub(display_rows);
         let end_row = screen_rows;
+        // Scrolled off the live tail is a state you can be stuck in without
+        // realising, so it gets the title's trailing slot rather than a colour.
         let scroll_indicator = if scroll_offset > 0 {
-            format!(" ↑{}", scroll_offset)
+            Some((format!("  ↑{}", scroll_offset), Style::default().fg(t.warn)))
         } else {
-            String::new()
+            None
         };
-        let title = format!(
-            " {} [{}] {}{} ",
-            idx + 1,
-            session.kind.label().to_uppercase(),
-            session.name,
+        let title = pane_title(
+            t,
+            focused,
+            kind_color(t, &session.kind),
+            &session.name,
+            &contract_home(std::path::Path::new(&session.cwd)),
             scroll_indicator,
         );
         let sel = if focused {
@@ -384,33 +483,27 @@ fn draw_pane_output(f: &mut Frame<'_>, app: &App, area: Rect, pane_idx: usize, f
                 })
                 .collect()
         };
-        let style = state_border_style(t, &session.state, focused);
-        (title, items, style)
+        (title, items)
     } else {
         let message = if app.sessions.is_empty() {
-            " No sessions. Press alt-n to create one."
+            "No sessions. Press alt-n to create one."
         } else {
-            " No session in this pane. Use a session switch key."
+            "No session in this pane. Use a session switch key."
         };
-        let items = vec![ListItem::new(Line::from(message))];
-        (
-            if app.sessions.is_empty() {
-                " linkshell ".to_string()
-            } else {
-                " no session ".to_string()
-            },
-            items,
+        let items = vec![ListItem::new(Line::from(Span::styled(
+            message,
             Style::default().fg(t.text_dim),
-        )
+        )))];
+        let name = if app.sessions.is_empty() {
+            "linkshell"
+        } else {
+            "no session"
+        };
+        (pane_title(t, focused, t.chrome, name, "", None), items)
     };
 
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
-
-    let list = List::new(lines).block(block);
-    f.render_widget(list, area);
+    let content = draw_pane_frame(f, t, area, focused, title);
+    f.render_widget(List::new(lines), content);
 }
 
 // ── Tab strip ──────────────────────────────────────────────────────────────
@@ -1723,12 +1816,18 @@ fn draw_chat(f: &mut Frame<'_>, app: &App, area: Rect) -> ChatLayout {
     let height_pct = app.config.chat.height_pct.clamp(20, 95);
     let height_rows = (area.height as u32 * height_pct as u32 / 100).max(8) as u16;
     let popup = centered_rect(width_pct, height_rows, area);
-    draw_chat_in(f, app, popup, true)
+    draw_chat_in(f, app, popup, true, true)
 }
 
 /// Render the chat into an exact rect — used by both the centered overlay
 /// and the docked split pane. `focused` drives the border colour.
-fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> ChatLayout {
+fn draw_chat_in(
+    f: &mut Frame<'_>,
+    app: &App,
+    popup: Rect,
+    focused: bool,
+    boxed: bool,
+) -> ChatLayout {
     let t = &app.theme;
     f.render_widget(Clear, popup);
 
@@ -1738,15 +1837,36 @@ fn draw_chat_in(f: &mut Frame<'_>, app: &App, popup: Rect, focused: bool) -> Cha
         .as_deref()
         .map(|t| format!("@{}", t))
         .unwrap_or_else(|| "no target".to_string());
-    let block = Block::default()
-        .title(format!(
-            " Chat ─ {}  (@name msg · /cmd · /agents · esc) ",
-            target
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { t.info } else { t.text_dim }));
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    // A floating overlay keeps its box — it needs an edge to read as floating.
+    // Docked into a split leaf it is a pane like any other, and wears the
+    // same chrome, or the two halves of a split look like two applications.
+    let inner = if boxed {
+        let block = Block::default()
+            .title(format!(
+                " Chat ─ {}  (@name msg · /cmd · /agents · esc) ",
+                target
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if focused { t.info } else { t.text_dim }));
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        inner
+    } else {
+        draw_pane_frame(
+            f,
+            t,
+            popup,
+            focused,
+            pane_title(
+                t,
+                focused,
+                t.info,
+                "chat",
+                &format!("{target}  (@name msg · /cmd · esc)"),
+                None,
+            ),
+        )
+    };
 
     let width = inner.width as usize;
 
@@ -2656,12 +2776,13 @@ fn draw_planning_in(f: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
 
     f.render_widget(Clear, area);
 
-    let block = Block::default()
-        .title(" Planning ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { t.info } else { t.text_dim }));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = draw_pane_frame(
+        f,
+        t,
+        area,
+        focused,
+        pane_title(t, focused, t.info, "planning", "", None),
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -3435,26 +3556,16 @@ mod tests {
 
         assert_eq!(text[0], "", "no sessions: the strip is blank");
         assert_eq!(text[1], "─".repeat(60));
-        assert_eq!(
-            text[2],
-            "┌ linkshell ───────────────────────────────────────────────┐"
-        );
-        assert_eq!(
-            text[3],
-            "│ No sessions. Press alt-n to create one.                  │"
-        );
-        // In the default overlay mode the panel claims no rows, so the output
-        // pane runs to the footer.
-        assert_eq!(
-            text[13],
-            "└──────────────────────────────────────────────────────────┘"
-        );
+        assert_eq!(text[2], "▎ ● linkshell");
+        assert_eq!(text[3], "▎ No sessions. Press alt-n to create one.");
+        // The pane runs to the footer: no bottom border, and in the default
+        // overlay mode the status panel claims no rows either.
+        assert_eq!(text[13], "▎");
         assert_eq!(text[14], " no session — alt-n to create one");
 
-        // The rule is chrome, and the empty-pane border is text_dim.
         let t = Theme::classic();
-        assert_eq!(rows[1].1[0], t.chrome);
-        assert_eq!(rows[2].1[0], t.text_dim);
+        assert_eq!(rows[1].1[0], t.chrome, "the rule is chrome");
+        assert_eq!(rows[2].1[0], t.accent, "the focused pane's bar");
     }
 
     fn app_with_sessions(names: &[&str]) -> App {
@@ -3569,6 +3680,93 @@ mod tests {
             (second.x, second.y, second.width, second.height),
             (5, 0, 5, 1)
         );
+    }
+
+    // ── Pane chrome ───────────────────────────────────────────────────────
+
+    /// The hazard the borderless pane introduces: content width is what the
+    /// PTY is sized to and what mouse selection maps against. `Borders::ALL`
+    /// gave `width - 2`; the focus bar plus its padding must give the same,
+    /// or every session silently gets a wider PTY than it renders into.
+    #[test]
+    fn dropping_the_border_did_not_change_the_content_width() {
+        for (w, h) in [(80u16, 24u16), (40, 12), (3, 2), (1, 1), (0, 0)] {
+            let outer = Rect {
+                x: 5,
+                y: 3,
+                width: w,
+                height: h,
+            };
+            let content = pane_content_area(outer);
+            assert_eq!(
+                content.width,
+                w.saturating_sub(2),
+                "width parity with Borders::ALL at {w}x{h}"
+            );
+            // Height gains a row: the bottom border is gone, the title is not.
+            assert_eq!(content.height, h.saturating_sub(1), "at {w}x{h}");
+            if w >= 2 && h >= 1 {
+                assert!(
+                    content.x + content.width <= outer.x + outer.width,
+                    "content overflows the pane at {w}x{h}"
+                );
+                assert!(content.y + content.height <= outer.y + outer.height);
+            }
+        }
+    }
+
+    /// The renderer, the PTY size and the mouse mapping all have to agree.
+    /// They used to be three independent `saturating_sub(2)`s.
+    #[test]
+    fn the_pty_size_matches_the_rendered_content_area() {
+        let app = app_with_sessions(&["alpha"]);
+        let layout = layout_of(&app, 80, 30);
+        let area = layout.output_areas[0];
+        let content = pane_content_area(area);
+        // This is the arithmetic main.rs performs to size the PTY.
+        assert_eq!(
+            (content.height.max(1), content.width.max(1)),
+            (area.height - 1, area.width - 2)
+        );
+    }
+
+    #[test]
+    fn the_focused_pane_is_marked_and_its_neighbour_divides_from_it() {
+        let t = Theme::classic();
+        let mut app = app_with_sessions(&["alpha", "beta"]);
+        app.split_focused(crate::layout::SplitDir::Row);
+        let layout = layout_of(&app, 80, 30);
+        assert_eq!(layout.output_areas.len(), 2, "expected a split");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        for (i, area) in layout.output_areas.iter().enumerate() {
+            let cell = buffer.get(area.x, area.y + 1);
+            if i == app.focused_pane {
+                assert_eq!(cell.symbol(), "▎", "focused pane {i}");
+                assert_eq!(cell.fg, t.accent);
+            } else {
+                // The same column separates the panes when it isn't marking
+                // focus — one column doing both jobs, so a split needs no
+                // per-pane boxes and no separate divider.
+                assert_eq!(cell.symbol(), "│", "unfocused pane {i}");
+                assert_eq!(cell.fg, t.chrome);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_title_names_the_session_and_its_directory() {
+        let mut app = app_with_sessions(&["alpha"]);
+        app.sessions[0].cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()) + "/src";
+        let rows = render_rows(&app, 60, 15);
+        assert_eq!(rows[2].0, "▎ ● alpha · ~/src");
     }
 
     // ── Status panel ──────────────────────────────────────────────────────
@@ -3828,13 +4026,13 @@ mod tests {
     fn a_theme_override_reaches_the_rendered_frame() {
         let mut config = crate::config::Config::default();
         config.theme.base = Some("classic".into());
-        config.theme.text_dim = Some("#ff00ff".into());
+        config.theme.chrome = Some("#ff00ff".into());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let app = App::new(tx, std::sync::Arc::new(config));
 
         let rows = render_rows(&app, 60, 15);
-        // The empty output pane's border is drawn in text_dim.
-        assert_eq!(rows[2].1[0], Color::Rgb(0xff, 0, 0xff));
+        // The rule under the tab strip is drawn in chrome.
+        assert_eq!(rows[1].1[0], Color::Rgb(0xff, 0, 0xff));
     }
 
     /// `used / 1000` rendered every thread under 1000 tokens as "0k", which
@@ -3904,7 +4102,7 @@ mod tests {
         assert!(screen.cell(0, 0).unwrap().is_wide());
         assert!(screen.cell(0, 1).unwrap().is_wide_continuation());
 
-        let line = build_row_line(&t, &screen, 0, 20, 0, None, None);
+        let line = build_row_line(&t, screen, 0, 20, 0, None, None);
         assert_eq!(line_text(&line), "\u{4e16}x plain");
     }
 
@@ -3965,27 +4163,6 @@ mod tests {
         assert_eq!(
             kind_color(&t, &SessionKind::Custom("x".into())),
             t.kind_custom
-        );
-    }
-
-    #[test]
-    fn state_border_style_highlights_waiting_error_and_active_states() {
-        let t = Theme::classic();
-        assert_eq!(
-            state_border_style(&t, &SessionState::Waiting, false).fg,
-            Some(t.warn)
-        );
-        assert_eq!(
-            state_border_style(&t, &SessionState::Error, false).fg,
-            Some(t.err)
-        );
-        assert_eq!(
-            state_border_style(&t, &SessionState::Ready, true).fg,
-            Some(t.text_bright)
-        );
-        assert_eq!(
-            state_border_style(&t, &SessionState::Ready, false).fg,
-            Some(t.text_dim)
         );
     }
 

@@ -13,6 +13,21 @@
 Split any pane side by side (`alt-\`) or top/bottom (`alt--`), repeatedly and in
 any direction, for arbitrary tiled layouts.
 
+Panes have no boxes. Each carries a title line and a one-column bar down its
+left edge, and that bar does double duty — `▎` in the accent colour marks the
+focused pane, `│` in chrome separates a pane from its neighbour — so a split
+needs neither per-pane borders nor a separate divider:
+
+```
+▎ ● alpha · ~/src/linkshell                    │ ○ beta · /tmp
+▎ $ cargo test                                 │ $
+```
+
+A filled dot and a bright name mean focused; hollow and dim mean not. A pane
+scrolled off the live tail says so in its title (`↑12`). The docked chat and
+planning panes wear the same chrome; the floating chat overlay keeps its box,
+because a floating thing needs an edge to read as floating.
+
 | Key | Action |
 |-----|--------|
 | `alt-\` | Split focused pane side by side |
