@@ -128,11 +128,11 @@ fn state_border_style(t: &Theme, state: &SessionState, active: bool) -> Style {
 }
 
 /// Smallest terminal the main layout can be solved for: the vertical split
-/// below asks for a tab strip and its rule (2 rows), a 5-row main pane and a
-/// status panel of at least 4 rows. Under that, ratatui's solver starts
+/// below asks for a tab strip and its rule (2 rows), a 5-row main pane, a
+/// status panel of at least 4 rows and a footer row. Under that, ratatui's solver starts
 /// handing back zero-height rects and the geometry arithmetic downstream has
 /// nothing valid to work from.
-const MIN_ROWS: u16 = 12;
+const MIN_ROWS: u16 = 13;
 const MIN_COLS: u16 = 20;
 
 pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
@@ -161,7 +161,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     };
 
     // ── Top-level vertical split ───────────────────────────────────────────
-    // tab strip | rule | main output | status panel
+    // tab strip | rule | main output | status panel | footer
     //
     // The strip sits above the output rather than below it: it names what is
     // in the pane, and a label under the thing it labels reads as a caption
@@ -185,6 +185,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
             Constraint::Length(1),           // rule
             Constraint::Min(5),              // main output
             Constraint::Length(status_rows), // status panel
+            Constraint::Length(1),           // footer
         ])
         .split(body);
 
@@ -216,6 +217,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     let slot_areas = draw_tab_strip(f, app, chunks[0]);
     draw_rule(f, &app.theme, chunks[1]);
     let status_row_areas = draw_status_panel(f, app, chunks[3]);
+    draw_footer(f, app, chunks[4]);
 
     // ── Overlays ───────────────────────────────────────────────────────────
     let mut new_session_area = Rect::default();
@@ -608,6 +610,147 @@ fn draw_rule(f: &mut Frame<'_>, t: &Theme, area: Rect) {
         Paragraph::new(Span::styled(line, Style::default().fg(t.chrome))),
         area,
     );
+}
+
+// ── Footer ─────────────────────────────────────────────────────────────────
+
+/// Fraction of the context window past which the counter turns amber.
+const CTX_PRESSURE: f64 = 0.80;
+
+/// The active session's vitals, on one row at the bottom of the screen:
+///
+/// ```text
+///  claude · opus-4-8   18.0k/180k   ⣾ THINKING   0:42   $0.31   alt-h help
+/// ```
+///
+/// This is the row that lets the status panel be closed: it answers "what am
+/// I looking at, is it working, and what has it cost" for the pane in front
+/// of you, which is the question the panel was being kept open to answer.
+fn draw_footer(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let fill = Style::default().bg(t.surface);
+    f.render_widget(Paragraph::new("").style(fill), area);
+
+    let Some(session) = app.active_session() else {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " no session — alt-n to create one",
+                fill.fg(t.text_dim),
+            )),
+            area,
+        );
+        return;
+    };
+
+    // A paused or dead session's numbers are all frozen; dimming the whole
+    // row says that once, instead of each field having to say it.
+    let inert = session.paused || session.state == SessionState::Dead;
+    let dim = |style: Style| if inert { fill.fg(t.text_dim) } else { style };
+
+    let name_style = dim(match session.state {
+        SessionState::Waiting => fill.fg(t.warn).add_modifier(Modifier::BOLD),
+        SessionState::Error | SessionState::Dead => fill.fg(t.err).add_modifier(Modifier::BOLD),
+        SessionState::Thinking | SessionState::Running => {
+            fill.fg(t.accent).add_modifier(Modifier::BOLD)
+        }
+        _ => fill.fg(t.text_bright).add_modifier(Modifier::BOLD),
+    });
+
+    // Segments in drop order: the tail is shed first as the terminal
+    // narrows, so the identity of the session outlives the hint text.
+    let mut head: Vec<Span> = vec![Span::styled(" ", fill)];
+    head.push(Span::styled(
+        ellipsize(&session.name, MAX_TAB_NAME),
+        name_style,
+    ));
+    if let Some(model) = session.model.as_deref() {
+        head.push(Span::styled(" · ", dim(fill.fg(t.chrome))));
+        head.push(Span::styled(
+            model_display(Some(model)),
+            dim(fill.fg(t.text)),
+        ));
+    }
+
+    let mut segments: Vec<Vec<Span>> = Vec::new();
+
+    // Context: the number whose meaning changes when you switch models, and
+    // the one worth a colour when it starts running out. With no known
+    // window there is no denominator and no threshold to colour against —
+    // rendering a bare count beats inventing one.
+    if session.stats.context_tokens > 0 {
+        let style = if session.context_max > 0
+            && session.stats.context_tokens as f64 / session.context_max as f64 >= CTX_PRESSURE
+        {
+            fill.fg(t.warn).add_modifier(Modifier::BOLD)
+        } else {
+            fill.fg(t.ctx)
+        };
+        segments.push(vec![Span::styled(session.context_display(), dim(style))]);
+    }
+
+    let state = session.state_label();
+    let mut state_spans = Vec::new();
+    if matches!(
+        session.state,
+        SessionState::Thinking | SessionState::Running
+    ) && !inert
+    {
+        state_spans.push(Span::styled(
+            format!("{} ", spinner_frame()),
+            fill.fg(t.accent),
+        ));
+    }
+    state_spans.push(Span::styled(
+        state.to_string(),
+        dim(match session.state {
+            SessionState::Waiting => fill.fg(t.warn),
+            SessionState::Error | SessionState::Dead => fill.fg(t.err),
+            _ => fill.fg(t.text),
+        }),
+    ));
+    if session.state == SessionState::Dead {
+        state_spans.push(Span::styled(" — alt-r restart", fill.fg(t.text_dim)));
+    }
+    segments.push(state_spans);
+
+    segments.push(vec![Span::styled(
+        session.elapsed_display(),
+        dim(fill.fg(t.text_dim)),
+    )]);
+    let cost = session.cost_display();
+    if cost != "—" {
+        segments.push(vec![Span::styled(cost, dim(fill.fg(t.cost)))]);
+    }
+
+    // Assemble left to right, dropping trailing segments that don't fit
+    // rather than wrapping — a wrapped footer would eat an output row.
+    let width = area.width as usize;
+    let mut spans = head;
+    let mut used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let hint = " alt-h help ";
+    let hint_w = hint.chars().count();
+    for segment in segments {
+        let seg_w: usize = segment.iter().map(|s| s.content.chars().count()).sum();
+        if used + 3 + seg_w > width {
+            break;
+        }
+        spans.push(Span::styled("   ", fill));
+        spans.extend(segment);
+        used += 3 + seg_w;
+    }
+
+    // The hint is the first thing to go, so it is placed last and only if
+    // what remains is genuinely spare.
+    if used + hint_w <= width {
+        let pad = width - used - hint_w;
+        spans.push(Span::styled(" ".repeat(pad), fill));
+        spans.push(Span::styled(hint, fill.fg(t.text_dim)));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ── Status panel ───────────────────────────────────────────────────────────
@@ -3202,7 +3345,9 @@ mod tests {
     #[test]
     fn the_empty_frame_renders_its_chrome_in_the_expected_rows() {
         let app = snapshot_app();
-        let rows = render_rows(&app, 60, 14);
+        // 15 rows, one more than the layout's minimum, so the footer is the
+        // row that gets added rather than one the output pane gives up.
+        let rows = render_rows(&app, 60, 15);
         let text: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
 
         assert_eq!(text[0], "", "no sessions: the strip is blank");
@@ -3215,10 +3360,18 @@ mod tests {
             text[3],
             "│ No sessions. Press alt-n to create one.                  │"
         );
-        assert!(text[9].starts_with("└"), "{:?}", text[9]);
-        assert!(text[10].contains("Status"), "{:?}", text[10]);
-        assert!(text[11].contains("Kind"), "{:?}", text[11]);
-        assert!(text[12].contains("sock:"), "{:?}", text[12]);
+        assert!(
+            text[8].starts_with("└"),
+            "output pane closes: {:?}",
+            text[8]
+        );
+        // The status panel keeps its own chrome; its height flexes with the
+        // terminal, so this asserts presence and order, not row numbers.
+        let status = text[9..14].join("\n");
+        assert!(status.contains("Status"), "{status}");
+        assert!(status.contains("Kind"), "{status}");
+        assert!(status.contains("sock:"), "{status}");
+        assert_eq!(text[14], " no session — alt-n to create one");
 
         // The rule is chrome, and the empty-pane border is text_dim.
         let t = Theme::classic();
@@ -3340,6 +3493,107 @@ mod tests {
         );
     }
 
+    // ── Footer ────────────────────────────────────────────────────────────
+
+    fn footer_row(app: &App, width: u16) -> (String, Vec<Color>) {
+        let height = 15;
+        render_rows(app, width, height).pop().unwrap()
+    }
+
+    #[test]
+    fn the_footer_carries_the_active_session_name_state_and_elapsed() {
+        let mut app = app_with_sessions(&["alpha", "beta"]);
+        app.sessions[0].model = Some("claude-opus-4-8-20260101".into());
+        let (text, _) = footer_row(&app, 80);
+        assert!(text.starts_with(" alpha · opus-4-8"), "{text:?}");
+        assert!(text.contains("READY"), "{text:?}");
+        assert!(text.contains("alt-h help"), "{text:?}");
+    }
+
+    #[test]
+    fn the_context_counter_turns_amber_past_eighty_percent() {
+        let t = Theme::classic();
+        let mut app = app_with_sessions(&["alpha"]);
+        app.sessions[0].context_max = 100_000;
+
+        app.sessions[0].stats.context_tokens = 79_000;
+        let (text, fgs) = footer_row(&app, 80);
+        let at = text.find("79.0k").expect(&text);
+        assert_eq!(fgs[at], t.ctx, "below the threshold: {text:?}");
+
+        app.sessions[0].stats.context_tokens = 80_000;
+        let (text, fgs) = footer_row(&app, 80);
+        let at = text.find("80.0k").expect(&text);
+        assert_eq!(fgs[at], t.warn, "at the threshold: {text:?}");
+    }
+
+    /// A local model whose window was never probed has no denominator, so
+    /// there is no percentage to colour against. Rendering a bare count beats
+    /// inventing a threshold.
+    #[test]
+    fn an_unknown_context_window_renders_a_bare_count() {
+        let t = Theme::classic();
+        let mut app = app_with_sessions(&["alpha"]);
+        app.sessions[0].stats.context_tokens = 90_000;
+        app.sessions[0].context_max = 0;
+        let (text, fgs) = footer_row(&app, 80);
+        assert!(text.contains("90.0k"), "{text:?}");
+        assert!(!text.contains("90.0k/"), "no denominator: {text:?}");
+        assert_eq!(fgs[text.find("90.0k").unwrap()], t.ctx);
+    }
+
+    /// A wrapped footer would silently eat a row of output. Every field is
+    /// droppable; the session's identity is what survives.
+    #[test]
+    fn the_footer_never_wraps_however_narrow_the_terminal() {
+        let mut app = app_with_sessions(&["a-long-session-name"]);
+        app.sessions[0].model = Some("claude-opus-4-8".into());
+        app.sessions[0].stats.context_tokens = 90_000;
+        app.sessions[0].stats.total_cost_usd = 1.25;
+        app.sessions[0].context_max = 100_000;
+        for width in MIN_COLS..100 {
+            let rows = render_rows(&app, width, 15);
+            assert_eq!(rows.len(), 15, "width {width} changed the row count");
+            let (text, _) = &rows[14];
+            assert!(
+                text.chars().count() <= width as usize,
+                "width {width} overflowed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hint_is_shed_before_the_cost_and_the_cost_before_the_state() {
+        let mut app = app_with_sessions(&["alpha"]);
+        app.sessions[0].stats.total_cost_usd = 1.25;
+        assert!(footer_row(&app, 80).0.contains("alt-h help"));
+
+        let (text, _) = footer_row(&app, 34);
+        assert!(
+            !text.contains("alt-h help"),
+            "hint should go first: {text:?}"
+        );
+        assert!(text.contains("$1.250"), "{text:?}");
+
+        let (text, _) = footer_row(&app, 26);
+        assert!(!text.contains("$1.250"), "cost should go next: {text:?}");
+        assert!(text.contains("READY"), "state outlives cost: {text:?}");
+
+        // Whatever else goes, the session is still named.
+        assert!(footer_row(&app, MIN_COLS).0.contains("alpha"));
+    }
+
+    #[test]
+    fn a_dead_session_says_how_to_bring_it_back_and_greys_out() {
+        let t = Theme::classic();
+        let mut app = app_with_sessions(&["alpha"]);
+        app.sessions[0].state = SessionState::Dead;
+        let (text, fgs) = footer_row(&app, 80);
+        assert!(text.contains("alt-r restart"), "{text:?}");
+        // Inert: the whole row is dim, including the name.
+        assert_eq!(fgs[1], t.text_dim);
+    }
+
     #[test]
     fn broadcast_pushes_the_tabs_right_instead_of_covering_them() {
         let mut app = app_with_sessions(&["a"]);
@@ -3356,7 +3610,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let app = App::new(tx, std::sync::Arc::new(config));
 
-        let rows = render_rows(&app, 60, 14);
+        let rows = render_rows(&app, 60, 15);
         // The empty output pane's border is drawn in text_dim.
         assert_eq!(rows[2].1[0], Color::Rgb(0xff, 0, 0xff));
     }

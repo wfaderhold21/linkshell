@@ -2,6 +2,7 @@
 
 - [Split panes](#split-panes)
 - [Tab strip](#tab-strip)
+- [Footer](#footer)
 - [Scrollback](#scrollback)
 - [Status panel](#status-panel)
 - [Keybindings](#keybindings)
@@ -36,6 +37,25 @@ me" is legible without the status panel open. Click a tab to focus it.
 As the terminal narrows the strip drops names before it drops tabs: first the
 inactive tabs fall back to bare indices, then all of them do. Every session
 keeps a tab.
+
+## Footer
+
+The bottom row reports the focused session:
+
+```
+ claude · opus-4-8   18.0k/180k   ⣾ THINKING   0:42   $0.31   alt-h help
+```
+
+The name is coloured by state — accent while working, amber on WAITING, red
+on ERROR — and a dead session offers `alt-r restart`. The context counter
+turns amber past 80% of the window; when the window size is unknown (a local
+model that was never probed) it renders a bare count with no denominator,
+because there is no percentage to colour against. A paused or dead session
+greys the whole row: its numbers are frozen.
+
+Fields are dropped as the terminal narrows rather than wrapping, which would
+cost a row of output. The hint goes first, then cost, then elapsed; the
+session's name and state are the last to go.
 
 ## Scrollback
 
