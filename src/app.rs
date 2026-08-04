@@ -174,6 +174,13 @@ pub enum AppMode {
         selected_top: usize,
         selected_sub: Option<usize>,
     },
+    /// Picking the orchestrator's model from what its endpoint reports. A
+    /// mode rather than a menu row because the list is live and can run to
+    /// dozens of entries — cycling through those one Enter at a time is not
+    /// choosing, it is scrolling with extra steps.
+    OrchestratorModel {
+        selected: usize,
+    },
     Search {
         query: String,
         cursor: usize,
@@ -251,6 +258,89 @@ pub struct PendingKill {
     pub session_name: String,
     pub reason: String,
     pub requested_at: std::time::Instant,
+}
+
+/// State of the planning pane.
+///
+/// The pane is a two-column view: a collapsible thread list on the left, the
+/// open thread's transcript and input on the right. Unlike `ChatState`, whose
+/// transcript is ephemeral and tail-oriented, everything here is backed by a
+/// file on disk and survives a restart.
+#[derive(Default)]
+pub struct PlanningState {
+    /// Open thread, if any. `None` means the pane shows only the list.
+    pub thread: Option<crate::planning::store::Thread>,
+    /// Sidebar rows, newest first.
+    pub threads: Vec<crate::planning::store::ThreadSummary>,
+    pub list_selected: usize,
+    pub sidebar_collapsed: bool,
+    pub input: String,
+    pub cursor: usize,
+    /// Lines scrolled up from the tail of the transcript.
+    pub scroll: usize,
+    /// Backend the next turn will use. Switching mid-thread is expected; the
+    /// per-message record in the thread is what preserves the seam.
+    pub backend: Option<crate::planning::Backend>,
+    /// True while a turn or commit is in flight; the input is not sent twice.
+    pub busy: bool,
+    /// Latest progress line from the running turn.
+    pub status: String,
+    /// Last error, kept visible until the next successful turn.
+    pub error: String,
+    /// Set when the last failure was a context overflow, so the pane can
+    /// offer compact/fork instead of a plain retry.
+    pub overflow: bool,
+    /// Backend picker open, with the candidate index.
+    pub picker: Option<usize>,
+    /// Second level of the picker: the model list probed from the highlighted
+    /// backend's endpoint, with the candidate index. A backend is an endpoint,
+    /// and an endpoint usually serves several models — picking the endpoint
+    /// without picking the model only gets you halfway.
+    pub picker_model: Option<usize>,
+    /// Which column keys drive: the thread list or the transcript/input.
+    pub focus: PlanningFocus,
+    /// Thread id awaiting a delete confirmation.
+    pub confirm_delete: Option<String>,
+    /// Handoff picker open, with the candidate index into the eligible
+    /// session list. Opening a committed plan as work is the payoff of the
+    /// whole pane, so it gets an explicit target rather than guessing one.
+    pub handoff: Option<usize>,
+    /// Estimated tokens in the largest request the last turn built. The
+    /// thread's own messages carry no tool traffic, so without this the meter
+    /// reports a few hundred tokens for a turn that read half the repository.
+    pub last_peak_tokens: usize,
+    /// Model ids probed from a local backend's `/v1/models`, keyed by backend
+    /// name. Cached because the picker would otherwise hit the endpoint on
+    /// every open, and a local server's list changes rarely.
+    pub model_cache: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Which column of the planning pane has key focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanningFocus {
+    /// Typing goes to the input; Up/Down scroll the transcript.
+    #[default]
+    Transcript,
+    /// Up/Down move the thread selection; Enter opens it.
+    Sidebar,
+}
+
+impl PlanningState {
+    /// Reload the sidebar from disk.
+    pub fn refresh_list(&mut self) {
+        self.threads = crate::planning::store::list().unwrap_or_default();
+        if self.list_selected >= self.threads.len() {
+            self.list_selected = self.threads.len().saturating_sub(1);
+        }
+    }
+
+    /// Label for the status bar: which model the next turn goes to.
+    pub fn backend_label(&self) -> String {
+        self.backend
+            .as_ref()
+            .map(|b| b.label())
+            .unwrap_or_else(|| "no backend configured".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -364,6 +454,18 @@ const COMMAND_PALETTE: &[(&str, &str, &str)] = &[
     ("quit", "Exit linkshell", "quit"),
 ];
 
+/// What the file browser is picking a directory *for*. The browser is shared,
+/// so it has to know where to hand the result back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileBrowserPurpose {
+    /// Fill the new-session dialog's cwd field.
+    #[default]
+    NewSessionCwd,
+    /// Pick the scope root for a new planning thread. The root is pinned
+    /// permanently at creation, so it is worth making easy to get right.
+    PlanningRoot,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileBrowserState {
     pub current_dir: PathBuf,
@@ -452,6 +554,7 @@ pub struct App {
     pub browse_button_area: Rect,
     pub file_browser_area: Rect,
     pub file_browser_state: FileBrowserState,
+    pub file_browser_purpose: FileBrowserPurpose,
     pub command_bar_area: Rect,
     pub help_area: Rect,
     pub chat_area: Rect,
@@ -517,9 +620,26 @@ pub struct App {
     /// `/yes` and `/no` without a target answer this one.
     pub last_permission_request: Option<usize>,
     pub chat: ChatState,
+    pub planning: PlanningState,
+    /// Models the orchestrator's endpoint reports serving. Empty until
+    /// probed; falls back to `[orchestrator].models` for a provider whose
+    /// catalogue is not worth listing.
+    pub orchestrator_models: Vec<String>,
+    /// Orchestrator settings were changed from the menu while it was
+    /// running; the running task holds a snapshot, so a restart is needed.
+    pub orchestrator_config_dirty: bool,
     /// When Some(p), split pane `p` renders the chat instead of a session
     /// and keyboard input goes to the chat while that pane is focused.
     pub chat_docked: Option<usize>,
+    /// When Some(p), split pane `p` renders the planning thread instead of a
+    /// session and keyboard input goes to the planning pane while focused.
+    pub planning_docked: Option<usize>,
+    /// The planning pane takes the whole output region, replacing the session
+    /// panes. A plan is a document you read and scroll, and a third of a split
+    /// is not enough room to hold one in your head. The session bar and status
+    /// panel stay put, so the sessions being planned against are still visible
+    /// and still updating — only their output is covered.
+    pub planning_fullscreen: bool,
     /// When true, key input is forwarded to all non-dead sessions
     pub broadcast_mode: bool,
     pub settings_state: SettingsState,
@@ -579,6 +699,7 @@ impl App {
             browse_button_area: Rect::default(),
             file_browser_area: Rect::default(),
             file_browser_state: FileBrowserState::new("."),
+            file_browser_purpose: FileBrowserPurpose::default(),
             command_bar_area: Rect::default(),
             help_area: Rect::default(),
             chat_area: Rect::default(),
@@ -586,6 +707,7 @@ impl App {
             chat_scroll_max: 0,
             chat_visible_lines: Vec::new(),
             chat_selection: None,
+            orchestrator_models: Vec::new(),
             menu_bar_area: Rect::default(),
             menu_item_areas: Vec::new(),
             menu_submenu_area: Rect::default(),
@@ -614,7 +736,11 @@ impl App {
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
             chat: ChatState::default(),
+            planning: PlanningState::default(),
+            orchestrator_config_dirty: false,
             chat_docked: None,
+            planning_docked: None,
+            planning_fullscreen: false,
             broadcast_mode: false,
             settings_state: SettingsState::new_empty(),
             clipboard: None,
@@ -1060,6 +1186,9 @@ impl App {
         if self.chat_docked == Some(self.focused_pane) {
             self.chat_docked = None;
         }
+        if self.planning_docked == Some(self.focused_pane) {
+            self.planning_docked = None;
+        }
         // Don't show the same session in two panes at once.
         let shown_elsewhere = self
             .panes
@@ -1138,6 +1267,11 @@ impl App {
                 *dock += 1;
             }
         }
+        if let Some(dock) = self.planning_docked.as_mut() {
+            if *dock >= new_slot {
+                *dock += 1;
+            }
+        }
         self.focused_pane = new_slot;
         // No immediate PTY resize: the true pane geometry isn't known until the
         // next draw, whose post-draw handle_pane_resize sizes the new pane's
@@ -1165,6 +1299,13 @@ impl App {
                 self.chat_docked = Some(dock - 1);
             }
         }
+        if let Some(dock) = self.planning_docked {
+            if dock == removed {
+                self.planning_docked = None;
+            } else if dock > removed {
+                self.planning_docked = Some(dock - 1);
+            }
+        }
         self.focused_pane = removed.min(self.panes.len() - 1);
         self.needs_redraw = true;
     }
@@ -1181,6 +1322,11 @@ impl App {
     pub fn focus_next_pane(&mut self) {
         if self.is_split() {
             self.focused_pane = (self.focused_pane + 1) % self.panes.len();
+            // Focus that leaves the fullscreen planning pane has to restore
+            // the split, or keys go to a pane covered by another one.
+            if self.planning_fullscreen && self.planning_docked != Some(self.focused_pane) {
+                self.planning_fullscreen = false;
+            }
             self.needs_redraw = true;
         }
     }
@@ -2907,7 +3053,7 @@ impl App {
                         self.mode = AppMode::Normal;
                         return;
                     }
-                    AppMode::Normal | AppMode::Menu { .. } => {}
+                    AppMode::Normal | AppMode::Menu { .. } | AppMode::OrchestratorModel { .. } => {}
                 }
 
                 // Docked chat pane click → focus it, maybe start a transcript
@@ -3170,7 +3316,7 @@ impl App {
                 {
                     for (idx, area) in self.menu_submenu_item_areas.iter().enumerate() {
                         if rect_hit(*area, col, row) {
-                            self.execute_menu_action(selected_top, idx);
+                            self.activate_menu_index(selected_top, idx);
                             return;
                         }
                     }
@@ -3406,6 +3552,17 @@ impl App {
             self.new_session_state.cwd.clone()
         };
         self.file_browser_state = FileBrowserState::new(&start);
+        self.file_browser_purpose = FileBrowserPurpose::NewSessionCwd;
+        self.mode = AppMode::FileBrowser;
+    }
+
+    /// Open the browser to pick a scope root for a new planning thread.
+    pub fn open_planning_root_browser(&mut self) {
+        let start = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        self.file_browser_state = FileBrowserState::new(&start);
+        self.file_browser_purpose = FileBrowserPurpose::PlanningRoot;
         self.mode = AppMode::FileBrowser;
     }
 
@@ -3450,14 +3607,46 @@ impl App {
             .current_dir
             .to_string_lossy()
             .to_string();
-        self.new_session_state.cwd = s.clone();
-        self.new_session_state.cwd_cursor = s.len();
-        self.new_session_state.active_field = NewSessionField::Cwd;
-        self.mode = AppMode::NewSession;
+        match self.file_browser_purpose {
+            FileBrowserPurpose::NewSessionCwd => {
+                self.new_session_state.cwd = s.clone();
+                self.new_session_state.cwd_cursor = s.len();
+                self.new_session_state.active_field = NewSessionField::Cwd;
+                self.mode = AppMode::NewSession;
+            }
+            FileBrowserPurpose::PlanningRoot => {
+                // Title the thread after the directory; it is renameable by
+                // editing the markdown, and a name beats "untitled" in the list.
+                let title = self
+                    .file_browser_state
+                    .current_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "untitled".to_string());
+                if let Err(e) = self.planning_new_thread(&title, &s) {
+                    self.planning.error = e;
+                }
+                self.file_browser_purpose = FileBrowserPurpose::default();
+                self.mode = AppMode::Normal;
+                if let Some(pane) = self.planning_docked {
+                    self.focused_pane = pane;
+                }
+                self.planning.focus = PlanningFocus::Transcript;
+            }
+        }
     }
 
     pub fn file_browser_cancel(&mut self) {
-        self.mode = AppMode::NewSession;
+        match self.file_browser_purpose {
+            FileBrowserPurpose::NewSessionCwd => self.mode = AppMode::NewSession,
+            FileBrowserPurpose::PlanningRoot => {
+                self.file_browser_purpose = FileBrowserPurpose::default();
+                self.mode = AppMode::Normal;
+                if let Some(pane) = self.planning_docked {
+                    self.focused_pane = pane;
+                }
+            }
+        }
     }
 
     pub fn handle_file_browser_mouse(&mut self, col: u16, row: u16, list_visible: usize) {
@@ -4377,10 +4566,17 @@ impl App {
             selected_sub,
         } = self.mode
         {
-            let next = ((selected_top as i32 + delta).rem_euclid(MENU.len() as i32)) as usize;
+            let sections = self.menu();
+            if sections.is_empty() {
+                return;
+            }
+            let next = ((selected_top as i32 + delta).rem_euclid(sections.len() as i32)) as usize;
+            // Submenu indices are per-section, so clamp rather than carry a
+            // stale index into a shorter menu.
+            let sub = selected_sub.map(|i| i.min(sections[next].items.len().saturating_sub(1)));
             self.mode = AppMode::Menu {
                 selected_top: next,
-                selected_sub,
+                selected_sub: sub,
             };
         }
     }
@@ -4391,11 +4587,28 @@ impl App {
             selected_sub,
         } = self.mode
         {
-            let count = MENU[selected_top].1.len() as i32;
+            let sections = self.menu();
+            let Some(section) = sections.get(selected_top) else {
+                return;
+            };
+            let count = section.items.len() as i32;
+            if count == 0 {
+                return;
+            }
             let cur = selected_sub.unwrap_or(0) as i32;
+            // Separators are not landable; step past them in the direction of
+            // travel so arrow keys never park on a divider.
+            let step = if delta >= 0 { 1 } else { -1 };
+            let mut next = (cur + delta).rem_euclid(count);
+            for _ in 0..count {
+                if section.items[next as usize].action != MenuAction::Separator {
+                    break;
+                }
+                next = (next + step).rem_euclid(count);
+            }
             self.mode = AppMode::Menu {
                 selected_top,
-                selected_sub: Some(((cur + delta).rem_euclid(count)) as usize),
+                selected_sub: Some(next as usize),
             };
         }
     }
@@ -4406,6 +4619,8 @@ impl App {
                 selected_top,
                 selected_sub: Some(0),
             };
+            // Land on the first selectable row.
+            self.menu_move_sub(0);
         }
     }
 
@@ -4418,27 +4633,109 @@ impl App {
         }
     }
 
+    /// Jump to the section whose title starts with `c` (menu mnemonics).
+    /// Derived from the live titles rather than hardcoded, so adding a
+    /// section cannot silently steal another one's letter.
+    pub fn menu_jump_to_mnemonic(&mut self, c: char) -> bool {
+        let want = c.to_ascii_lowercase();
+        let idx = self.menu().iter().position(|s| {
+            s.title
+                .chars()
+                .next()
+                .map(|t| t.to_ascii_lowercase() == want)
+                .unwrap_or(false)
+        });
+        match idx {
+            Some(i) => {
+                self.mode = AppMode::Menu {
+                    selected_top: i,
+                    selected_sub: Some(0),
+                };
+                self.menu_move_sub(0);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn execute_selected_menu_action(&mut self) {
         if let AppMode::Menu {
             selected_top,
             selected_sub,
         } = self.mode
         {
-            self.execute_menu_action(selected_top, selected_sub.unwrap_or(0));
+            self.activate_menu_index(selected_top, selected_sub.unwrap_or(0));
         }
     }
 
-    fn execute_menu_action(&mut self, top: usize, sub: usize) {
-        self.mode = AppMode::Normal;
-        match (top, sub) {
-            (0, 0) => self.open_new_session(),
-            (0, 1) => self.kill_active_session(),
-            (0, 2) => self.next_session(),
-            (0, 3) => self.prev_session(),
-            (1, 0) => self.scroll_up(20),
-            (1, 1) => self.scroll_down(20),
-            (1, 2) => self.clear_scroll(),
-            (2, 0) => {
+    /// Activate the item at a (section, item) position — used by both the
+    /// keyboard and mouse paths. Resolves the position against the *current*
+    /// menu, so a stale index from a previous frame is ignored rather than
+    /// firing the wrong action.
+    pub fn activate_menu_index(&mut self, top: usize, sub: usize) {
+        let action = match self.menu().get(top).and_then(|s| s.items.get(sub)) {
+            Some(item) if item.enabled => item.action.clone(),
+            // A disabled row is a no-op that leaves the menu open, so the
+            // user can see *why* it is greyed out rather than being dropped
+            // back to the session with nothing having happened.
+            Some(_) => return,
+            None => return,
+        };
+        self.execute_menu_action(action, top, sub);
+    }
+
+    fn execute_menu_action(&mut self, action: MenuAction, top: usize, sub: usize) {
+        let outcome = self.run_menu_action(action);
+        match outcome {
+            MenuOutcome::Close => {
+                if matches!(self.mode, AppMode::Menu { .. }) {
+                    self.mode = AppMode::Normal;
+                }
+            }
+            // Cycling items (model, context, approval) keep the menu open so
+            // a value can be stepped through without reopening four times.
+            MenuOutcome::Stay => {
+                self.mode = AppMode::Menu {
+                    selected_top: top,
+                    selected_sub: Some(sub),
+                };
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn run_menu_action(&mut self, action: MenuAction) -> MenuOutcome {
+        match action {
+            MenuAction::Separator => MenuOutcome::Stay,
+            MenuAction::NewSession => {
+                self.open_new_session();
+                MenuOutcome::Close
+            }
+            MenuAction::KillSession => {
+                self.kill_active_session();
+                MenuOutcome::Close
+            }
+            MenuAction::NextSession => {
+                self.next_session();
+                MenuOutcome::Close
+            }
+            MenuAction::PrevSession => {
+                self.prev_session();
+                MenuOutcome::Close
+            }
+            MenuAction::ScrollUp => {
+                self.scroll_up(20);
+                MenuOutcome::Close
+            }
+            MenuAction::ScrollDown => {
+                self.scroll_down(20);
+                MenuOutcome::Close
+            }
+            MenuAction::ClearScroll => {
+                self.clear_scroll();
+                MenuOutcome::Close
+            }
+            MenuAction::ListPipes => {
                 self.command_result = if self.pipes.is_empty() {
                     "No active pipes".into()
                 } else {
@@ -4461,29 +4758,511 @@ impl App {
                         .join(" | ")
                 };
                 self.mode = AppMode::CommandResult;
+                MenuOutcome::Close
             }
-            (2, 1) => {
-                self.command_input = "pipe ".into();
+            MenuAction::PrefillCommand(text) => {
+                self.command_input = text;
                 self.command_cursor = self.command_input.len();
                 self.mode = AppMode::CommandBar;
+                MenuOutcome::Close
             }
-            (2, 2) => {
-                self.command_input = "unpipe ".into();
-                self.command_cursor = self.command_input.len();
-                self.mode = AppMode::CommandBar;
+            MenuAction::Help => {
+                self.mode = AppMode::Help;
+                MenuOutcome::Close
             }
-            (3, 0) | (3, 1) => self.mode = AppMode::Help,
-            _ => {}
+
+            // ── Orchestrator lifecycle ────────────────────────────────────
+            MenuAction::OrchestratorStart => {
+                self.command_result = match self.start_orchestrator() {
+                    Ok(()) => {
+                        self.orchestrator_config_dirty = false;
+                        "orchestrator started".to_string()
+                    }
+                    Err(e) => format!("orchestrator: {}", e),
+                };
+                MenuOutcome::Stay
+            }
+            MenuAction::OrchestratorStop => {
+                self.stop_orchestrator();
+                MenuOutcome::Stay
+            }
+            MenuAction::OrchestratorRestart => {
+                self.stop_orchestrator();
+                self.command_result = match self.start_orchestrator() {
+                    Ok(()) => {
+                        self.orchestrator_config_dirty = false;
+                        "orchestrator restarted".to_string()
+                    }
+                    Err(e) => format!("orchestrator: {}", e),
+                };
+                MenuOutcome::Stay
+            }
+            MenuAction::OrchestratorTogglePause => {
+                let pause = !self.orchestrator_paused;
+                self.set_orchestrator_paused(pause);
+                MenuOutcome::Stay
+            }
+            MenuAction::OrchestratorToggleHidden => {
+                if let Some(orch_id) = self.orchestrator_session_id {
+                    let now_hidden = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == orch_id)
+                        .map(|s| s.hidden)
+                        .unwrap_or(false);
+                    let show = now_hidden;
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == orch_id) {
+                        s.hidden = !show;
+                    }
+                    if !show {
+                        let idx = self.sessions.iter().position(|s| s.id == orch_id);
+                        for pane in &mut self.panes {
+                            if *pane == idx {
+                                *pane = None;
+                            }
+                        }
+                        if self.panes[0].is_none() {
+                            self.panes[0] = self.visible_indices().first().copied();
+                        }
+                    }
+                }
+                MenuOutcome::Stay
+            }
+
+            // ── Orchestrator settings ─────────────────────────────────────
+            //
+            // These edit the in-memory config only. Writing config.toml would
+            // mean reserializing a file the user hand-wrote with comments, so
+            // runtime changes stay for the session and the file remains the
+            // durable source of truth.
+            MenuAction::CyclePersona(delta) => {
+                let names: Vec<String> = self.personas().into_iter().map(|p| p.name).collect();
+                if names.is_empty() {
+                    return MenuOutcome::Stay;
+                }
+                let next = cycle_value(&names, &self.orchestrator_persona, delta);
+                // Personas hot-swap: they layer over the base config and take
+                // effect on the next turn without discarding history, so this
+                // one deliberately does not mark the config dirty.
+                self.set_persona(&next);
+                MenuOutcome::Stay
+            }
+            MenuAction::CycleProvider(delta) => {
+                let choices = self.config.orchestrator.provider_choices();
+                let current = self.config.orchestrator.provider.clone();
+                let next = cycle_value(&choices, &current, delta);
+                self.config_mut().orchestrator.provider = next.clone();
+                self.mark_orchestrator_dirty();
+                self.command_result = format!("orchestrator provider → {}", next);
+                MenuOutcome::Stay
+            }
+            MenuAction::PickModel => {
+                self.open_orchestrator_model_picker();
+                MenuOutcome::Close
+            }
+            MenuAction::CycleContext(delta) => {
+                let choices = self.config.orchestrator.context_choices();
+                let current = self.config.orchestrator.max_context_tokens;
+                let idx = choices.iter().position(|c| *c == current).unwrap_or(0) as i32;
+                let next = choices[((idx + delta).rem_euclid(choices.len() as i32)) as usize];
+                self.config_mut().orchestrator.max_context_tokens = next;
+                self.mark_orchestrator_dirty();
+                self.command_result = format!("orchestrator context budget → {}", next);
+                MenuOutcome::Stay
+            }
+            MenuAction::ToggleApproval => {
+                let propose = self.config.orchestrator.approval == "propose";
+                let next = if propose { "auto" } else { "propose" };
+                self.config_mut().orchestrator.approval = next.to_string();
+                self.mark_orchestrator_dirty();
+                self.command_result = format!("orchestrator approval → {}", next);
+                MenuOutcome::Stay
+            }
+            MenuAction::ToggleEvent(name) => {
+                let events = &mut self.config_mut().orchestrator.events;
+                match events.iter().position(|e| *e == name) {
+                    Some(i) => {
+                        events.remove(i);
+                    }
+                    None => events.push(name.clone()),
+                }
+                self.mark_orchestrator_dirty();
+                MenuOutcome::Stay
+            }
+            MenuAction::ReloadConfig => {
+                self.config = std::sync::Arc::new(crate::config::load());
+                self.orchestrator_config_dirty = false;
+                self.command_result = "config reloaded from disk".into();
+                MenuOutcome::Stay
+            }
+
+            // ── Planning ──────────────────────────────────────────────────
+            MenuAction::PlanningNew => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
+                self.command_result = match self.planning_new_thread("untitled", &cwd) {
+                    Ok(()) => format!("planning thread opened in {}", cwd),
+                    Err(e) => format!("planning: {}", e),
+                };
+                MenuOutcome::Close
+            }
+            MenuAction::PlanningOpenPicker => {
+                // The picker draws inside the planning pane, so the pane has
+                // to exist before it can be opened from the menu.
+                if self.planning_docked.is_none() {
+                    self.dock_planning(None);
+                }
+                self.planning_open_picker();
+                MenuOutcome::Close
+            }
+            MenuAction::PlanningCommit => {
+                self.planning_commit();
+                MenuOutcome::Close
+            }
+        }
+    }
+
+    /// Tear down whichever orchestrator flavor is running.
+    fn stop_orchestrator(&mut self) {
+        self.orchestrator_paused = false;
+        if self.orchestrator.take().is_some() {
+            // Dropping the handle closes the channel; the task exits.
+            self.command_result = "orchestrator stopped".into();
+        } else if let Some(orch_id) = self.orchestrator_session_id.take() {
+            if let Some(idx) = self.sessions.iter().position(|s| s.id == orch_id) {
+                self.remove_session(idx);
+            }
+            self.command_result = "orchestrator session killed".into();
+        } else {
+            self.command_result = "orchestrator is not running".into();
+        }
+    }
+
+    /// True when the orchestrator is live in either flavor.
+    pub fn orchestrator_running(&self) -> bool {
+        self.orchestrator.is_some() || self.orchestrator_session_id.is_some()
+    }
+
+    /// Settings edits are snapshotted into the agent task at spawn time, so a
+    /// running orchestrator does not pick them up. Rather than silently
+    /// restarting — which would throw away the conversation the user is in
+    /// the middle of — the menu flags that a restart is needed and leaves the
+    /// decision to them.
+    fn mark_orchestrator_dirty(&mut self) {
+        if self.orchestrator_running() {
+            self.orchestrator_config_dirty = true;
+        }
+    }
+
+    /// Mutable access to the live config. Copy-on-write: other holders of the
+    /// `Arc` (background tasks with their own snapshot) keep the version they
+    /// started with, which is exactly why a restart is needed to apply.
+    pub fn config_mut(&mut self) -> &mut Config {
+        std::sync::Arc::make_mut(&mut self.config)
+    }
+
+    /// Build the menu against current state. Rebuilt on every navigation and
+    /// draw rather than cached, so labels like "Stop Orchestrator" and the
+    /// current model always reflect reality.
+    pub fn menu(&self) -> Vec<MenuSection> {
+        let orch = &self.config.orchestrator;
+        let running = self.orchestrator_running();
+        let api_class = matches!(orch.class(), Ok(crate::config::OrchestratorClass::Api(_)));
+
+        let mut orchestrator_items = vec![
+            if running {
+                MenuItem::new("Stop", MenuAction::OrchestratorStop)
+            } else {
+                MenuItem::new("Start", MenuAction::OrchestratorStart)
+            },
+            MenuItem::new("Restart", MenuAction::OrchestratorRestart).enabled_if(running),
+            MenuItem::new(
+                if self.orchestrator_paused {
+                    "Resume"
+                } else {
+                    "Pause"
+                },
+                MenuAction::OrchestratorTogglePause,
+            )
+            .enabled_if(running),
+            MenuItem::new("Show/Hide Session", MenuAction::OrchestratorToggleHidden)
+                .enabled_if(self.orchestrator_session_id.is_some()),
+            MenuItem::separator(),
+            MenuItem::new("Persona", MenuAction::CyclePersona(1)).with_detail(
+                if self.orchestrator_persona.is_empty() {
+                    "(none)"
+                } else {
+                    &self.orchestrator_persona
+                },
+            ),
+            MenuItem::new("Provider", MenuAction::CycleProvider(1)).with_detail(&orch.provider),
+            MenuItem::new("Model", MenuAction::PickModel)
+                .with_detail(if orch.model.is_empty() {
+                    "(default)"
+                } else {
+                    &orch.model
+                })
+                .enabled_if(api_class),
+            MenuItem::new("Context Budget", MenuAction::CycleContext(1)).with_detail(&if orch
+                .max_context_tokens
+                == 0
+            {
+                "unlimited".to_string()
+            } else {
+                format_tokens(orch.max_context_tokens)
+            }),
+            MenuItem::new("Approval", MenuAction::ToggleApproval).with_detail(&orch.approval),
+            MenuItem::separator(),
+        ];
+        // Wake-on-event toggles: each is a full orchestrator turn, which is
+        // expensive on a local model, so they are worth flipping per session.
+        for event in ["ready", "waiting", "error", "dead"] {
+            let on = orch.events.iter().any(|e| e == event);
+            orchestrator_items.push(
+                MenuItem::new(
+                    &format!("Wake on {}", event),
+                    MenuAction::ToggleEvent(event.to_string()),
+                )
+                .with_detail(if on { "on" } else { "off" }),
+            );
+        }
+        orchestrator_items.push(MenuItem::separator());
+        orchestrator_items.push(MenuItem::new(
+            "Reload Config From Disk",
+            MenuAction::ReloadConfig,
+        ));
+        if self.orchestrator_config_dirty {
+            orchestrator_items.push(
+                MenuItem::new("Restart To Apply Changes", MenuAction::OrchestratorRestart)
+                    .with_detail("pending"),
+            );
+        }
+
+        let planning_backend = self
+            .planning
+            .backend
+            .as_ref()
+            .map(|b| b.label())
+            .unwrap_or_else(|| "(none configured)".to_string());
+
+        vec![
+            MenuSection {
+                title: "Sessions".into(),
+                items: vec![
+                    MenuItem::new("New Session", MenuAction::NewSession),
+                    MenuItem::new("Kill Session", MenuAction::KillSession),
+                    MenuItem::new("Next", MenuAction::NextSession),
+                    MenuItem::new("Prev", MenuAction::PrevSession),
+                ],
+            },
+            MenuSection {
+                title: "View".into(),
+                items: vec![
+                    MenuItem::new("Scroll Up", MenuAction::ScrollUp),
+                    MenuItem::new("Scroll Down", MenuAction::ScrollDown),
+                    MenuItem::new("Clear Scroll", MenuAction::ClearScroll),
+                ],
+            },
+            MenuSection {
+                title: "Pipes".into(),
+                items: vec![
+                    MenuItem::new("List Pipes", MenuAction::ListPipes),
+                    MenuItem::new("Add Pipe", MenuAction::PrefillCommand("pipe ".into())),
+                    MenuItem::new("Remove Pipe", MenuAction::PrefillCommand("unpipe ".into())),
+                ],
+            },
+            MenuSection {
+                title: "Orchestrator".into(),
+                items: orchestrator_items,
+            },
+            MenuSection {
+                title: "Agenda".into(),
+                items: vec![
+                    MenuItem::new("New Planning Thread", MenuAction::PlanningNew),
+                    MenuItem::new("Planning Model", MenuAction::PlanningOpenPicker)
+                        .with_detail(&planning_backend)
+                        // Nothing to cycle through until linkshell.toml
+                        // declares at least one [planning.backends.NAME].
+                        .enabled_if(!self.config.planning.backend_names().is_empty()),
+                    MenuItem::new("Commit Plan", MenuAction::PlanningCommit)
+                        .enabled_if(self.planning.thread.is_some()),
+                ],
+            },
+            MenuSection {
+                title: "Help".into(),
+                items: vec![
+                    MenuItem::new("Keybindings", MenuAction::Help),
+                    MenuItem::new("About", MenuAction::Help),
+                ],
+            },
+        ]
+    }
+}
+
+/// Ask an OpenAI-compatible endpoint what models it is serving.
+///
+/// Shared by the planning backend picker and the orchestrator's model picker:
+/// both face the same problem, which is that a self-hosted server's model list
+/// is live state and a model id written into config goes stale the moment the
+/// server loads something else. Failures come back as an empty list — an
+/// unreachable endpoint is a picker with nothing in it, not an error worth
+/// interrupting the user over.
+pub async fn probe_models(url: &str, api_key: Option<&str>) -> Vec<String> {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return Vec::new();
+    };
+    let mut req = client.get(url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let Ok(resp) = req.send().await else {
+        return Vec::new();
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                // A server serves embedding and reranker models alongside
+                // chat ones; they cannot answer a turn, so listing them is
+                // only a way to pick wrong.
+                .filter(|id| {
+                    let id = id.to_ascii_lowercase();
+                    !id.contains("embed") && !id.contains("rerank")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Step through a list of choices, landing on the first entry when the
+/// current value is not in the list (a hand-edited config value).
+fn cycle_value(choices: &[String], current: &str, delta: i32) -> String {
+    if choices.is_empty() {
+        return current.to_string();
+    }
+    match choices.iter().position(|c| c == current) {
+        Some(i) => {
+            let next = ((i as i32 + delta).rem_euclid(choices.len() as i32)) as usize;
+            choices[next].clone()
+        }
+        None => choices[0].clone(),
+    }
+}
+
+/// Compact token counts for the menu detail column: 60000 → "60k".
+fn format_tokens(n: usize) -> String {
+    if n >= 1000 && n.is_multiple_of(1000) {
+        format!("{}k", n / 1000)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// What happens to the menu after an item fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuOutcome {
+    /// Dismiss the menu (navigation and one-shot commands).
+    Close,
+    /// Keep it open (value cycling, lifecycle toggles) so the effect is
+    /// visible in the label and can be stepped again.
+    Stay,
+}
+
+/// A menu item's effect. Dispatch is on this value, never on a position, so
+/// inserting a row cannot silently rebind the ones below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuAction {
+    Separator,
+    NewSession,
+    KillSession,
+    NextSession,
+    PrevSession,
+    ScrollUp,
+    ScrollDown,
+    ClearScroll,
+    ListPipes,
+    PrefillCommand(String),
+    Help,
+    OrchestratorStart,
+    OrchestratorStop,
+    OrchestratorRestart,
+    OrchestratorTogglePause,
+    OrchestratorToggleHidden,
+    CyclePersona(i32),
+    CycleProvider(i32),
+    PickModel,
+    CycleContext(i32),
+    ToggleApproval,
+    ToggleEvent(String),
+    ReloadConfig,
+    PlanningNew,
+    PlanningOpenPicker,
+    PlanningCommit,
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuItem {
+    pub label: String,
+    /// Right-aligned current value, for rows that show state.
+    pub detail: String,
+    pub action: MenuAction,
+    pub enabled: bool,
+}
+
+impl MenuItem {
+    fn new(label: &str, action: MenuAction) -> MenuItem {
+        MenuItem {
+            label: label.to_string(),
+            detail: String::new(),
+            action,
+            enabled: true,
+        }
+    }
+
+    fn separator() -> MenuItem {
+        MenuItem {
+            label: String::new(),
+            detail: String::new(),
+            action: MenuAction::Separator,
+            enabled: false,
+        }
+    }
+
+    fn with_detail(mut self, detail: &str) -> MenuItem {
+        self.detail = detail.to_string();
+        self
+    }
+
+    fn enabled_if(mut self, cond: bool) -> MenuItem {
+        self.enabled = cond;
+        self
+    }
+
+    /// Rendered width needed for label plus detail.
+    pub fn width(&self) -> usize {
+        if self.detail.is_empty() {
+            self.label.chars().count()
+        } else {
+            self.label.chars().count() + self.detail.chars().count() + 3
         }
     }
 }
 
-pub const MENU: &[(&str, &[&str])] = &[
-    ("Sessions", &["New Session", "Kill Session", "Next", "Prev"]),
-    ("View", &["Scroll Up", "Scroll Down", "Clear Scroll"]),
-    ("Pipes", &["List Pipes", "Add Pipe", "Remove Pipe"]),
-    ("Help", &["Keybindings", "About"]),
-];
+#[derive(Debug, Clone)]
+pub struct MenuSection {
+    pub title: String,
+    pub items: Vec<MenuItem>,
+}
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
@@ -5083,6 +5862,852 @@ impl App {
             .push(("assistant".to_string(), text.clone()));
         self.chat.messages.push(ChatMsg { from, text });
         self.chat.scroll = 0;
+    }
+}
+
+// ── Planning pane ─────────────────────────────────────────────────────────────
+
+impl App {
+    /// Dock the planning pane into a dedicated pane, splitting the focused one
+    /// to make room. Focus moves to the planning pane.
+    ///
+    /// Unlike the chat, planning has no overlay form: a planning thread is a
+    /// document you sit in beside a session, so it is always a real leaf.
+    pub fn dock_planning(&mut self, dir: Option<SplitDir>) {
+        if let Some(pane) = self.planning_docked {
+            // Already docked — just focus it.
+            self.focused_pane = pane;
+            self.needs_redraw = true;
+            return;
+        }
+        let panes_before = self.panes.len();
+        self.split_focused(dir.unwrap_or(SplitDir::Row));
+        if self.panes.len() == panes_before {
+            // Couldn't split (pane cap reached) — nothing to dock into.
+            return;
+        }
+        self.panes[self.focused_pane] = None;
+        self.planning_docked = Some(self.focused_pane);
+        self.planning.refresh_list();
+        if self.planning.backend.is_none() {
+            self.planning.backend = self.config.planning.default_backend();
+        }
+        // With no thread open, the list is the only thing to act on.
+        self.planning.focus = if self.planning.thread.is_none() {
+            PlanningFocus::Sidebar
+        } else {
+            PlanningFocus::Transcript
+        };
+        self.needs_redraw = true;
+    }
+
+    /// Give the planning pane the whole terminal, or hand the space back.
+    ///
+    /// Docks the pane first if it is closed, so the key is one action rather
+    /// than a mode that only works once something else is set up.
+    pub fn toggle_planning_fullscreen(&mut self) {
+        if self.planning_docked.is_none() {
+            self.dock_planning(None);
+            // A pane cap or a layout that cannot split leaves nothing to
+            // maximize; don't blank the screen over it.
+            if self.planning_docked.is_none() {
+                return;
+            }
+        }
+        self.planning_fullscreen = !self.planning_fullscreen;
+        if let Some(pane) = self.planning_docked {
+            // Fullscreen without focus would eat every key and answer none.
+            self.focused_pane = pane;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Close the planning pane, giving the space back to its sibling.
+    pub fn undock_planning(&mut self) {
+        let Some(pane) = self.planning_docked.take() else {
+            return;
+        };
+        self.planning_fullscreen = false;
+        self.planning.picker = None;
+        self.planning.picker_model = None;
+        self.planning.confirm_delete = None;
+        self.focused_pane = pane;
+        self.close_focused_pane();
+        self.needs_redraw = true;
+    }
+
+    /// Keys for the docked planning pane.
+    ///
+    /// Three transient sub-modes take priority over the pane itself: the
+    /// delete confirmation, the backend picker, and the overflow prompt. The
+    /// overflow prompt is the only route to `planning_compact`, deliberately —
+    /// compacting silently would eat the early turns, which in a planning
+    /// thread are usually the premises everything downstream rests on.
+    pub fn planning_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // ── Delete confirmation ────────────────────────────────────────────
+        if self.planning.confirm_delete.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(id) = self.planning.confirm_delete.take() {
+                        match crate::planning::store::delete(&id) {
+                            Ok(()) => {
+                                if self.planning_is_open(&id) {
+                                    self.planning.thread = None;
+                                }
+                                self.planning.refresh_list();
+                            }
+                            Err(e) => self.planning.error = e.to_string(),
+                        }
+                    }
+                }
+                _ => self.planning.confirm_delete = None,
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        // ── Handoff picker ─────────────────────────────────────────────────
+        if let Some(sel) = self.planning.handoff {
+            let targets = self.planning_handoff_targets();
+            match key.code {
+                KeyCode::Esc => self.planning.handoff = None,
+                KeyCode::Up => self.planning.handoff = Some(sel.saturating_sub(1)),
+                KeyCode::Down => {
+                    self.planning.handoff = Some((sel + 1).min(targets.len().saturating_sub(1)));
+                }
+                KeyCode::Enter => {
+                    if let Some((id, _)) = targets.get(sel) {
+                        self.planning_handoff_to(*id);
+                    }
+                    self.planning.handoff = None;
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        // ── Backend picker ─────────────────────────────────────────────────
+        if let Some(sel) = self.planning.picker {
+            let names = self.config.planning.backend_names();
+            let models = names
+                .get(sel)
+                .and_then(|n| self.planning.model_cache.get(n))
+                .cloned()
+                .unwrap_or_default();
+
+            // ── Model level ────────────────────────────────────────────────
+            if let Some(msel) = self.planning.picker_model {
+                match key.code {
+                    // Back out to the endpoint list rather than closing, so a
+                    // wrong endpoint costs one keypress.
+                    KeyCode::Esc | KeyCode::Left => self.planning.picker_model = None,
+                    KeyCode::Up => {
+                        self.planning.picker_model = Some(msel.saturating_sub(1));
+                    }
+                    KeyCode::Down => {
+                        self.planning.picker_model =
+                            Some((msel + 1).min(models.len().saturating_sub(1)));
+                    }
+                    KeyCode::Enter => {
+                        if let (Some(name), Some(model)) = (names.get(sel), models.get(msel)) {
+                            if let Some(mut b) = self.config.planning.backend(name) {
+                                b.model = model.clone();
+                                self.planning.backend = Some(b);
+                                self.planning_recheck_budget();
+                            }
+                        }
+                        self.planning.picker = None;
+                        self.planning.picker_model = None;
+                    }
+                    _ => {}
+                }
+                self.needs_redraw = true;
+                return;
+            }
+
+            // ── Endpoint level ─────────────────────────────────────────────
+            match key.code {
+                KeyCode::Esc => self.planning.picker = None,
+                KeyCode::Up => {
+                    self.planning.picker = Some(sel.saturating_sub(1));
+                }
+                KeyCode::Down => {
+                    self.planning.picker = Some((sel + 1).min(names.len().saturating_sub(1)));
+                }
+                // A local server can load a different model between opens, so
+                // the cache has to be droppable without restarting linkshell.
+                KeyCode::Char('r') => {
+                    self.planning.model_cache.clear();
+                    self.planning_refresh_model_cache();
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    // Descend into the model list when the endpoint told us
+                    // what it serves; otherwise Enter takes the endpoint with
+                    // its configured model, which is all there is to take.
+                    if !models.is_empty() {
+                        self.planning.picker_model = Some(
+                            names
+                                .get(sel)
+                                .and_then(|n| self.config.planning.backend(n))
+                                .and_then(|b| models.iter().position(|m| *m == b.model))
+                                .unwrap_or(0),
+                        );
+                    } else if key.code == KeyCode::Enter {
+                        if let Some(name) = names.get(sel) {
+                            if let Some(b) = self.config.planning.backend(name) {
+                                self.planning.backend = Some(b);
+                                // Re-check the budget on switch: you find out a
+                                // thread won't fit the local model at switch time,
+                                // not at send time.
+                                self.planning_recheck_budget();
+                            }
+                        }
+                        self.planning.picker = None;
+                    }
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        // ── Overflow prompt ────────────────────────────────────────────────
+        if self.planning.overflow {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.planning_compact();
+                    self.needs_redraw = true;
+                    return;
+                }
+                KeyCode::Char('b') => {
+                    self.planning_open_picker();
+                    self.needs_redraw = true;
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.planning.overflow = false;
+                    self.needs_redraw = true;
+                    return;
+                }
+                // Anything else falls through to the pane.
+                _ => {}
+            }
+        }
+
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // ── Pane-wide chords ───────────────────────────────────────────────
+        match key.code {
+            KeyCode::Char('b') if ctrl => {
+                self.planning.sidebar_collapsed = !self.planning.sidebar_collapsed;
+                if self.planning.sidebar_collapsed {
+                    self.planning.focus = PlanningFocus::Transcript;
+                }
+                self.needs_redraw = true;
+                return;
+            }
+            // Alt+M, not Ctrl+M: terminals encode Ctrl+M as carriage return,
+            // making it indistinguishable from Enter — the picker would never
+            // fire and the message would send instead.
+            KeyCode::Char('m') if alt => {
+                self.planning_open_picker();
+                self.needs_redraw = true;
+                return;
+            }
+            KeyCode::Char('k') if ctrl => {
+                self.planning_commit();
+                self.needs_redraw = true;
+                return;
+            }
+            // Hand the committed plan to a session as work.
+            KeyCode::Char('i') if alt => {
+                self.planning_open_handoff();
+                self.needs_redraw = true;
+                return;
+            }
+            KeyCode::Tab => {
+                self.planning.focus = match self.planning.focus {
+                    PlanningFocus::Transcript if !self.planning.sidebar_collapsed => {
+                        PlanningFocus::Sidebar
+                    }
+                    _ => PlanningFocus::Transcript,
+                };
+                self.needs_redraw = true;
+                return;
+            }
+            KeyCode::Esc => {
+                // Fullscreen: step back to the split first. Focusing another
+                // pane while this one covers the screen would send keys
+                // somewhere the user cannot see.
+                if self.planning_fullscreen {
+                    self.planning_fullscreen = false;
+                } else {
+                    // Docked pane: Esc jumps back to the other pane rather than
+                    // closing the thread.
+                    self.focus_next_pane();
+                }
+                self.needs_redraw = true;
+                return;
+            }
+            KeyCode::PageUp => {
+                self.planning.scroll = self.planning.scroll.saturating_add(10);
+                self.needs_redraw = true;
+                return;
+            }
+            KeyCode::PageDown => {
+                self.planning.scroll = self.planning.scroll.saturating_sub(10);
+                self.needs_redraw = true;
+                return;
+            }
+            _ => {}
+        }
+
+        // ── Sidebar focus ──────────────────────────────────────────────────
+        if self.planning.focus == PlanningFocus::Sidebar {
+            match key.code {
+                KeyCode::Up => {
+                    self.planning.list_selected = self.planning.list_selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let last = self.planning.threads.len().saturating_sub(1);
+                    self.planning.list_selected = (self.planning.list_selected + 1).min(last);
+                }
+                KeyCode::Enter => {
+                    if let Some(t) = self.planning.threads.get(self.planning.list_selected) {
+                        let id = t.id.clone();
+                        if let Err(e) = self.planning_open_thread(&id) {
+                            self.planning.error = e;
+                        }
+                        self.planning.focus = PlanningFocus::Transcript;
+                    }
+                }
+                KeyCode::Char('n') => self.open_planning_root_browser(),
+                KeyCode::Char('d') => {
+                    if let Some(t) = self.planning.threads.get(self.planning.list_selected) {
+                        self.planning.confirm_delete = Some(t.id.clone());
+                    }
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        // ── Transcript / input focus ───────────────────────────────────────
+        match key.code {
+            // A planning message is often a paragraph, which is the opposite
+            // of the orchestrator chat's one-liners.
+            KeyCode::Enter if alt => {
+                self.planning.input.insert(self.planning.cursor, '\n');
+                self.planning.cursor += 1;
+            }
+            KeyCode::Enter => self.planning_send(),
+            KeyCode::Up => {
+                self.planning.scroll = self.planning.scroll.saturating_add(1);
+            }
+            KeyCode::Down => {
+                self.planning.scroll = self.planning.scroll.saturating_sub(1);
+            }
+            KeyCode::Left => {
+                let mut i = self.planning.cursor.saturating_sub(1);
+                while i > 0 && !self.planning.input.is_char_boundary(i) {
+                    i -= 1;
+                }
+                self.planning.cursor = i;
+            }
+            KeyCode::Right => {
+                let mut i = (self.planning.cursor + 1).min(self.planning.input.len());
+                while i < self.planning.input.len() && !self.planning.input.is_char_boundary(i) {
+                    i += 1;
+                }
+                self.planning.cursor = i;
+            }
+            KeyCode::Home => self.planning.cursor = 0,
+            KeyCode::End => self.planning.cursor = self.planning.input.len(),
+            KeyCode::Backspace if self.planning.cursor > 0 => {
+                let mut i = self.planning.cursor - 1;
+                while i > 0 && !self.planning.input.is_char_boundary(i) {
+                    i -= 1;
+                }
+                self.planning
+                    .input
+                    .replace_range(i..self.planning.cursor, "");
+                self.planning.cursor = i;
+            }
+            KeyCode::Delete if self.planning.cursor < self.planning.input.len() => {
+                let mut i = self.planning.cursor + 1;
+                while i < self.planning.input.len() && !self.planning.input.is_char_boundary(i) {
+                    i += 1;
+                }
+                self.planning
+                    .input
+                    .replace_range(self.planning.cursor..i, "");
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.planning.input.insert(self.planning.cursor, c);
+                self.planning.cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Sessions a plan can be handed to: live, visible, and not the pane
+    /// itself. Returns `(session id, display name)`.
+    pub fn planning_handoff_targets(&self) -> Vec<(usize, String)> {
+        self.sessions
+            .iter()
+            .filter(|s| !s.hidden && s.state != SessionState::Dead)
+            .map(|s| (s.id, s.name.clone()))
+            .collect()
+    }
+
+    /// Open the handoff picker for the thread's latest committed plan.
+    ///
+    /// Refuses when there is nothing to hand off: the contract with an
+    /// implementation session is a plan *file*, so an uncommitted thread has
+    /// nothing to give it.
+    fn planning_open_handoff(&mut self) {
+        let Some(thread) = self.planning.thread.as_ref() else {
+            return;
+        };
+        if crate::planning::store::latest_plan(&thread.id).is_none() {
+            self.planning.error = "no committed plan yet — ctrl-k to commit one".to_string();
+            return;
+        }
+        if self.planning_handoff_targets().is_empty() {
+            self.planning.error = "no live session to hand the plan to".to_string();
+            return;
+        }
+        self.planning.error.clear();
+        self.planning.handoff = Some(0);
+    }
+
+    /// Hand the latest committed plan to `dest_id` as a work brief.
+    ///
+    /// The brief is a path plus a staleness warning, not a serialized thread:
+    /// an implementation session may run sandboxed, and a read-only bind mount
+    /// of one file is far simpler to arrange than replaying a conversation.
+    /// Staleness is recomputed now rather than reused from commit time, since
+    /// the repo may have moved on since.
+    fn planning_handoff_to(&mut self, dest_id: usize) {
+        let Some(thread) = self.planning.thread.as_ref() else {
+            return;
+        };
+        let Some(path) = crate::planning::store::latest_plan(&thread.id) else {
+            self.planning.error = "no committed plan yet — ctrl-k to commit one".to_string();
+            return;
+        };
+        let stale = thread.stale_reads();
+        let brief = crate::planning::distill::session_brief(&path, &stale);
+        let name = self
+            .sessions
+            .iter()
+            .find(|s| s.id == dest_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        // Reuse the pipe relay: it already queues for a session that isn't
+        // Ready, which is the common case when handing work to a busy agent.
+        self.handle_pipe_relay(dest_id, format!("{}\n", brief));
+        self.planning.status = format!("plan handed to {}", name);
+        self.planning.error.clear();
+    }
+
+    /// Open the backend picker positioned on the current backend.
+    fn planning_open_picker(&mut self) {
+        let names = self.config.planning.backend_names();
+        let cur = self
+            .planning
+            .backend
+            .as_ref()
+            .and_then(|b| names.iter().position(|n| n == &b.name))
+            .unwrap_or(0);
+        self.planning.picker = Some(cur);
+        self.planning.picker_model = None;
+        // Probing is cached per backend; a local server's model list changes
+        // rarely and the picker would otherwise hit the endpoint every open.
+        self.planning_refresh_model_cache();
+    }
+
+    /// Probe backends' `/v1/models` for the picker, once per backend.
+    ///
+    /// Hosted endpoints are skipped: they advertise hundreds of models, which
+    /// is noise in a picker, and their catalogue is not what changes under
+    /// you. A self-hosted server's is — it serves whatever is loaded right
+    /// now, which is exactly the thing worth asking about rather than
+    /// hardcoding in config.
+    fn planning_refresh_model_cache(&mut self) {
+        for name in self.config.planning.backend_names() {
+            if self.planning.model_cache.contains_key(&name) {
+                continue;
+            }
+            let Some(b) = self.config.planning.backend(&name) else {
+                continue;
+            };
+            if !b.is_probeable() {
+                continue;
+            }
+            let url = format!("{}/models", b.endpoint_url().trim_end_matches('/'));
+            let tx = self.event_tx.clone();
+            let key = b.resolve_api_key();
+            tokio::spawn(async move {
+                let models = probe_models(&url, key.as_deref()).await;
+                let _ = tx
+                    .send(crate::events::AppEvent::PlanningModels {
+                        backend: name,
+                        models,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    /// Open the orchestrator's model picker, probing its endpoint first.
+    ///
+    /// The Model row used to cycle `[orchestrator].models`, which is empty in
+    /// most configs — leaving a one-element list, so pressing Enter set the
+    /// model to what it already was and the row looked dead. Ask the endpoint
+    /// instead; a local server knows what it is serving and the config does
+    /// not.
+    pub fn open_orchestrator_model_picker(&mut self) {
+        let orch = &self.config.orchestrator;
+        // Start from whatever the config lists, so a hosted provider (whose
+        // catalogue is not worth enumerating) still offers its choices.
+        self.orchestrator_models = orch.model_choices();
+        let selected = self
+            .orchestrator_models
+            .iter()
+            .position(|m| *m == orch.model)
+            .unwrap_or(0);
+        self.mode = AppMode::OrchestratorModel { selected };
+        self.refresh_orchestrator_models();
+        self.needs_redraw = true;
+    }
+
+    /// Ask the orchestrator's endpoint what it is serving. Only self-hosted
+    /// endpoints are asked, for the same reason the planning picker skips the
+    /// hosted catalogues: hundreds of entries is not a choice.
+    pub fn refresh_orchestrator_models(&mut self) {
+        let orch = &self.config.orchestrator;
+        if !matches!(orch.class(), Ok(crate::config::OrchestratorClass::Api(_))) {
+            return;
+        }
+        let endpoint = orch.endpoint_url();
+        if endpoint.is_empty()
+            || endpoint.contains("api.openai.com")
+            || orch.provider == "anthropic"
+        {
+            return;
+        }
+        let url = format!("{}/models", endpoint.trim_end_matches('/'));
+        let key = orch.resolve_api_key();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let models = probe_models(&url, key.as_deref()).await;
+            let _ = tx
+                .send(crate::events::AppEvent::OrchestratorModels { models })
+                .await;
+        });
+    }
+
+    pub fn handle_orchestrator_models(&mut self, models: Vec<String>) {
+        if models.is_empty() {
+            return;
+        }
+        // Keep the configured model listed even when the server does not
+        // report it, or the picker cannot get back to where it started.
+        let current = self.config.orchestrator.model.clone();
+        let mut list = models;
+        if !current.is_empty() && !list.contains(&current) {
+            list.insert(0, current.clone());
+        }
+        if let AppMode::OrchestratorModel { .. } = self.mode {
+            let selected = list.iter().position(|m| *m == current).unwrap_or(0);
+            self.mode = AppMode::OrchestratorModel { selected };
+        }
+        self.orchestrator_models = list;
+        self.needs_redraw = true;
+    }
+
+    /// Apply the highlighted model. Takes effect on the orchestrator's next
+    /// restart, which the menu already advertises as a pending change.
+    pub fn orchestrator_model_picker_select(&mut self, idx: usize) {
+        let Some(model) = self.orchestrator_models.get(idx).cloned() else {
+            self.mode = AppMode::Normal;
+            return;
+        };
+        self.config_mut().orchestrator.model = model.clone();
+        self.mark_orchestrator_dirty();
+        self.command_result = format!("orchestrator model → {} (restart to apply)", model);
+        self.mode = AppMode::CommandResult;
+        self.needs_redraw = true;
+    }
+
+    pub fn handle_planning_models(&mut self, backend: String, models: Vec<String>) {
+        self.planning.model_cache.insert(backend, models);
+        self.needs_redraw = true;
+    }
+
+    /// Re-evaluate the thread against the selected backend's window.
+    fn planning_recheck_budget(&mut self) {
+        let (Some(thread), Some(backend)) = (
+            self.planning.thread.as_ref(),
+            self.planning.backend.as_ref(),
+        ) else {
+            return;
+        };
+        match crate::planning::check_budget(thread, backend, &self.planning.input) {
+            Ok(_) => {
+                self.planning.overflow = false;
+                self.planning.error.clear();
+            }
+            Err(e) => {
+                self.planning.overflow = true;
+                self.planning.error = e.to_string();
+            }
+        }
+    }
+
+    /// Open a new planning thread grounded in `root`.
+    ///
+    /// The root is canonicalized and pinned now. Reopening the thread later
+    /// reuses this value rather than re-deriving it from wherever the pane
+    /// happens to be opened, which would quietly invalidate every file
+    /// citation in the conversation.
+    pub fn planning_new_thread(&mut self, title: &str, root: &str) -> Result<(), String> {
+        let expanded = if root.trim().is_empty() {
+            "."
+        } else {
+            root.trim()
+        };
+        let path = std::path::PathBuf::from(expanded);
+        let canonical = crate::planning::tools::canonical_root(&path).map_err(|e| e.to_string())?;
+        let thread = crate::planning::store::Thread::new(title, canonical);
+        crate::planning::store::save(&thread).map_err(|e| e.to_string())?;
+        self.planning.thread = Some(thread);
+        self.planning.input.clear();
+        self.planning.cursor = 0;
+        self.planning.scroll = 0;
+        self.planning.error.clear();
+        self.planning.overflow = false;
+        self.planning.last_peak_tokens = 0;
+        if self.planning.backend.is_none() {
+            self.planning.backend = self.config.planning.default_backend();
+        }
+        self.planning.refresh_list();
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Open an existing thread by id.
+    pub fn planning_open_thread(&mut self, id: &str) -> Result<(), String> {
+        let thread = crate::planning::store::load(id).map_err(|e| e.to_string())?;
+        self.planning.thread = Some(thread);
+        self.planning.scroll = 0;
+        self.planning.error.clear();
+        self.planning.overflow = false;
+        // The peak belongs to the turn that produced it, not to the pane.
+        self.planning.last_peak_tokens = 0;
+        if self.planning.backend.is_none() {
+            self.planning.backend = self.config.planning.default_backend();
+        }
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Send the pane's input as a planning turn.
+    ///
+    /// The draft is cleared only once the request is in flight, and comes back
+    /// on failure — a local endpoint going down mid-thought must not cost the
+    /// user their typed message.
+    pub fn planning_send(&mut self) {
+        if self.planning.busy {
+            return;
+        }
+        let text = self.planning.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let thread = match &self.planning.thread {
+            Some(t) => t.clone(),
+            None => {
+                self.planning.error = "no thread open".to_string();
+                return;
+            }
+        };
+        let backend = match &self.planning.backend {
+            Some(b) => b.clone(),
+            None => {
+                self.planning.error =
+                    "no planning backend configured — add [planning.backends.NAME]".to_string();
+                return;
+            }
+        };
+        // Catch an overflow here rather than after a round trip, so the
+        // compact/fork choice is offered before anything is spent.
+        if let Err(e) = crate::planning::check_budget(&thread, &backend, &text) {
+            self.planning.error = e.to_string();
+            self.planning.overflow =
+                matches!(e, crate::planning::TurnError::ContextOverflow { .. });
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.planning.input.clear();
+        self.planning.cursor = 0;
+        self.planning.busy = true;
+        self.planning.status = "sending".to_string();
+        self.planning.error.clear();
+        self.planning.overflow = false;
+        self.planning.scroll = 0;
+        crate::planning::spawn_turn(thread, backend, text, self.event_tx.clone());
+        self.needs_redraw = true;
+    }
+
+    /// Drop oldest turns until the thread fits the selected backend. Only
+    /// reachable from an explicit user action after an overflow.
+    pub fn planning_compact(&mut self) {
+        let backend = match &self.planning.backend {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        let pending = self.planning.input.clone();
+        if let Some(thread) = self.planning.thread.as_mut() {
+            let dropped = crate::planning::compact(thread, &backend, &pending);
+            let _ = crate::planning::store::save(thread);
+            self.planning.status = format!("compacted: dropped {} turns", dropped);
+            self.planning.error.clear();
+            self.planning.overflow = false;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Distill the open thread into a plan revision.
+    pub fn planning_commit(&mut self) {
+        if self.planning.busy {
+            return;
+        }
+        let thread = match &self.planning.thread {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let distiller = match self.config.planning.distill_backend() {
+            Some(b) => b,
+            None => {
+                self.planning.error = "no distill backend configured".to_string();
+                return;
+            }
+        };
+        self.planning.busy = true;
+        self.planning.status = format!("distilling with {}", distiller.label());
+        crate::planning::distill::spawn_commit(thread, distiller, self.event_tx.clone());
+        self.needs_redraw = true;
+    }
+
+    pub fn handle_planning_status(&mut self, thread_id: String, status: String) {
+        if self.planning_is_open(&thread_id) {
+            self.planning.status = status;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn handle_planning_reply(
+        &mut self,
+        thread_id: String,
+        text: String,
+        backend: String,
+        model: String,
+        peak_tokens: usize,
+        save_error: Option<String>,
+    ) {
+        if !self.planning_is_open(&thread_id) {
+            return;
+        }
+        self.planning.busy = false;
+        self.planning.last_peak_tokens = peak_tokens;
+        self.planning.status.clear();
+        // The background task owns its own copy of the thread, so reload from
+        // disk rather than appending here — that keeps one writer and avoids
+        // the two copies diverging.
+        if let Ok(t) = crate::planning::store::load(&thread_id) {
+            self.planning.thread = Some(t);
+        } else if let Some(t) = self.planning.thread.as_mut() {
+            let b = crate::planning::Backend {
+                name: backend,
+                model,
+                ..crate::planning::Backend::default()
+            };
+            t.messages
+                .push(crate::planning::store::Message::assistant(text, &b));
+        }
+        if let Some(e) = save_error {
+            self.planning.error = format!("reply not saved: {}", e);
+        }
+        self.planning.scroll = 0;
+        self.planning.refresh_list();
+        self.needs_redraw = true;
+    }
+
+    pub fn handle_planning_failed(
+        &mut self,
+        thread_id: String,
+        draft: String,
+        error: String,
+        overflow: bool,
+    ) {
+        if !self.planning_is_open(&thread_id) {
+            return;
+        }
+        self.planning.busy = false;
+        self.planning.status.clear();
+        self.planning.error = error;
+        self.planning.overflow = overflow;
+        // Restore the unsent message so a switch-and-retry costs nothing.
+        if !draft.is_empty() && self.planning.input.trim().is_empty() {
+            self.planning.cursor = draft.chars().count();
+            self.planning.input = draft;
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn handle_planning_committed(
+        &mut self,
+        thread_id: String,
+        path: String,
+        revision: usize,
+        stale: Vec<String>,
+    ) {
+        if !self.planning_is_open(&thread_id) {
+            return;
+        }
+        self.planning.busy = false;
+        self.planning.status = if stale.is_empty() {
+            format!("plan revision {} written to {}", revision, path)
+        } else {
+            format!(
+                "plan revision {} written to {} — grounded in {} file(s) that have since changed: {}",
+                revision,
+                path,
+                stale.len(),
+                stale.join(", ")
+            )
+        };
+        if let Ok(t) = crate::planning::store::load(&thread_id) {
+            self.planning.thread = Some(t);
+        }
+        self.needs_redraw = true;
+    }
+
+    fn planning_is_open(&self, thread_id: &str) -> bool {
+        self.planning
+            .thread
+            .as_ref()
+            .map(|t| t.id == thread_id)
+            .unwrap_or(false)
     }
 }
 
@@ -5962,6 +7587,479 @@ mod tests {
 
     fn cursor_pos(app: &App) -> usize {
         app.new_session_state.cursor_pos()
+    }
+
+    // ── Menu ──────────────────────────────────────────────────────────────
+
+    fn find_item(app: &App, section: &str, label: &str) -> (usize, usize, MenuItem) {
+        let sections = app.menu();
+        let si = sections
+            .iter()
+            .position(|s| s.title == section)
+            .unwrap_or_else(|| panic!("no {} section", section));
+        let ii = sections[si]
+            .items
+            .iter()
+            .position(|i| i.label == label)
+            .unwrap_or_else(|| panic!("no {} item in {}", label, section));
+        (si, ii, sections[si].items[ii].clone())
+    }
+
+    #[test]
+    fn menu_section_mnemonics_are_unique() {
+        let app = make_app();
+        let mut firsts: Vec<char> = app
+            .menu()
+            .iter()
+            .map(|s| s.title.chars().next().unwrap().to_ascii_lowercase())
+            .collect();
+        let before = firsts.len();
+        firsts.sort_unstable();
+        firsts.dedup();
+        assert_eq!(before, firsts.len(), "two sections share a mnemonic letter");
+    }
+
+    #[test]
+    fn mnemonic_jumps_to_the_named_section() {
+        let mut app = make_app();
+        app.open_menu();
+        assert!(app.menu_jump_to_mnemonic('o'));
+        match app.mode {
+            AppMode::Menu { selected_top, .. } => {
+                assert_eq!(app.menu()[selected_top].title, "Orchestrator");
+            }
+            _ => panic!("expected menu mode"),
+        }
+        assert!(!app.menu_jump_to_mnemonic('z'), "unknown letter is a no-op");
+    }
+
+    #[test]
+    fn orchestrator_row_flips_between_start_and_stop() {
+        let mut app = make_app();
+        let (_, _, item) = find_item(&app, "Orchestrator", "Start");
+        assert_eq!(item.action, MenuAction::OrchestratorStart);
+        // Restart and Pause are meaningless with nothing running.
+        assert!(!find_item(&app, "Orchestrator", "Restart").2.enabled);
+
+        app.orchestrator_session_id = Some(1);
+        let (_, _, item) = find_item(&app, "Orchestrator", "Stop");
+        assert_eq!(item.action, MenuAction::OrchestratorStop);
+        assert!(find_item(&app, "Orchestrator", "Restart").2.enabled);
+    }
+
+    #[test]
+    fn disabled_rows_are_no_ops_that_keep_the_menu_open() {
+        let mut app = make_app();
+        app.open_menu();
+        let (si, ii, item) = find_item(&app, "Orchestrator", "Restart");
+        assert!(!item.enabled);
+        app.activate_menu_index(si, ii);
+        assert!(
+            matches!(app.mode, AppMode::Menu { .. }),
+            "a greyed-out row must not dismiss the menu"
+        );
+    }
+
+    /// The Model row cycled `[orchestrator].models`, which is empty in most
+    /// configs — a one-element list, so Enter set the model to what it
+    /// already was and the row looked dead. It opens a picker now.
+    #[test]
+    fn the_model_row_opens_a_picker_positioned_on_the_current_model() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.model = "b".into();
+        cfg.orchestrator.models = vec!["a".into(), "b".into(), "c".into()];
+        let mut app = make_app_with_config(cfg);
+        app.open_menu();
+
+        let (si, ii, _) = find_item(&app, "Orchestrator", "Model");
+        app.activate_menu_index(si, ii);
+        assert!(
+            matches!(app.mode, AppMode::OrchestratorModel { selected: 1 }),
+            "opens on the configured model, got {:?}",
+            app.mode
+        );
+        assert_eq!(app.orchestrator_models, vec!["a", "b", "c"]);
+    }
+
+    /// A config that never listed models — the common case — must still get a
+    /// usable picker once the endpoint answers.
+    #[test]
+    fn probed_models_populate_a_picker_that_config_left_empty() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.model = "loaded-model".into();
+        let mut app = make_app_with_config(cfg);
+        app.open_orchestrator_model_picker();
+        // Only the configured model, which is why cycling could never move.
+        assert_eq!(app.orchestrator_models, vec!["loaded-model"]);
+
+        app.handle_orchestrator_models(vec!["other-model".into(), "loaded-model".into()]);
+        assert_eq!(
+            app.orchestrator_models,
+            vec!["other-model", "loaded-model"],
+            "the endpoint's list replaces the stub"
+        );
+        assert!(
+            matches!(app.mode, AppMode::OrchestratorModel { selected: 1 }),
+            "still positioned on the model actually in use"
+        );
+    }
+
+    /// The configured model has to stay listed even when the server does not
+    /// report it, or the picker cannot get back to where it started.
+    #[test]
+    fn a_model_the_server_does_not_report_is_still_offered() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.model = "unloaded".into();
+        let mut app = make_app_with_config(cfg);
+        app.open_orchestrator_model_picker();
+        app.handle_orchestrator_models(vec!["something-else".into()]);
+        assert_eq!(app.orchestrator_models, vec!["unloaded", "something-else"]);
+        assert!(matches!(
+            app.mode,
+            AppMode::OrchestratorModel { selected: 0 }
+        ));
+    }
+
+    #[test]
+    fn selecting_a_model_edits_config_and_flags_a_restart_only_when_running() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.model = "a".into();
+        cfg.orchestrator.models = vec!["a".into(), "b".into()];
+        let mut app = make_app_with_config(cfg);
+
+        app.open_orchestrator_model_picker();
+        app.orchestrator_model_picker_select(1);
+        assert_eq!(app.config.orchestrator.model, "b");
+        // Nothing is running, so no restart is owed.
+        assert!(!app.orchestrator_config_dirty);
+
+        app.orchestrator_session_id = Some(1);
+        app.open_orchestrator_model_picker();
+        app.orchestrator_model_picker_select(0);
+        assert_eq!(app.config.orchestrator.model, "a");
+        assert!(
+            app.orchestrator_config_dirty,
+            "a running orchestrator holds a snapshot, so a restart is owed"
+        );
+    }
+
+    #[test]
+    fn a_pending_restart_row_appears_only_while_changes_are_unapplied() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.models = vec!["a".into(), "b".into()];
+        let mut app = make_app_with_config(cfg);
+        app.orchestrator_session_id = Some(1);
+        assert!(app
+            .menu()
+            .iter()
+            .flat_map(|s| &s.items)
+            .all(|i| i.label != "Restart To Apply Changes"));
+
+        app.open_orchestrator_model_picker();
+        app.orchestrator_model_picker_select(1);
+        assert!(app
+            .menu()
+            .iter()
+            .flat_map(|s| &s.items)
+            .any(|i| i.label == "Restart To Apply Changes"));
+    }
+
+    #[test]
+    fn context_budget_cycles_through_the_ladder_and_shows_a_compact_label() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.max_context_tokens = 60_000;
+        let mut app = make_app_with_config(cfg);
+        let (si, ii, item) = find_item(&app, "Orchestrator", "Context Budget");
+        assert_eq!(item.detail, "60k");
+        app.open_menu();
+        app.activate_menu_index(si, ii);
+        assert_ne!(app.config.orchestrator.max_context_tokens, 60_000);
+        // 0 means unlimited and must be reachable, so compaction can be
+        // turned off without editing the file.
+        let choices = app.config.orchestrator.context_choices();
+        assert!(choices.contains(&0));
+    }
+
+    #[test]
+    fn hand_edited_config_values_stay_reachable_when_cycling() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.model = "custom-not-in-list".into();
+        cfg.orchestrator.models = vec!["a".into(), "b".into()];
+        cfg.orchestrator.max_context_tokens = 12_345;
+        let app = make_app_with_config(cfg);
+        assert!(app
+            .config
+            .orchestrator
+            .model_choices()
+            .contains(&"custom-not-in-list".to_string()));
+        assert!(app.config.orchestrator.context_choices().contains(&12_345));
+    }
+
+    #[test]
+    fn persona_cycles_without_owing_a_restart() {
+        let mut app = make_app();
+        app.orchestrator_session_id = Some(1);
+        let (si, ii, item) = find_item(&app, "Orchestrator", "Persona");
+        assert_eq!(item.detail, "(none)");
+        app.open_menu();
+        app.activate_menu_index(si, ii);
+        assert!(
+            !app.orchestrator_persona.is_empty(),
+            "a persona became active"
+        );
+        assert!(
+            !app.orchestrator_config_dirty,
+            "personas layer over the base config and apply on the next turn"
+        );
+    }
+
+    #[test]
+    fn approval_toggles_between_auto_and_propose() {
+        let mut app = make_app();
+        let (si, ii, item) = find_item(&app, "Orchestrator", "Approval");
+        assert_eq!(item.detail, "auto");
+        app.open_menu();
+        app.activate_menu_index(si, ii);
+        assert_eq!(app.config.orchestrator.approval, "propose");
+        app.activate_menu_index(si, ii);
+        assert_eq!(app.config.orchestrator.approval, "auto");
+    }
+
+    #[test]
+    fn wake_events_toggle_individually() {
+        let mut app = make_app();
+        let (si, ii, item) = find_item(&app, "Orchestrator", "Wake on ready");
+        assert_eq!(item.detail, "off", "ready is off by default — it is costly");
+        app.open_menu();
+        app.activate_menu_index(si, ii);
+        assert!(app.config.orchestrator.events.iter().any(|e| e == "ready"));
+        assert!(
+            app.config.orchestrator.events.iter().any(|e| e == "error"),
+            "toggling one event must not disturb the others"
+        );
+        app.activate_menu_index(si, ii);
+        assert!(!app.config.orchestrator.events.iter().any(|e| e == "ready"));
+    }
+
+    #[test]
+    fn arrow_navigation_steps_over_separators() {
+        let mut app = make_app();
+        let sections = app.menu();
+        let oi = sections
+            .iter()
+            .position(|s| s.title == "Orchestrator")
+            .unwrap();
+        app.mode = AppMode::Menu {
+            selected_top: oi,
+            selected_sub: Some(0),
+        };
+        // Walk the whole section; a separator must never be the resting spot.
+        for _ in 0..sections[oi].items.len() * 2 {
+            app.menu_move_sub(1);
+            let AppMode::Menu { selected_sub, .. } = app.mode else {
+                panic!("left menu mode")
+            };
+            let idx = selected_sub.unwrap();
+            assert_ne!(
+                app.menu()[oi].items[idx].action,
+                MenuAction::Separator,
+                "parked on a separator at {}",
+                idx
+            );
+        }
+    }
+
+    // ── Planning fullscreen ───────────────────────────────────────────────
+
+    /// The key is one action: it docks the pane if it is closed rather than
+    /// being a mode that only works once something else is set up.
+    #[test]
+    fn fullscreen_docks_the_pane_if_it_is_closed_and_focuses_it() {
+        let mut app = make_app();
+        assert!(app.planning_docked.is_none());
+        app.toggle_planning_fullscreen();
+        assert!(app.planning_docked.is_some(), "docked on the way in");
+        assert!(app.planning_fullscreen);
+        assert_eq!(
+            Some(app.focused_pane),
+            app.planning_docked,
+            "fullscreen without focus would eat every key and answer none"
+        );
+    }
+
+    /// Esc steps back to the split before it starts moving focus, or keys go
+    /// to a pane hidden behind this one.
+    #[test]
+    fn esc_leaves_fullscreen_before_it_changes_focus() {
+        use crossterm::event::KeyCode;
+        let mut app = make_app();
+        app.toggle_planning_fullscreen();
+        let pane = app.planning_docked.expect("docked");
+        app.planning_key(key(KeyCode::Esc));
+        assert!(!app.planning_fullscreen);
+        assert_eq!(app.focused_pane, pane, "focus stays put on the first Esc");
+        app.planning_key(key(KeyCode::Esc));
+        assert_ne!(app.focused_pane, pane, "now it moves on");
+    }
+
+    /// Focusing away from a fullscreen planning pane has to restore the split.
+    #[test]
+    fn focusing_another_pane_drops_fullscreen() {
+        let mut app = make_app();
+        app.toggle_planning_fullscreen();
+        app.focus_next_pane();
+        assert!(!app.planning_fullscreen);
+    }
+
+    /// Closing the pane cannot leave the flag set, or the next dock comes back
+    /// fullscreen unasked.
+    #[test]
+    fn undocking_clears_fullscreen() {
+        let mut app = make_app();
+        app.toggle_planning_fullscreen();
+        app.undock_planning();
+        assert!(!app.planning_fullscreen);
+        assert!(app.planning_docked.is_none());
+    }
+
+    // ── Planning backend/model picker ─────────────────────────────────────
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    /// An endpoint is not a choice of model: the picker has to descend into
+    /// what the endpoint reported and apply the model the user lands on.
+    #[test]
+    fn picking_a_probed_model_overrides_the_configured_one() {
+        use crossterm::event::KeyCode;
+        let cfg = crate::config::parse(
+            "[planning.backends.local]\nprovider = \"lmstudio\"\nendpoint = \"http://localhost:1234/v1\"\nmodel = \"stale-from-config\"\n",
+        )
+        .unwrap();
+        let mut app = make_app_with_config(cfg);
+        // Stand in for the /v1/models probe, which is what the endpoint would
+        // have answered.
+        app.handle_planning_models(
+            "local".to_string(),
+            vec!["gemma4-26b".to_string(), "qwen3.6-27b".to_string()],
+        );
+
+        app.planning.picker = Some(0);
+        app.planning_key(key(KeyCode::Enter)); // descend into the model list
+        assert_eq!(
+            app.planning.picker_model,
+            Some(0),
+            "the configured model is not in the list, so land on the first"
+        );
+        app.planning_key(key(KeyCode::Down));
+        app.planning_key(key(KeyCode::Enter));
+
+        let b = app
+            .planning
+            .backend
+            .as_ref()
+            .expect("a backend was selected");
+        assert_eq!(b.name, "local");
+        assert_eq!(b.model, "qwen3.6-27b", "the probed model wins over config");
+        assert_eq!(app.planning.picker, None, "selecting closes the picker");
+        assert_eq!(app.planning.picker_model, None);
+    }
+
+    /// Left backs out one level instead of closing, so a wrong endpoint costs
+    /// one keypress rather than a reopen.
+    #[test]
+    fn left_returns_to_the_endpoint_list() {
+        use crossterm::event::KeyCode;
+        let mut app = make_app();
+        app.planning.picker = Some(0);
+        app.planning.picker_model = Some(1);
+        app.planning_key(key(KeyCode::Left));
+        assert_eq!(app.planning.picker_model, None);
+        assert_eq!(app.planning.picker, Some(0), "still in the picker");
+    }
+
+    /// A backend whose endpoint said nothing still has to be selectable on its
+    /// configured model, or an unreachable server locks the picker.
+    #[test]
+    fn an_unprobed_backend_is_selected_on_its_configured_model() {
+        use crossterm::event::KeyCode;
+        let cfg = crate::config::parse(
+            "[planning.backends.opus]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-8\"\n",
+        )
+        .unwrap();
+        let mut app = make_app_with_config(cfg);
+        app.planning.picker = Some(0);
+        app.planning_key(key(KeyCode::Enter));
+        assert_eq!(app.planning.picker_model, None, "nothing to descend into");
+        let b = app.planning.backend.as_ref().expect("selected anyway");
+        assert_eq!(b.model, "claude-opus-4-8");
+        assert_eq!(app.planning.picker, None);
+    }
+
+    #[test]
+    fn moving_between_sections_clamps_a_stale_submenu_index() {
+        let mut app = make_app();
+        let sections = app.menu();
+        let oi = sections
+            .iter()
+            .position(|s| s.title == "Orchestrator")
+            .unwrap();
+        let long = sections[oi].items.len();
+        app.mode = AppMode::Menu {
+            selected_top: oi,
+            selected_sub: Some(long - 1),
+        };
+        // Step to a shorter section; the index must not point past its end.
+        for _ in 0..sections.len() {
+            app.menu_move_top(1);
+            let AppMode::Menu {
+                selected_top,
+                selected_sub,
+            } = app.mode
+            else {
+                panic!("left menu mode")
+            };
+            let len = app.menu()[selected_top].items.len();
+            assert!(
+                selected_sub.unwrap() < len,
+                "stale index leaked into a shorter section"
+            );
+        }
+    }
+
+    #[test]
+    fn one_shot_actions_close_the_menu() {
+        let mut app = make_app();
+        app.open_menu();
+        let (si, ii, _) = find_item(&app, "Pipes", "List Pipes");
+        app.activate_menu_index(si, ii);
+        assert!(!matches!(app.mode, AppMode::Menu { .. }));
+    }
+
+    #[test]
+    fn out_of_range_positions_are_ignored_rather_than_firing_something_else() {
+        let mut app = make_app();
+        app.open_menu();
+        let before = app.config.orchestrator.approval.clone();
+        app.activate_menu_index(999, 999);
+        assert_eq!(app.config.orchestrator.approval, before);
+    }
+
+    #[test]
+    fn token_counts_render_compactly() {
+        assert_eq!(format_tokens(60_000), "60k");
+        assert_eq!(format_tokens(12_345), "12.3k");
+        assert_eq!(format_tokens(512), "512");
+    }
+
+    #[test]
+    fn cycle_value_recovers_from_a_value_outside_the_list() {
+        let choices: Vec<String> = vec!["a".into(), "b".into()];
+        assert_eq!(cycle_value(&choices, "a", 1), "b");
+        assert_eq!(cycle_value(&choices, "b", 1), "a");
+        assert_eq!(cycle_value(&choices, "zzz", 1), "a");
+        assert_eq!(cycle_value(&[], "keep", 1), "keep");
     }
 
     #[test]

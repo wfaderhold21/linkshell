@@ -69,6 +69,53 @@ pub enum AppEvent {
     OrchestratorContextMax {
         max: u64,
     },
+    /// A planning thread's assistant reply landed and the thread was saved.
+    PlanningReply {
+        thread_id: String,
+        text: String,
+        backend: String,
+        model: String,
+        /// Largest request the turn built, in estimated tokens. The persisted
+        /// thread does not carry tool traffic, so this is the only place the
+        /// cost of a turn that read the codebase is visible.
+        peak_tokens: usize,
+        /// Set when the reply arrived but persisting it failed — the user
+        /// should hear about that now, not on reopen.
+        save_error: Option<String>,
+    },
+    /// Models the orchestrator's endpoint reports serving, for its picker.
+    OrchestratorModels {
+        models: Vec<String>,
+    },
+    /// Progress line for the planning pane (thinking, tool calls).
+    PlanningStatus {
+        thread_id: String,
+        status: String,
+    },
+    /// A planning turn or commit failed. `draft` carries the user's unsent
+    /// text back so the pane can restore it for a retry on another backend.
+    PlanningFailed {
+        thread_id: String,
+        draft: String,
+        error: String,
+        /// True when the failure was a context-budget overflow, which offers
+        /// compact/fork rather than a plain retry.
+        overflow: bool,
+    },
+    /// Model ids a planning backend's endpoint advertises. Cached in the pane
+    /// so the picker doesn't re-probe on every open.
+    PlanningModels {
+        backend: String,
+        models: Vec<String>,
+    },
+    /// A plan revision was distilled and written to linkshell's store.
+    PlanningCommitted {
+        thread_id: String,
+        path: String,
+        revision: usize,
+        /// Files that changed since the thread read them, at commit time.
+        stale: Vec<String>,
+    },
     /// Model ID parsed from the session's JSONL log (Claude or Codex)
     SessionModel {
         session_id: usize,

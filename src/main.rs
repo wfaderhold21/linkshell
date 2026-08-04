@@ -16,6 +16,7 @@ mod opencode_log;
 mod orchestrator;
 mod patterns;
 mod pipe;
+mod planning;
 mod protocol;
 mod reattach;
 mod session;
@@ -568,6 +569,41 @@ fn handle_event(app: &mut App, event: AppEvent) {
         AppEvent::ChatReply { from, text } => {
             app.handle_chat_reply(from, text);
         }
+        AppEvent::PlanningModels { backend, models } => {
+            app.handle_planning_models(backend, models);
+        }
+        AppEvent::PlanningStatus { thread_id, status } => {
+            app.handle_planning_status(thread_id, status);
+        }
+        AppEvent::OrchestratorModels { models } => {
+            app.handle_orchestrator_models(models);
+        }
+        AppEvent::PlanningReply {
+            thread_id,
+            text,
+            backend,
+            model,
+            peak_tokens,
+            save_error,
+        } => {
+            app.handle_planning_reply(thread_id, text, backend, model, peak_tokens, save_error);
+        }
+        AppEvent::PlanningFailed {
+            thread_id,
+            draft,
+            error,
+            overflow,
+        } => {
+            app.handle_planning_failed(thread_id, draft, error, overflow);
+        }
+        AppEvent::PlanningCommitted {
+            thread_id,
+            path,
+            revision,
+            stale,
+        } => {
+            app.handle_planning_committed(thread_id, path, revision, stale);
+        }
         AppEvent::Tick => app.handle_tick(),
         AppEvent::SessionBytes { session_id, data } => {
             // High-frequency path: full-screen TUIs stream bytes continuously.
@@ -833,6 +869,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                             app.dock_chat(None);
                         }
                     }
+                    Action::PlanningFullscreen => app.toggle_planning_fullscreen(),
+                    Action::DockPlanning => {
+                        if app.planning_docked.is_some() {
+                            app.undock_planning();
+                        } else {
+                            app.dock_planning(None);
+                        }
+                    }
                     Action::SplitPaneRight => app.split_focused(layout::SplitDir::Row),
                     Action::SplitPaneDown => app.split_focused(layout::SplitDir::Col),
                     Action::ClosePane => app.close_focused_pane(),
@@ -860,6 +904,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             // Docked chat pane focused → keys drive the chat input
             if app.chat_docked == Some(app.focused_pane) {
                 app.chat_key(key);
+                return;
+            }
+            // Docked planning pane focused → keys drive the planning pane
+            if app.planning_docked == Some(app.focused_pane) {
+                app.planning_key(key);
                 return;
             }
             // Full-screen agent TUIs (claude, codex) ignore the terminal's
@@ -1040,11 +1089,34 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             _ => {}
         },
 
+        AppMode::OrchestratorModel { selected } => {
+            let len = app.orchestrator_models.len();
+            match key.code {
+                KeyCode::Up => {
+                    app.mode = AppMode::OrchestratorModel {
+                        selected: selected.saturating_sub(1),
+                    };
+                }
+                KeyCode::Down => {
+                    app.mode = AppMode::OrchestratorModel {
+                        selected: (selected + 1).min(len.saturating_sub(1)),
+                    };
+                }
+                // A local server can load a different model while linkshell
+                // runs, so the list has to be refreshable in place.
+                KeyCode::Char('r') => app.refresh_orchestrator_models(),
+                KeyCode::Enter => app.orchestrator_model_picker_select(selected),
+                KeyCode::Esc => app.mode = AppMode::Normal,
+                _ => {}
+            }
+            app.needs_redraw = true;
+        }
+
         AppMode::Help | AppMode::CommandResult => {
             app.mode = AppMode::Normal; // any key dismisses
         }
 
-        AppMode::Menu { .. } => {
+        AppMode::Menu { selected_sub, .. } => {
             if app.keymap.get(&(key.modifiers, key.code)) == Some(&Action::OpenMenu) {
                 app.mode = AppMode::Normal;
                 return;
@@ -1052,37 +1124,26 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             match key.code {
                 KeyCode::Left => app.menu_move_top(-1),
                 KeyCode::Right => app.menu_move_top(1),
-                KeyCode::Down => app.menu_open_submenu(),
-                KeyCode::Up => app.menu_close_submenu(),
+                // The first Down drops into the section; subsequent ones walk
+                // it. Up walks back and pops out at the top row.
+                KeyCode::Down => {
+                    if selected_sub.is_some() {
+                        app.menu_move_sub(1)
+                    } else {
+                        app.menu_open_submenu()
+                    }
+                }
+                KeyCode::Up => match selected_sub {
+                    Some(0) | None => app.menu_close_submenu(),
+                    Some(_) => app.menu_move_sub(-1),
+                },
                 KeyCode::Enter => app.execute_selected_menu_action(),
                 KeyCode::Esc => app.mode = AppMode::Normal,
-                KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                    's' => {
-                        app.mode = AppMode::Menu {
-                            selected_top: 0,
-                            selected_sub: Some(0),
-                        }
-                    }
-                    'v' => {
-                        app.mode = AppMode::Menu {
-                            selected_top: 1,
-                            selected_sub: Some(0),
-                        }
-                    }
-                    'p' => {
-                        app.mode = AppMode::Menu {
-                            selected_top: 2,
-                            selected_sub: Some(0),
-                        }
-                    }
-                    'h' => {
-                        app.mode = AppMode::Menu {
-                            selected_top: 3,
-                            selected_sub: Some(0),
-                        }
-                    }
-                    _ => {}
-                },
+                // Mnemonics come from the live section titles, so adding or
+                // reordering a section cannot silently steal another's letter.
+                KeyCode::Char(c) => {
+                    app.menu_jump_to_mnemonic(c);
+                }
                 _ => {}
             }
         }
