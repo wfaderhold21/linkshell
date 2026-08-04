@@ -792,10 +792,21 @@ pub struct GeneralConfig {
     pub tick_interval_ms: u64,
     pub ipc_state_override_timeout_secs: u64,
     pub menu_key: String,
-    /// "overlay" (default): the status panel is an alt-s overlay, and the
-    /// rows it used to occupy go to the output pane. "docked": it is always
-    /// on, in a region below the output, as it used to be.
+    /// Where the status panel lives:
+    ///
+    /// - "left" (default) — a permanent sidebar beside the output. Costs
+    ///   columns instead of rows, and unlike the bottom region it has the
+    ///   full terminal height, so it doesn't run out of room at 4 sessions.
+    /// - "bottom" — the always-on region below the output.
+    /// - "overlay" — not docked; alt-s opens it centered over the output.
+    /// - "off" — never shown.
+    ///
+    /// In "left" and "bottom", alt-s hides and shows the panel at runtime.
     pub status_panel: String,
+    /// Columns claimed by the left sidebar. Below `status_panel_width` +
+    /// 60 columns of terminal the sidebar collapses to a rail (see
+    /// `ui::SIDEBAR_RAIL_COLS`) rather than starving the output pane.
+    pub status_panel_width: u16,
 }
 
 impl Default for GeneralConfig {
@@ -806,7 +817,8 @@ impl Default for GeneralConfig {
             tick_interval_ms: 100,
             ipc_state_override_timeout_secs: 60,
             menu_key: "ctrl+space".to_string(),
-            status_panel: "overlay".to_string(),
+            status_panel: "left".to_string(),
+            status_panel_width: 28,
         }
     }
 }

@@ -224,6 +224,28 @@ impl SettingsState {
     }
 }
 
+/// Where the status panel lives. See `[general] status_panel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPlacement {
+    Left,
+    Bottom,
+    Overlay,
+    Off,
+}
+
+impl StatusPlacement {
+    /// Unknown values fall back to the default rather than failing: a typo in
+    /// one optional cosmetic key should not stop linkshell starting.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bottom" | "docked" => Self::Bottom,
+            "overlay" => Self::Overlay,
+            "off" | "none" | "hidden" => Self::Off,
+            _ => Self::Left,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeGlyph {
     pub outgoing: bool,
@@ -546,6 +568,10 @@ pub struct App {
     status_rows_hold_at: std::cell::Cell<Option<std::time::Instant>>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub config: Arc<Config>,
+    /// Runtime alt-s state for a docked panel. Not persisted: the config
+    /// says where the panel lives, this says whether you have tucked it away
+    /// for the moment.
+    pub status_hidden: bool,
     /// Every colour the UI draws with. Lives on App because each `draw_*` fn
     /// already takes `&App`, so the palette is a field access rather than a
     /// parameter threaded through forty signatures.
@@ -697,6 +723,7 @@ impl App {
             status_rows_hold: std::cell::Cell::new(0),
             status_rows_hold_at: std::cell::Cell::new(None),
             event_tx,
+            status_hidden: false,
             theme: Theme::resolve(&config.theme),
             config,
             pipes: Vec::new(),
@@ -1434,16 +1461,29 @@ impl App {
     /// (codex repaints re-triggering WAITING↔RUNNING) adds and removes its
     /// waiting-preview row every few hundred ms; each change resizes the
     /// output panes, the resized TUI repaints, the repaint re-flaps the
-    /// state, and the whole UI oscillates.
-    /// Whether the status panel is always-on in its own region rather than
-    /// an alt-s overlay.
-    pub fn status_docked(&self) -> bool {
-        self.config
-            .general
-            .status_panel
-            .eq_ignore_ascii_case("docked")
+    /// Where the status panel is configured to live.
+    pub fn status_placement(&self) -> StatusPlacement {
+        StatusPlacement::parse(&self.config.general.status_panel)
     }
 
+    /// Whether the panel occupies a region of the layout right now — docked
+    /// *and* not hidden. Callers use this to decide whether to reserve rows
+    /// or columns for it.
+    pub fn status_docked(&self) -> bool {
+        !self.status_hidden
+            && matches!(
+                self.status_placement(),
+                StatusPlacement::Left | StatusPlacement::Bottom
+            )
+    }
+
+    /// Status-panel height with shrink hysteresis. Growing applies
+    /// immediately; shrinking only after the smaller height has been desired
+    /// for a few seconds. Without this, a session whose inferred state flaps
+    /// (codex repaints re-triggering WAITING↔RUNNING) adds and removes its
+    /// waiting-preview row every few hundred ms; each change resizes the
+    /// output panes, the resized TUI repaints, the repaint re-flaps the
+    /// state, and the whole UI oscillates.
     pub fn stabilized_status_rows(&self, desired: u16) -> u16 {
         const HOLD: std::time::Duration = std::time::Duration::from_secs(3);
         let held = self.status_rows_hold.get();
@@ -5301,18 +5341,22 @@ pub struct MenuSection {
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
 impl App {
-    /// alt-s. A no-op when the panel is docked: it is already on screen, and
-    /// opening an overlay copy of it would be answering a question nobody
-    /// asked.
+    /// alt-s. For a docked panel this hides and shows it in place; for the
+    /// overlay placement it opens and closes the overlay. `off` means off.
     pub fn toggle_status_panel(&mut self) {
-        if self.status_docked() {
-            return;
+        match self.status_placement() {
+            StatusPlacement::Left | StatusPlacement::Bottom => {
+                self.status_hidden = !self.status_hidden;
+            }
+            StatusPlacement::Overlay => {
+                self.mode = if matches!(self.mode, AppMode::Status) {
+                    AppMode::Normal
+                } else {
+                    AppMode::Status
+                };
+            }
+            StatusPlacement::Off => {}
         }
-        self.mode = if matches!(self.mode, AppMode::Status) {
-            AppMode::Normal
-        } else {
-            AppMode::Status
-        };
     }
 
     pub fn toggle_chat(&mut self) {

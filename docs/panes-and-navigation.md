@@ -84,37 +84,69 @@ Mouse text selection works everywhere: drag to select, auto-copies to clipboard.
 
 ## Status panel
 
-`alt-s` opens the status panel; `esc` closes it. Each session gets two lines:
+A permanent sidebar down the left, on by default. `alt-s` tucks it away and
+brings it back.
 
 ```
- ● alpha          THINKING     1m32s      ~450         18.0k/180k    $0.02
-     opus-4-8 · ~/src/linkshell · → beta · ← gamma
+ Status                    │▎ ● alpha · ~/src/linkshell
+ ● alpha            1m32s  │▎ $ cargo test
+   READY       18.0k/180k  │▎
+   opus-4-8         $0.31  │▎
+                           │▎
+ ! beta               12s  │▎
+   WAITING           2.1k  │▎
+   sonnet-5         $0.04  │▎
+                           │
+ 2 sess            $0.35   │
 ```
 
-The first line is the vitals; the second is the identity — model, working
-directory, and which sessions this one is piped to (`→`) or from (`←`). Pipe
-direction is new here: the old column table had a fixed 20-column cell that
-truncated a second peer out of existence. Column separators are gone; the
-numbers are padded to fixed widths instead, which removes the class of drift
-that made them wander out of alignment. Clicking a row focuses that session.
+Each session is a stacked block: name and elapsed, state and context, then
+model and cost. A session with no model (a shell) shows its working directory
+instead — the thing that actually distinguishes it from the shell in the next
+pane. Clicking a block focuses that session.
+
+The sidebar costs **columns instead of rows**, which is the better trade on a
+wide terminal, and it has the full column height — so unlike the bottom
+region it doesn't run out of room at four sessions.
+
+### When the terminal is narrow
+
+Below `status_panel_width + 60` columns the sidebar collapses to a
+three-column rail rather than starving the output pane:
+
+```
+●1 ▎ ● alpha · ~/src/linkshell
+!2 ▎ $ cargo test
+✕3 ▎
+```
+
+State still reaches you — which agent needs you is the sidebar's real job, and
+a glyph plus an index still does it.
+
+### Placement
+
+```toml
+[general]
+status_panel = "left"       # "left" (default) | "bottom" | "overlay" | "off"
+status_panel_width = 28     # columns for the sidebar
+```
+
+- **`left`** — the sidebar above.
+- **`bottom`** — the always-on region below the output, in two-line rows.
+  Its height is capped at a third of the terminal, so past four sessions it
+  drops the detail line to keep every session visible.
+- **`overlay`** — not docked; `alt-s` opens it centered over the output, which
+  costs no layout space and resizes no PTY.
+- **`off`** — never shown, and `alt-s` does nothing.
+
+In `left` and `bottom`, `alt-s` hides and restores the panel. Note that this
+resizes the sessions' PTYs, as any docked panel must; `overlay` is the
+placement that never does.
 
 Token counts and cost come from the JSONL logs written by Claude and Codex —
 not from screen scraping. Shell and custom sessions show `—`. On Pro/Max
 subscriptions, linkshell detects the subscription and shows real token counts
 while skipping meaningless cost.
-
-The panel is an overlay by default, so opening it costs no output rows and
-resizes no PTY. To get the always-on panel back:
-
-```toml
-[general]
-status_panel = "docked"   # "overlay" (default) | "docked"
-```
-
-A docked panel takes its rows from the output pane, and two-line rows take
-twice as many. Past four sessions it drops the detail line rather than showing
-fewer sessions — the detail is still in the overlay, one keystroke away. With
-the panel docked, `alt-s` does nothing: it is already on screen.
 
 ## Keybindings
 
@@ -123,7 +155,7 @@ the panel docked, `alt-s` does nothing: it is already on screen.
 | `alt-n` | New session dialog |
 | `alt-c` | Open command bar |
 | `alt-t` | Toggle agent chat pane |
-| `alt-s` | Toggle status panel (overlay mode) |
+| `alt-s` | Show/hide the status panel |
 | `alt-h` | Toggle help |
 | `alt-x` | Kill active session |
 | `alt-d` | Detach (sessions keep running) |

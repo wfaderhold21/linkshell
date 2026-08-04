@@ -6,7 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, FileBrowserState, MenuAction, NewSessionField, Selection};
+use crate::app::{
+    App, AppMode, FileBrowserState, MenuAction, NewSessionField, Selection, StatusPlacement,
+};
 use crate::layout::LayoutTree;
 use crate::session::{SessionKind, SessionState};
 use crate::theme::Theme;
@@ -157,13 +159,16 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     } else {
         0
     };
-    // Overlay mode is the default and claims no rows at all: the panel is
-    // drawn over the output, so opening it resizes no PTY. Docked mode keeps
-    // the region — and with two-line rows it wants twice the height, which
-    // the height/3 cap reaches sooner; `draw_status_panel` drops the detail
-    // line past four sessions rather than showing half the sessions.
-    let docked = app.status_docked();
-    let status_rows = if docked {
+    // The left sidebar (the default) takes columns from the output rather
+    // than rows, so it claims none of the vertical budget.
+    let sidebar = sidebar_width(app, body.width);
+    // The bottom region: two-line rows want twice the height, which the
+    // height/3 cap reaches sooner, so `draw_status_panel` drops the detail
+    // line past four sessions rather than showing half the sessions. The
+    // sidebar has no such cap — it gets the whole column — which is the main
+    // reason it is the default.
+    let bottom_docked = app.status_docked() && app.status_placement() == StatusPlacement::Bottom;
+    let status_rows = if bottom_docked {
         let rows_per_session = if app.visible_indices().len() <= 4 {
             2
         } else {
@@ -183,11 +188,25 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
         .constraints([
             Constraint::Length(1),           // tab strip
             Constraint::Length(1),           // rule
-            Constraint::Min(5),              // main output
-            Constraint::Length(status_rows), // status panel
+            Constraint::Min(5),              // middle: sidebar + output
+            Constraint::Length(status_rows), // bottom status region
             Constraint::Length(1),           // footer
         ])
         .split(body);
+
+    // The tab strip and footer stay full width — they are chrome for the
+    // whole window, not for the output pane — so only the middle band is
+    // split for the sidebar.
+    let (sidebar_area, output_region) = match sidebar {
+        Some(w) if w > 0 && chunks[2].width > w => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(w), Constraint::Min(1)])
+                .split(chunks[2]);
+            (Some(cols[0]), cols[1])
+        }
+        _ => (None, chunks[2]),
+    };
 
     let mut chat_area = Rect::default();
     let mut chat_layout = ChatLayout::default();
@@ -197,12 +216,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     // planning against remain visible and their state keeps updating.
     let planning_fullscreen = app.planning_fullscreen && app.planning_docked.is_some();
     let output_areas = if planning_fullscreen {
-        draw_planning_in(f, app, chunks[2], true);
+        draw_planning_in(f, app, output_region, true);
         // No pane rects: hit-testing must find nothing where no session was
         // drawn, and the PTYs keep the size they last laid out at.
         Vec::new()
     } else {
-        split_output_areas(chunks[2], &app.tree)
+        split_output_areas(output_region, &app.tree)
     };
     for (pane_idx, area) in output_areas.iter().copied().enumerate() {
         if app.chat_docked == Some(pane_idx) && output_areas.len() > 1 {
@@ -216,7 +235,11 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> LayoutInfo {
     }
     let slot_areas = draw_tab_strip(f, app, chunks[0]);
     draw_rule(f, &app.theme, chunks[1]);
-    let mut status_row_areas = draw_status_panel(f, app, chunks[3], docked);
+    let mut status_row_areas = if let Some(area) = sidebar_area {
+        draw_status_sidebar(f, app, area)
+    } else {
+        draw_status_panel(f, app, chunks[3], bottom_docked)
+    };
     draw_footer(f, app, chunks[4]);
 
     // ── Overlays ───────────────────────────────────────────────────────────
@@ -1078,6 +1101,313 @@ fn status_title(app: &App) -> String {
         ),
         None => " Status ".to_string(),
     }
+}
+
+// ── Status sidebar ─────────────────────────────────────────────────────────
+
+/// Columns the rail falls back to when the terminal can't afford the full
+/// sidebar: a state glyph and an index per session, and nothing else.
+pub const SIDEBAR_RAIL_COLS: u16 = 3;
+
+/// Columns the output pane must keep before the sidebar gives way to the
+/// rail. Below this a split pane stops being usable for anything.
+const MIN_OUTPUT_COLS: u16 = 60;
+
+/// How wide the sidebar should actually be drawn, given the terminal width.
+///
+/// Returns `None` when the panel isn't docked to the left at all. The rail is
+/// what makes "permanently there" survive a narrow terminal: the sidebar's
+/// job is to tell you which agent needs you, and a glyph plus an index still
+/// does that in three columns.
+pub fn sidebar_width(app: &App, total_width: u16) -> Option<u16> {
+    if !app.status_docked() || app.status_placement() != StatusPlacement::Left {
+        return None;
+    }
+    let want = app.config.general.status_panel_width.clamp(16, 60);
+    if total_width.saturating_sub(want) >= MIN_OUTPUT_COLS {
+        Some(want)
+    } else {
+        Some(SIDEBAR_RAIL_COLS)
+    }
+}
+
+/// The rail: one row per session, `●1` / `!3` / `✕4`.
+fn draw_status_rail(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+    let t = &app.theme;
+    let mut rects = Vec::new();
+    for (i, &idx) in app.visible_indices().iter().enumerate() {
+        let y = area.y + i as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        let session = &app.sessions[idx];
+        let (glyph, style) = match tab_marker(t, session) {
+            Some((glyph, style)) => (glyph, style),
+            None => (
+                "●",
+                Style::default().fg(if app.active_idx() == Some(idx) {
+                    t.accent
+                } else {
+                    t.ok
+                }),
+            ),
+        };
+        let row = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(glyph, style),
+                Span::styled(format!("{}", i + 1), Style::default().fg(t.text_dim)),
+            ])),
+            row,
+        );
+        rects.push(row);
+    }
+    rects
+}
+
+/// One session as a stacked block, for the sidebar's narrow column:
+///
+/// ```text
+///  ● alpha           1m32s
+///    READY      18.0k/180k
+///    opus-4-8        $0.31
+/// ```
+///
+/// The horizontal row the bottom panel uses needs 70 columns; restacking is
+/// what makes the panel affordable as a sidebar at all.
+fn sidebar_block(
+    app: &App,
+    session: &crate::session::Session,
+    width: usize,
+    lines: usize,
+) -> Vec<Line<'static>> {
+    let t = &app.theme;
+    let active = app.active_session().is_some_and(|s| s.id == session.id);
+    let (glyph, glyph_style) = match tab_marker(t, session) {
+        Some((glyph, style)) => (glyph, style),
+        None => (
+            "●",
+            Style::default().fg(if active { t.accent } else { t.ok }),
+        ),
+    };
+    let state_style = if session.paused {
+        Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)
+    } else {
+        match session.state {
+            SessionState::Waiting => Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+            SessionState::Error => Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+            SessionState::Thinking => Style::default().fg(t.kind_claude),
+            SessionState::Running => Style::default().fg(t.ok),
+            _ => Style::default().fg(t.text_dim),
+        }
+    };
+
+    // Each line is a left field and a right field, with the gap between them
+    // doing the aligning — the sidebar is too narrow for fixed columns.
+    let pair = |left: Span<'static>, right: Span<'static>| -> Line<'static> {
+        let used = left.content.chars().count() + right.content.chars().count() + 1;
+        let gap = width.saturating_sub(used).max(1);
+        Line::from(vec![
+            Span::raw(" "),
+            left,
+            Span::raw(" ".repeat(gap)),
+            right,
+        ])
+    };
+
+    let name_width = width.saturating_sub(session.elapsed_display().chars().count() + 4);
+    let mut out = vec![pair(
+        Span::styled(
+            format!("{glyph} {}", ellipsize(&session.name, name_width.max(4))),
+            if active {
+                Style::default()
+                    .fg(t.text_bright)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                glyph_style
+            },
+        ),
+        Span::styled(session.elapsed_display(), Style::default().fg(t.text_dim)),
+    )];
+    if lines >= 2 {
+        out.push(pair(
+            Span::styled(format!("  {}", session.state_label()), state_style),
+            Span::styled(session.context_display(), Style::default().fg(t.ctx)),
+        ));
+    }
+    if lines >= 3 {
+        // A shell has no model and no cost, and a line reading "-    —" is a
+        // line spent saying nothing. Its working directory is the identity
+        // that actually distinguishes it from the shell in the next pane.
+        let cost = session.cost_display();
+        let left = match session.model.as_deref() {
+            Some(model) => model_display(Some(model)),
+            None => contract_home(std::path::Path::new(&session.cwd)),
+        };
+        let room = width.saturating_sub(cost.chars().count() + 4);
+        out.push(pair(
+            Span::styled(
+                format!("  {}", ellipsize(&left, room.max(4))),
+                Style::default().fg(t.text_dim),
+            ),
+            Span::styled(
+                if cost == "—" { String::new() } else { cost },
+                Style::default().fg(t.cost),
+            ),
+        ));
+    }
+    out
+}
+
+/// The left sidebar. Returns one click rect per visible session, on each
+/// block's first line, in `visible_indices` order.
+fn draw_status_sidebar(f: &mut Frame<'_>, app: &App, area: Rect) -> Vec<Rect> {
+    let t = &app.theme;
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    if area.width <= SIDEBAR_RAIL_COLS {
+        return draw_status_rail(f, app, area);
+    }
+
+    let visible = app.visible_indices();
+    // A rule down the right edge separates the sidebar from the output; the
+    // output pane draws its own focus bar just past it.
+    for y in area.y..area.y + area.height {
+        f.render_widget(
+            Paragraph::new(Span::styled("│", Style::default().fg(t.chrome))),
+            Rect {
+                x: area.x + area.width - 1,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    let inner = Rect {
+        width: area.width - 1,
+        ..area
+    };
+
+    // Two rows of chrome: the title and the totals footer.
+    let budget = inner.height.saturating_sub(2) as usize;
+    let n = visible.len().max(1);
+    // Pick the tallest block that fits, down to a single line. Unlike the
+    // bottom panel there is no height/3 cap to fight — a sidebar has the
+    // whole column, which is the main reason it holds more sessions.
+    let (lines, gap) = if n * 4 <= budget {
+        (3usize, 1usize)
+    } else if n * 3 <= budget {
+        (3, 0)
+    } else if n * 2 <= budget {
+        (2, 0)
+    } else {
+        (1, 0)
+    };
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!(
+                " {}",
+                ellipsize(status_title(app).trim(), inner.width as usize - 1)
+            ),
+            Style::default()
+                .fg(t.text_bright)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect { height: 1, ..inner },
+    );
+
+    let mut rects = Vec::new();
+    let mut y = inner.y + 1;
+    let last = inner.y + inner.height - 1;
+    for &idx in &visible {
+        if y >= last {
+            break;
+        }
+        let session = &app.sessions[idx];
+        let block = sidebar_block(app, session, inner.width as usize - 1, lines);
+        let first = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        for line in block {
+            if y >= last {
+                break;
+            }
+            f.render_widget(
+                Paragraph::new(line),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+            y += 1;
+        }
+        rects.push(first);
+        y += gap as u16;
+    }
+
+    if let Some(o) = orchestrator_row(app) {
+        if y < last {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!(" {} ", o.dot), o.dot_style),
+                    Span::styled(
+                        ellipsize(&o.name, inner.width as usize / 2),
+                        Style::default()
+                            .fg(t.kind_orch)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {}", o.state), o.state_style),
+                ])),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    // Totals on the last row.
+    let total_cost: f64 = visible
+        .iter()
+        .map(|&i| app.sessions[i].stats.total_cost_usd)
+        .sum();
+    let mut footer = vec![Span::styled(
+        format!(" {} sess", visible.len()),
+        Style::default().fg(t.text_dim),
+    )];
+    if total_cost > 0.0 {
+        let cost = format!("${total_cost:.2}");
+        let used = 6 + visible.len().to_string().len() + cost.chars().count() + 1;
+        footer.push(Span::raw(
+            " ".repeat((inner.width as usize).saturating_sub(used).max(1)),
+        ));
+        footer.push(Span::styled(cost, Style::default().fg(t.cost)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(footer)),
+        Rect {
+            x: inner.x,
+            y: last,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    rects
 }
 
 /// The status panel, in either of its two modes.
@@ -3556,16 +3886,16 @@ mod tests {
 
         assert_eq!(text[0], "", "no sessions: the strip is blank");
         assert_eq!(text[1], "─".repeat(60));
-        assert_eq!(text[2], "▎ ● linkshell");
-        assert_eq!(text[3], "▎ No sessions. Press alt-n to create one.");
+        assert_eq!(text[2], "   ▎ ● linkshell", "rail (empty) then the pane");
+        assert_eq!(text[3], "   ▎ No sessions. Press alt-n to create one.");
         // The pane runs to the footer: no bottom border, and in the default
         // overlay mode the status panel claims no rows either.
-        assert_eq!(text[13], "▎");
+        assert_eq!(text[13], "   ▎");
         assert_eq!(text[14], " no session — alt-n to create one");
 
         let t = Theme::classic();
         assert_eq!(rows[1].1[0], t.chrome, "the rule is chrome");
-        assert_eq!(rows[2].1[0], t.accent, "the focused pane's bar");
+        assert_eq!(rows[2].1[3], t.accent, "the focused pane's bar");
     }
 
     fn app_with_sessions(names: &[&str]) -> App {
@@ -3766,7 +4096,7 @@ mod tests {
         let mut app = app_with_sessions(&["alpha"]);
         app.sessions[0].cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()) + "/src";
         let rows = render_rows(&app, 60, 15);
-        assert_eq!(rows[2].0, "▎ ● alpha · ~/src");
+        assert_eq!(rows[2].0, "●1 ▎ ● alpha · ~/src", "rail, then the pane");
     }
 
     // ── Status panel ──────────────────────────────────────────────────────
@@ -3777,7 +4107,7 @@ mod tests {
     /// output; the pane rects must be identical open and closed.
     #[test]
     fn opening_the_overlay_does_not_resize_any_pane() {
-        let mut app = app_with_sessions(&["alpha", "beta"]);
+        let mut app = placed_app("overlay", &["alpha", "beta"]);
         let closed = layout_of(&app, 80, 30).output_areas;
         app.toggle_status_panel();
         assert!(matches!(app.mode, AppMode::Status));
@@ -3796,9 +4126,11 @@ mod tests {
         layout
     }
 
-    fn docked_app(names: &[&str]) -> App {
+    /// An app with the status panel placed explicitly, rather than at the
+    /// `left` default.
+    fn placed_app(placement: &str, names: &[&str]) -> App {
         let mut config = crate::config::Config::default();
-        config.general.status_panel = "docked".into();
+        config.general.status_panel = placement.into();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut app = App::new(tx, std::sync::Arc::new(config));
         for name in names {
@@ -3808,9 +4140,13 @@ mod tests {
         app
     }
 
+    fn docked_app(names: &[&str]) -> App {
+        placed_app("bottom", names)
+    }
+
     #[test]
     fn overlay_mode_gives_its_rows_back_to_the_output_pane() {
-        let overlay = app_with_sessions(&["alpha", "beta"]);
+        let overlay = placed_app("overlay", &["alpha", "beta"]);
         let docked = docked_app(&["alpha", "beta"]);
         let overlay_h = layout_of(&overlay, 80, 30).output_areas[0].height;
         let docked_h = layout_of(&docked, 80, 30).output_areas[0].height;
@@ -3835,7 +4171,7 @@ mod tests {
 
     #[test]
     fn the_overlay_shows_two_lines_per_session_with_model_and_cwd() {
-        let mut app = app_with_sessions(&["alpha"]);
+        let mut app = placed_app("overlay", &["alpha"]);
         app.sessions[0].model = Some("claude-opus-4-8".into());
         app.sessions[0].cwd = "/tmp/work".into();
         app.mode = AppMode::Status;
@@ -3854,7 +4190,7 @@ mod tests {
 
     #[test]
     fn the_detail_line_names_pipe_peers_in_both_directions() {
-        let mut app = app_with_sessions(&["alpha", "beta", "gamma"]);
+        let mut app = placed_app("overlay", &["alpha", "beta", "gamma"]);
         for (source, dest) in [(0, 1), (2, 0)] {
             app.pipes.push(crate::pipe::Pipe {
                 source,
@@ -3900,17 +4236,139 @@ mod tests {
     #[test]
     fn click_to_focus_works_in_both_modes() {
         for mut app in [
-            app_with_sessions(&["alpha", "beta"]),
+            placed_app("overlay", &["alpha", "beta"]),
             docked_app(&["alpha", "beta"]),
+            app_with_sessions(&["alpha", "beta"]),
         ] {
             if !app.status_docked() {
                 app.mode = AppMode::Status;
             }
-            let layout = layout_of(&app, 80, 30);
+            let layout = layout_of(&app, 120, 30);
             assert_eq!(layout.status_row_areas.len(), 2);
             let second = layout.status_row_areas[1];
             assert!(second.height == 1 && second.width > 0);
         }
+    }
+
+    // ── Status sidebar ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_sidebar_is_on_by_default_and_stacks_each_session() {
+        let mut app = app_with_sessions(&["alpha", "beta"]);
+        app.sessions[0].model = Some("claude-opus-4-8".into());
+        app.sessions[0].stats.context_tokens = 18_000;
+        app.sessions[0].context_max = 180_000;
+        let rows: Vec<String> = render_rows(&app, 120, 30)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let body = rows.join("\n");
+        assert!(body.contains("alpha"), "{body}");
+        assert!(body.contains("READY"), "{body}");
+        assert!(body.contains("opus-4-8"), "{body}");
+        assert!(body.contains("18.0k/180.0k"), "{body}");
+        assert!(body.contains("2 sess"), "totals: {body}");
+    }
+
+    /// The whole reason the sidebar beats the bottom region: it has the full
+    /// column height, so it does not hit a height/3 cap at four sessions.
+    #[test]
+    fn the_sidebar_holds_every_session_where_the_bottom_region_could_not() {
+        // 24 rows: the bottom region's height/3 cap leaves it 6 usable rows,
+        // the sidebar has the whole column.
+        let app = app_with_sessions(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let layout = layout_of(&app, 120, 24);
+        assert_eq!(layout.status_row_areas.len(), 8);
+
+        let bottom = docked_app(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let bottom_rows = layout_of(&bottom, 120, 24).status_row_areas.len();
+        assert!(
+            bottom_rows < 8,
+            "the bottom region was expected to run out of rows, showed {bottom_rows}"
+        );
+    }
+
+    /// "Permanently there" has to survive a narrow terminal, and the panel's
+    /// job — which agent needs you — still fits in three columns.
+    #[test]
+    fn a_narrow_terminal_collapses_the_sidebar_to_a_rail() {
+        let mut app = app_with_sessions(&["alpha", "beta", "gamma"]);
+        app.sessions[1].state = SessionState::Waiting;
+        app.sessions[2].state = SessionState::Error;
+
+        assert_eq!(sidebar_width(&app, 120), Some(28), "wide: full sidebar");
+        assert_eq!(
+            sidebar_width(&app, 80),
+            Some(SIDEBAR_RAIL_COLS),
+            "narrow: rail"
+        );
+        // The threshold is where the output pane would drop under 60 columns.
+        assert_eq!(sidebar_width(&app, 88), Some(28));
+        assert_eq!(sidebar_width(&app, 87), Some(SIDEBAR_RAIL_COLS));
+
+        let rows: Vec<String> = render_rows(&app, 80, 20)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        // State still reaches you: the marker glyph survives the collapse.
+        let rail = |row: &str| row.chars().take(2).collect::<String>();
+        assert_eq!(rail(&rows[2]), "●1");
+        assert_eq!(rail(&rows[3]), "!2");
+        assert_eq!(rail(&rows[4]), "✕3");
+    }
+
+    #[test]
+    fn alt_s_hides_and_restores_a_docked_panel() {
+        for placement in ["left", "bottom"] {
+            let mut app = placed_app(placement, &["alpha"]);
+            let shown = layout_of(&app, 120, 30).output_areas[0];
+
+            app.toggle_status_panel();
+            assert!(app.status_hidden, "{placement}");
+            let hidden = layout_of(&app, 120, 30).output_areas[0];
+            assert!(
+                hidden.width > shown.width || hidden.height > shown.height,
+                "{placement}: hiding should give the space back"
+            );
+
+            app.toggle_status_panel();
+            assert!(!app.status_hidden);
+            assert_eq!(layout_of(&app, 120, 30).output_areas[0], shown);
+        }
+    }
+
+    #[test]
+    fn status_panel_off_never_renders_and_alt_s_does_nothing() {
+        let mut app = placed_app("off", &["alpha"]);
+        let body = render_rows(&app, 120, 30)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!body.contains("Status"), "{body}");
+        assert!(!body.contains("sess"), "{body}");
+
+        app.toggle_status_panel();
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(!app.status_hidden);
+    }
+
+    #[test]
+    fn an_unknown_placement_falls_back_to_the_default() {
+        let app = placed_app("sideways", &["alpha"]);
+        assert_eq!(app.status_placement(), StatusPlacement::Left);
+    }
+
+    /// The sidebar takes columns from the output, so the PTY must be sized
+    /// to what is left — the same three-way agreement the pane chrome has.
+    #[test]
+    fn the_sidebar_narrows_the_pty_by_exactly_its_width() {
+        let with = app_with_sessions(&["alpha"]);
+        let without = placed_app("off", &["alpha"]);
+        let a = pane_content_area(layout_of(&with, 120, 30).output_areas[0]);
+        let b = pane_content_area(layout_of(&without, 120, 30).output_areas[0]);
+        assert_eq!(b.width - a.width, 28);
+        assert_eq!(a.height, b.height, "the sidebar costs no rows");
     }
 
     // ── Footer ────────────────────────────────────────────────────────────
@@ -3927,7 +4385,7 @@ mod tests {
         let (text, _) = footer_row(&app, 80);
         assert!(text.starts_with(" alpha · opus-4-8"), "{text:?}");
         assert!(text.contains("READY"), "{text:?}");
-        assert!(text.contains("alt-s status"), "{text:?}");
+        assert!(text.contains("alt-h help"), "{text:?}");
     }
 
     #[test]
@@ -3986,7 +4444,7 @@ mod tests {
     fn the_hint_is_shed_before_the_cost_and_the_cost_before_the_state() {
         let mut app = app_with_sessions(&["alpha"]);
         app.sessions[0].stats.total_cost_usd = 1.25;
-        assert!(footer_row(&app, 80).0.contains("alt-s status"));
+        assert!(footer_row(&app, 80).0.contains("alt-h help"));
 
         let (text, _) = footer_row(&app, 34);
         assert!(
