@@ -4691,19 +4691,25 @@ impl App {
                 return;
             }
             let cur = selected_sub.unwrap_or(0) as i32;
-            // Separators are not landable; step past them in the direction of
-            // travel so arrow keys never park on a divider.
+            // Step past anything that cannot be landed on, in the direction of
+            // travel. Disabled rows count: the renderer draws them dim and
+            // never highlights them, so parking on one loses the cursor
+            // entirely — you cannot see where you are or act on it.
             let step = if delta >= 0 { 1 } else { -1 };
             let mut next = (cur + delta).rem_euclid(count);
+            let mut found = false;
             for _ in 0..count {
-                if section.items[next as usize].action != MenuAction::Separator {
+                if section.items[next as usize].is_selectable() {
+                    found = true;
                     break;
                 }
                 next = (next + step).rem_euclid(count);
             }
             self.mode = AppMode::Menu {
                 selected_top,
-                selected_sub: Some(next as usize),
+                // A section with nothing selectable leaves focus on the menu
+                // bar rather than on an invisible selection.
+                selected_sub: found.then_some(next as usize),
             };
         }
     }
@@ -4717,6 +4723,19 @@ impl App {
             // Land on the first selectable row.
             self.menu_move_sub(0);
         }
+    }
+
+    /// Index of the first row in the open section that can be landed on.
+    /// `Up` pops back to the menu bar here rather than wrapping to the
+    /// bottom, which is what "the top of the list" means to someone holding
+    /// the key down — the literal index 0 may be a separator or disabled.
+    pub fn menu_first_selectable(&self) -> Option<usize> {
+        if let AppMode::Menu { selected_top, .. } = self.mode {
+            let sections = self.menu();
+            let section = sections.get(selected_top)?;
+            return section.items.iter().position(|i| i.is_selectable());
+        }
+        None
     }
 
     pub fn menu_close_submenu(&mut self) {
@@ -5341,6 +5360,13 @@ impl MenuItem {
     fn enabled_if(mut self, cond: bool) -> MenuItem {
         self.enabled = cond;
         self
+    }
+
+    /// Whether arrow keys may land on this row. Separators are structure and
+    /// disabled rows cannot be acted on; both are rendered without a
+    /// highlight, so selecting one makes the cursor vanish.
+    pub fn is_selectable(&self) -> bool {
+        self.enabled && self.action != MenuAction::Separator
     }
 
     /// Rendered width needed for label plus detail.
@@ -7720,6 +7746,95 @@ mod tests {
             .position(|i| i.label == label)
             .unwrap_or_else(|| panic!("no {} item in {}", label, section));
         (si, ii, sections[si].items[ii].clone())
+    }
+
+    /// Walking a section with the arrow keys must never leave the cursor
+    /// nowhere. The renderer draws separators and disabled rows without a
+    /// highlight, so landing on one loses the selection visually: you cannot
+    /// see where you are, and Enter does nothing.
+    #[test]
+    fn arrowing_through_a_menu_never_lands_on_an_unselectable_row() {
+        let mut app = make_app();
+        app.open_menu();
+        let sections = app.menu();
+        for (si, section) in sections.iter().enumerate() {
+            if !section
+                .items
+                .iter()
+                .any(|i| i.enabled && i.action != MenuAction::Separator)
+            {
+                continue;
+            }
+            app.mode = AppMode::Menu {
+                selected_top: si,
+                selected_sub: None,
+            };
+            app.menu_open_submenu();
+            // Two full laps, so wrapping is covered in both directions.
+            for delta in [1, -1] {
+                for _ in 0..section.items.len() * 2 {
+                    let AppMode::Menu { selected_sub, .. } = app.mode else {
+                        panic!("left menu mode");
+                    };
+                    let idx = selected_sub
+                        .unwrap_or_else(|| panic!("no selection in section '{}'", section.title));
+                    let row = &section.items[idx];
+                    assert!(
+                        row.enabled && row.action != MenuAction::Separator,
+                        "section '{}' parked on an unselectable row {} ({:?}, enabled={})",
+                        section.title,
+                        idx,
+                        row.label,
+                        row.enabled
+                    );
+                    app.menu_move_sub(delta);
+                }
+            }
+        }
+    }
+
+    /// The exact report: the Orchestrator section's "Show/Hide Session" is
+    /// disabled when no CLI-class orchestrator session exists, and arrowing
+    /// down onto it made the cursor disappear.
+    #[test]
+    fn a_disabled_orchestrator_row_is_stepped_over() {
+        let mut app = make_app();
+        assert!(app.orchestrator_session_id.is_none());
+        let (si, disabled_idx, item) = find_item(&app, "Orchestrator", "Show/Hide Session");
+        assert!(!item.enabled, "precondition: the row is disabled");
+
+        app.mode = AppMode::Menu {
+            selected_top: si,
+            selected_sub: Some(disabled_idx - 1),
+        };
+        app.menu_move_sub(1);
+        let AppMode::Menu { selected_sub, .. } = app.mode else {
+            panic!("left menu mode")
+        };
+        let landed = selected_sub.expect("cursor vanished");
+        assert_ne!(landed, disabled_idx, "stopped on the disabled row");
+        let sections = app.menu();
+        assert!(
+            sections[si].items[landed].enabled,
+            "landed on a disabled row: {:?}",
+            sections[si].items[landed].label
+        );
+    }
+
+    /// Up at the top of a section pops back to the menu bar. The topmost
+    /// selectable row is not always index 0, so keying on the literal 0
+    /// wrapped to the bottom instead.
+    #[test]
+    fn up_from_the_first_selectable_row_returns_to_the_menu_bar() {
+        let mut app = make_app();
+        app.open_menu();
+        app.menu_open_submenu();
+        let first = app.menu_first_selectable();
+        assert!(first.is_some());
+        let AppMode::Menu { selected_sub, .. } = app.mode else {
+            panic!()
+        };
+        assert_eq!(selected_sub, first, "opening lands on the first selectable");
     }
 
     #[test]

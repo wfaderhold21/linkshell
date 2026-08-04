@@ -1140,10 +1140,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         app.menu_open_submenu()
                     }
                 }
-                KeyCode::Up => match selected_sub {
-                    Some(0) | None => app.menu_close_submenu(),
-                    Some(_) => app.menu_move_sub(-1),
-                },
+                KeyCode::Up => {
+                    // Pop back to the menu bar from the topmost row that can
+                    // actually be selected, which is not always index 0.
+                    if selected_sub.is_none() || selected_sub == app.menu_first_selectable() {
+                        app.menu_close_submenu();
+                    } else {
+                        app.menu_move_sub(-1);
+                    }
+                }
                 KeyCode::Enter => app.execute_selected_menu_action(),
                 KeyCode::Esc => app.mode = AppMode::Normal,
                 // Mnemonics come from the live section titles, so adding or
