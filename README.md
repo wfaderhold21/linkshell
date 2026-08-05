@@ -6,22 +6,46 @@ going: it knows what each agent is doing, lets them talk to each other, routes
 output between them, and can run a resident agent that drives the whole board.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                                                                 │
-│   [active session output]                                       │
-│                                                                 │
-│   > Analyzing the UCC transport layer...                        │
-│   > Found 3 potential issues in ucp_tag_send.c                  │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│          │   1    │   2    │   3    │                           │
-│          │🟠claude│🔵codex │ shell  │                           │
-├─────────────────────────────────────────────────────────────────┤
-│ 1 🟠 →2   THINKING  1m 32s  │  ~450 tok  │  ~$0.02             │
-│ 2 🔵       READY    0m 08s  │  ~1.2k tok │  ~$0.05             │
-│ 3          RUNNING  0m 45s  │  —         │  —                  │
-└─────────────────────────────────────────────────────────────────┘
+ 1 claude  2 codex
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Status                    ││ ○ claude · ~/linkshell                      ▎ ● codex · ~/linkshell
+ ● claude            1m25s ││            Claude Code v2.1.211             ▎
+   READY             23.1k ││  ▐▛███▜▌   claude-opus-5 with low effort    ▎   Tip: New Use /fast to enable our fastest
+   opus-5           $0.386 ││ ▝▜█████▛▘  Claude Pro                       ▎   inference with increased plan usage.
+                           ││   ▘▘ ▝▝    ~/linkshell                      ▎
+ ● codex             1m25s ││                                             ▎ • You have 1 usage limit reset available.
+   READY             17.9k ││                                             ▎ Run /usage to use one.
+   gpt-5.6-sol             ││ ❯ In src/pipe.rs, which extraction modes    ▎
+                           ││   are supported? Just list them, no edits.  ▎
+ ● agent IDLE              ││                                             ▎ › Summarize what src/patterns.rs does in
+                           ││   Searched for 1 pattern (ctrl+o to expand) ▎   two sentences. Read only.
+                           ││                                             ▎
+                           ││ ● ExtractMode (src/pipe.rs:15) supports     ▎
+                           ││   four:                                     ▎ • I’ll inspect only src/patterns.rs and
+                           ││                                             ▎   summarize its role without changing
+                           ││   - LastBlock — last_block                  ▎   anything.
+                           ││   - LastN(usize) — last:N                   ▎
+                           ││   - Diff — diff                             ▎ • Explored
+                           ││   - Summarize(u32) — summarize:N            ▎   └ Read patterns.rs
+                           ││                                             ▎
+                           ││ ✻ Churned for 4s                            ▎ ────────────────────────────────────────────
+                           ││                                             ▎
+                           ││ ────────────────────────────────────────────▎ • src/patterns.rs uses regular expressions
+                           ││ ❯ where is each mode used in app.rs?        ▎   to infer session states—ready, running,
+                           ││ ────────────────────────────────────────────▎   thinking, waiting, or error—from shell,
+                           ││   ⏸ manual mode on · ? for shortcuts · ← …  ▎   Claude, Codex, and local-agent output. It
+                           ││                                             ▎   also extracts context-window, token-usage,
+                           ││                                             ▎   and cost statistics, estimating cost when
+                           ││                                             ▎   none is reported, with tests covering
+ 2 sess              $0.39 ││                                             ▎   gpt-5.6-sol low · ~/linkshell
+ codex · gpt-5.6-sol   17.9k   READY   1m25s                                                                 alt-h help
 ```
+
+A one-row tab strip on top, the status panel as a left sidebar — state, model,
+context, and real cost per session — tiled output panes, and a footer for
+whatever is focused. The panel can move (`bottom`,
+`overlay`) or close (`alt-s`); the tab strip and footer keep the "which agent
+needs me" answer on screen either way.
 
 ## Why linkshell
 
@@ -45,7 +69,8 @@ And the awareness a generic multiplexer can't give you:
 
 - **It knows what each agent is doing.** Live per-session state — READY,
   THINKING, RUNNING, WAITING, ERROR — inferred from PTY output and JSONL logs,
-  with a yellow border when an agent is blocked on you and a red flash on error.
+  surfaced in the status panel, the focused session's footer, and a suffix glyph
+  on the tab itself (`!` waiting on you, `✕` error, `⏸` paused).
   [→ session states](docs/sessions.md#session-states)
 - **It tracks real tokens and cost.** Read directly from the Claude/Codex JSONL
   logs (config-home aware), not screen-scraped — and subscription-aware, so
@@ -54,17 +79,25 @@ And the awareness a generic multiplexer can't give you:
 - **One chat pane drives everything.** Talk to any session, local LLM, or the
   orchestrator by name; answer permission prompts; run commands — without
   leaving the pane. [→ agent chat](docs/chat.md)
+- **A place to think before you build.** The planning pane (`alt-p`, or
+  `alt-shift-p` full-screen) is a persistent read-only design chat that lives on
+  disk, survives a restart, tracks which files it read and how stale they are,
+  and hands a committed plan to an implementation session as work (`alt-i`).
+  Pick any configured endpoint and model to plan against with `alt-m`.
+  [→ planning pane](docs/panes-and-navigation.md#planning-pane-keys)
 
 Plus the multiplexer fundamentals done right: detach/reattach with sessions that
 survive, recursive tiled split panes, unified scrollback across full-screen TUIs
-and shells, and mouse selection everywhere.
+and shells, a discoverable menu bar (`ctrl-space`) over the same commands the
+keybindings reach, a themeable palette (`[theme]`, truecolor-aware), and mouse
+selection everywhere.
 
 ## Feature guides
 
 | Guide | What's inside |
 |-------|---------------|
 | [Sessions](docs/sessions.md) | Starting sessions, detach/reattach, multiple linkshells, startup profiles, aliased Claude/Codex, local agents, session states |
-| [Panes & navigation](docs/panes-and-navigation.md) | Split panes, scrollback, status panel, keybindings, command bar |
+| [Panes & navigation](docs/panes-and-navigation.md) | Split panes, tab strip, scrollback, status panel, planning pane, menu bar, keybindings, command bar |
 | [Pipes](docs/pipes.md) | Edge-triggered output forwarding between sessions |
 | [Councils](docs/councils.md) | Declarative multi-agent topologies |
 | [Agent chat](docs/chat.md) | The chat pane, local LLM agents, permission prompts |
@@ -108,7 +141,9 @@ linkshell --council examples/council.toml   # launch a multi-agent council
 linkshell --profile ucc-dev                 # launch a named session profile
 ```
 
-Then create your first session with `alt-n`. Linkshell runs as a client/server
+Then create your first session with `alt-n` — or press `ctrl-space` for the menu
+bar, which reaches the same commands without memorising a chord, and `alt-h` for
+the full key list. Linkshell runs as a client/server
 pair, like tmux/screen: each `linkshell` starts a background server that owns its
 sessions, and the foreground TUI is a client attached to it. `alt-d` detaches —
 sessions keep running. See the [sessions guide](docs/sessions.md) for detach,
