@@ -39,6 +39,7 @@ Linkshell is a terminal multiplexer TUI built for AI coding agents. It manages u
 | `claude_log.rs` | Watch `$CLAUDE_CONFIG_DIR/projects` JSONL for cumulative token/cost stats |
 | `codex_log.rs` | Watch `$CODEX_HOME/sessions` rollout JSONL for token/context stats |
 | `opencode_log.rs` | Watch the OpenCode SQLite DB for token/cost stats |
+| `omp_log.rs` | Watch `$OMP_HOME/agent/sessions` transcript JSONL for oh-my-pi token/context/cost stats, following the file roll `/new` produces |
 | `ctx_probe.rs` | Probe local model backends (llama.cpp, LM Studio) for context window size |
 | `notify.rs` | Desktop notifications (notify-send, OSC 9, bell) for WAITING/ERROR |
 | `doctor.rs` | `linkshell doctor` — environment/config diagnostics |
@@ -53,7 +54,7 @@ Background tasks communicate via `tokio::mpsc` to the main loop:
 1. **Input reader** — keyboard/mouse → `Key`/`Mouse` events
 2. **Tick generator** — 500ms → `Tick` event (timeout-based state transitions)
 3. **PTY reader** (one per session) — raw bytes → `SessionBytes` + `SessionOutput`/`SessionCurrentLine`
-4. **Log watchers** — Claude/Codex/OpenCode logs → token/cost events
+4. **Log watchers** — Claude/Codex/OpenCode/oh-my-pi logs → token/cost events
 5. **IPC listener** — `linkshell-ctl` / remote agents → state, input, pipe, chat messages
 6. **Orchestrator task** (API class) — tool-use loop ↔ main loop via events
 

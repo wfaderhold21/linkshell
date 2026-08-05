@@ -473,6 +473,10 @@ pub struct Session {
     /// A dedicated log/db watcher reports authoritative cumulative stats for
     /// this session, so terminal line-scraping must not touch `stats`.
     pub stats_from_watcher: bool,
+    /// Last unterminated tail we ran state inference over. The PTY reader
+    /// re-sends an unchanged tail once a second, so this is what tells a
+    /// live repaint (spinner frame advancing) apart from a still screen.
+    pub last_partial_line: String,
     /// Optional path to log session output lines to disk.
     pub log_path: Option<std::path::PathBuf>,
     /// Hash of the last rendered screen contents, used by `process_bytes` to
@@ -560,6 +564,7 @@ impl Session {
             base,
             log_path: None,
             stats_from_watcher: false,
+            last_partial_line: String::new(),
             last_screen_hash: 0,
         }
     }

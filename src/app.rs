@@ -1058,6 +1058,19 @@ impl App {
                         s.stats_from_watcher = true;
                     }
                 }
+                // oh-my-pi keeps a per-turn usage transcript under
+                // ~/.omp/agent/sessions; that beats scraping its status bar,
+                // and it is the only place the model and context size appear.
+                if matches!(kind, SessionKind::OhMyPi)
+                    || crate::session::command_base_name(&cmd_str) == Some("omp")
+                {
+                    let omp_home = crate::session::command_env_assignment(&cmd_str, "OMP_HOME")
+                        .map(|v| expand_tilde(&v));
+                    crate::omp_log::spawn_watcher(id, cwd.clone(), tx.clone(), omp_home);
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                        s.stats_from_watcher = true;
+                    }
+                }
                 // When the command itself names the backend (llama-cli, …),
                 // probe that backend's localhost API for the loaded model's
                 // context window. Sessions that reach a backend indirectly
@@ -1972,6 +1985,21 @@ impl App {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             state_before = Some(session.state.clone());
             let stripped = strip_ansi(&text);
+            // A TUI that animates a spinner in its unterminated tail (omp,
+            // opencode) may never complete a line for the whole turn, so
+            // `last_output_at` — fed only by complete lines — goes stale and
+            // the 2s idle timeout drags the session back to READY, only for
+            // the next spinner frame to flip it to THINKING again. That
+            // flapping is what the status panel showed. A *changed* tail is
+            // output, so count it as liveness; an unchanged one (re-sent once
+            // a second by the reader) is not, and still lets the session idle
+            // out.
+            if stripped != session.last_partial_line {
+                session.last_partial_line.clone_from(&stripped);
+                if !stripped.trim().is_empty() {
+                    session.last_output_at = Some(std::time::Instant::now());
+                }
+            }
             if let Some(new_state) = self.matcher.infer_state(&stripped, session.base) {
                 // Partial lines can detect Thinking/Waiting/Ready but must not
                 // flip to Running — that requires a complete line.
@@ -9046,6 +9074,29 @@ mod tests {
 
         app.handle_session_current_line(id, "partial output".into());
 
+        assert_eq!(app.sessions[0].state, SessionState::Ready);
+    }
+
+    #[test]
+    fn an_animating_tail_keeps_a_thinking_session_alive_but_a_static_one_idles_out() {
+        let mut app = make_app();
+        let id = app.spawn_headless_session("agent".into(), None).unwrap();
+        app.sessions[0].base = crate::session::BaseKind::LocalAgent;
+        app.sessions[0].state = SessionState::Thinking;
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        app.sessions[0].last_output_at = Some(stale);
+
+        // A spinner frame the session has not shown before: real output, so
+        // the idle timeout must not fire against it.
+        app.handle_session_current_line(id, "⠹ Working… ⟨esc⟩".into());
+        app.handle_tick();
+        assert_eq!(app.sessions[0].state, SessionState::Thinking);
+
+        // The same tail re-sent by the reader is not new output, so a session
+        // whose screen has stopped moving still falls back to READY.
+        app.sessions[0].last_output_at = Some(stale);
+        app.handle_session_current_line(id, "⠹ Working… ⟨esc⟩".into());
+        app.handle_tick();
         assert_eq!(app.sessions[0].state, SessionState::Ready);
     }
 

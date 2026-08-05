@@ -386,8 +386,15 @@ fn draw_pane_frame(
         );
     }
     if area.width > 2 {
+        // The title row doubles as the pane's top edge: a rule runs from the
+        // end of the title to the right margin. The left bar alone separates
+        // side-by-side panes, but stacked panes butt content directly against
+        // the next pane's title with nothing between them — this is the line
+        // that says where one ends and the next begins.
+        let title = Line::from(title);
+        let used = title.width() as u16;
         f.render_widget(
-            Paragraph::new(Line::from(title)),
+            Paragraph::new(title),
             Rect {
                 x: area.x + 2,
                 y: area.y,
@@ -395,6 +402,22 @@ fn draw_pane_frame(
                 height: 1,
             },
         );
+        let rule_x = area.x + 2 + used + 1;
+        if rule_x < area.x + area.width {
+            let rule_width = area.x + area.width - rule_x;
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "─".repeat(rule_width as usize),
+                    Style::default().fg(t.chrome),
+                )),
+                Rect {
+                    x: rule_x,
+                    y: area.y,
+                    width: rule_width,
+                    height: 1,
+                },
+            );
+        }
     }
     pane_content_area(area)
 }
@@ -3901,7 +3924,13 @@ mod tests {
 
         assert_eq!(text[0], "", "no sessions: the strip is blank");
         assert_eq!(text[1], "─".repeat(60));
-        assert_eq!(text[2], "   ▎ ● linkshell", "rail (empty) then the pane");
+        // The title row doubles as the pane's top edge, so a rule fills the
+        // rest of it.
+        assert!(
+            text[2].starts_with("   ▎ ● linkshell ─") && text[2].ends_with('─'),
+            "rail (empty), the pane title, then the top rule: {:?}",
+            text[2]
+        );
         assert_eq!(text[3], "   ▎ No sessions. Press alt-n to create one.");
         // The pane runs to the footer: no bottom border, and in the default
         // overlay mode the status panel claims no rows either.
@@ -4111,7 +4140,11 @@ mod tests {
         let mut app = app_with_sessions(&["alpha"]);
         app.sessions[0].cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()) + "/src";
         let rows = render_rows(&app, 60, 15);
-        assert_eq!(rows[2].0, "●1 ▎ ● alpha · ~/src", "rail, then the pane");
+        assert!(
+            rows[2].0.starts_with("●1 ▎ ● alpha · ~/src ─"),
+            "rail, the pane title, then the top rule: {:?}",
+            rows[2].0
+        );
     }
 
     // ── Status panel ──────────────────────────────────────────────────────

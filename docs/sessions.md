@@ -110,6 +110,14 @@ Sessions running `opencode`, `omp` (oh-my-pi), `pi`, `aider`, `llama-cli`, or
 token scraping. Wrappers with other names can be mapped with `kind = "local"`
 in `[sessions.aliases]`.
 
+Two of them keep their own records and get watched instead of scraped:
+`opencode` (its SQLite database) and `omp` (the per-turn transcript JSONL under
+`$OMP_HOME/agent/sessions`, default `~/.omp`). For omp that means the tokens,
+cost, context, and model shown are the ones it recorded. `/new` starts a fresh
+transcript; the watcher follows it and carries the totals forward, so a session's
+tokens keep climbing — context, which measures the live prompt rather than a
+total, drops with the new thread.
+
 ## Session states
 
 States are inferred from PTY output and refined by JSONL log activity.
