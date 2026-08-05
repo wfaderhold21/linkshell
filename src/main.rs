@@ -12,6 +12,7 @@ mod ipc;
 mod keybindings;
 mod layout;
 mod notify;
+mod omp_log;
 mod opencode_log;
 mod orchestrator;
 mod patterns;
