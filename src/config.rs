@@ -437,10 +437,16 @@ impl OrchestratorConfig {
     /// explaining the contract. Idempotent and best-effort; called when an
     /// orchestrator starts.
     pub fn ensure_agent_files(&self) {
-        if self.skills_dir.is_empty() {
-            if let Some(dir) = config_path().and_then(|p| p.parent().map(|d| d.join("skills"))) {
-                let _ = std::fs::create_dir_all(dir);
-            }
+        // Skills: create the directory and drop in the shipped defaults.
+        // install_defaults never overwrites an existing file, so a default
+        // the user has edited stays edited.
+        let skills_dir = if self.skills_dir.is_empty() {
+            config_path().and_then(|p| p.parent().map(|d| d.join("skills")))
+        } else {
+            Some(std::path::PathBuf::from(expand_tilde(&self.skills_dir)))
+        };
+        if let Some(dir) = skills_dir {
+            crate::orchestrator::install_default_skills(&dir);
         }
         if let Some(path) = self.memory_path() {
             if !path.exists() {

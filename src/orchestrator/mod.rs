@@ -13,6 +13,8 @@ mod anthropic;
 mod openai;
 mod skills;
 
+pub use skills::install_defaults as install_default_skills;
+
 use crate::config::{ApiProvider, OrchestratorClass, OrchestratorConfig};
 use crate::events::{AppEvent, OrchestratorReq};
 use tokio::sync::mpsc;
@@ -816,6 +818,21 @@ with [linkshell] are system notes.\n\
 \n\
 Your replies render in a small chat pane: be concise, no markdown headers.",
     );
+    p.push_str(
+        "\n\nStanding rules, above any task:\n\
+- Installing, upgrading, or removing software is the user's call, never yours. \
+If a session prompts to install something, report what it wants and wait for \
+explicit approval — do not answer the prompt, and do not run the install \
+yourself.\n\
+- If you cannot confirm that input you sent to a session was picked up, say so \
+in one line — which session, what you sent — and move on with the rest of the \
+work. Do not silently resend, and do not stall on it.\n\
+- The same holds for anything destructive and hard to undo: rm -rf, git reset \
+--hard, force pushes, dropping or resetting a branch, truncating or dropping \
+data. Describe what you would run and wait to be told to run it.\n\
+- Report uncertainty as uncertainty. A guess presented as an observation is \
+worse than saying you do not know.",
+    );
     if let Some(list) = skills_section(cfg, false) {
         p.push_str(
             "\n\nSkills — playbooks you can load with the use_skill tool. When a task \
@@ -875,6 +892,16 @@ Keep chat messages short.\n\
 Lines arriving that start with [linkshell event] mean a session changed state \
 (WAITING/ERROR/DEAD): investigate with `list`/`read`, then summarize for the user via \
 `linkshell-ctl chat`. Do not modify files unless the user asks; your role is coordination.",
+    );
+    p.push_str(
+        "\nStanding rules, above any task: installing, upgrading, or removing \
+software is the user's call — if a session prompts to install something, report it \
+via `linkshell-ctl chat` and wait for explicit approval rather than answering the \
+prompt or running the install yourself. Anything destructive and hard to undo — \
+rm -rf, git reset --hard, force pushes, dropping a branch, discarding data — needs \
+the same explicit approval: describe the command, then wait. If you cannot confirm that input you sent \
+to a session was picked up, say so in one line and move on; never silently resend. \
+Report uncertainty as uncertainty.\n",
     );
     if let Some(list) = skills_section(cfg, true) {
         p.push_str(
