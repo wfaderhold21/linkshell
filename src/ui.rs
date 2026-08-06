@@ -3443,6 +3443,20 @@ fn draw_planning_transcript(
         lines.push(Line::from(""));
     }
 
+    // The in-flight message, shown exactly like a real "you" turn so the
+    // transcript reads continuously while the backend thinks. It is not in
+    // the thread yet — the turn task writes that on completion.
+    if let Some(pending) = &app.planning.pending_user {
+        lines.push(Line::from(Span::styled(
+            " you",
+            Style::default().fg(t.text_dim),
+        )));
+        for l in wrap_text(pending, width.saturating_sub(2).max(8)) {
+            lines.push(Line::from(format!("   {}", l)));
+        }
+        lines.push(Line::from(""));
+    }
+
     if app.planning.busy && !app.planning.status.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" {} {}", spinner_frame(), app.planning.status),
