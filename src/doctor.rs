@@ -192,11 +192,16 @@ fn run_with(context: &Context, out: &mut dyn Write) -> i32 {
 
     match context.config.as_deref() {
         Some(path) if path.exists() => match crate::config::load_strict(path) {
-            Ok(_) => report(
-                "config validity",
-                Level::Ok,
-                "TOML and profile references are valid".into(),
-            ),
+            // A misspelled `approval` parses fine but silently changes how
+            // much the orchestrator may do unasked, so it is worth a line.
+            Ok(cfg) => match cfg.orchestrator.approval_warning() {
+                Some(warning) => report("config validity", Level::Warn, warning),
+                None => report(
+                    "config validity",
+                    Level::Ok,
+                    "TOML and profile references are valid".into(),
+                ),
+            },
             Err(error) => report(
                 "config validity",
                 Level::Fail,

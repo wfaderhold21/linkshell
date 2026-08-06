@@ -144,6 +144,12 @@ pub struct OrchestratorConfig {
     pub providers: Vec<String>,
     /// Context budgets offered by the menu. Empty = a built-in ladder.
     pub context_choices: Vec<usize>,
+    /// Keys written explicitly under `[orchestrator]` in the config file.
+    /// A persona only fills in keys the user left unset — writing
+    /// `approval = "propose"` there must survive a persona swap, or the
+    /// setting silently does nothing. Populated by `parse`, not by serde.
+    #[serde(skip)]
+    pub explicit_keys: std::collections::HashSet<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -192,6 +198,7 @@ impl Default for OrchestratorConfig {
             models: Vec::new(),
             providers: Vec::new(),
             context_choices: Vec::new(),
+            explicit_keys: std::collections::HashSet::new(),
         }
     }
 }
@@ -367,8 +374,30 @@ impl OrchestratorConfig {
         out
     }
 
+    /// Whether the propose gate is on. Only the literal "auto" turns it off:
+    /// an unrecognized value ("auto_approve", "approve", a typo) gates rather
+    /// than silently granting full autonomy, because that is the direction
+    /// that cannot hurt anyone. `approval_warning` reports the misspelling.
+    pub fn approval_gates(&self) -> bool {
+        self.approval.trim() != "auto"
+    }
+
+    /// Complaint about an `approval` value that is neither "auto" nor
+    /// "propose", for the chat pane and `linkshell doctor`.
+    pub fn approval_warning(&self) -> Option<String> {
+        let value = self.approval.trim();
+        if value == "auto" || value == "propose" {
+            return None;
+        }
+        Some(format!(
+            "[orchestrator] approval = \"{}\" is not a valid value (use \"auto\" or \
+             \"propose\"); treating it as \"propose\" so tool calls are gated",
+            value
+        ))
+    }
+
     pub fn approval_required(&self, tool: &str) -> bool {
-        if self.approval != "propose" {
+        if !self.approval_gates() {
             return false;
         }
         // kill_session has its own confirmation flow (/confirm-kill).
@@ -437,10 +466,16 @@ impl OrchestratorConfig {
     /// explaining the contract. Idempotent and best-effort; called when an
     /// orchestrator starts.
     pub fn ensure_agent_files(&self) {
-        if self.skills_dir.is_empty() {
-            if let Some(dir) = config_path().and_then(|p| p.parent().map(|d| d.join("skills"))) {
-                let _ = std::fs::create_dir_all(dir);
-            }
+        // Skills: create the directory and drop in the shipped defaults.
+        // install_defaults never overwrites an existing file, so a default
+        // the user has edited stays edited.
+        let skills_dir = if self.skills_dir.is_empty() {
+            config_path().and_then(|p| p.parent().map(|d| d.join("skills")))
+        } else {
+            Some(std::path::PathBuf::from(expand_tilde(&self.skills_dir)))
+        };
+        if let Some(dir) = skills_dir {
+            crate::orchestrator::install_default_skills(&dir);
         }
         if let Some(path) = self.memory_path() {
             if !path.exists() {
@@ -606,39 +641,97 @@ pub struct Persona {
 }
 
 impl Persona {
-    /// Layer this persona over a base orchestrator config.
+    /// Layer this persona over `base`, overriding every field it sets.
+    ///
+    /// This is the runtime path (`/persona <name>`, the Orchestrator menu):
+    /// the user picked this persona just now, so it outranks anything in the
+    /// config file and any earlier runtime tweak. `apply_at_startup` is the
+    /// quieter version used when the persona comes from the config itself.
     pub fn apply(&self, base: &OrchestratorConfig) -> OrchestratorConfig {
+        self.layer(base, false)
+    }
+
+    /// Layer this persona over `base` without touching keys the user wrote
+    /// explicitly under `[orchestrator]`. Used only for the persona named in
+    /// the config: there both settings come from the same file, and the more
+    /// specific one — the key the user spelled out — is what they meant.
+    pub fn apply_at_startup(&self, base: &OrchestratorConfig) -> OrchestratorConfig {
+        self.layer(base, true)
+    }
+
+    fn layer(&self, base: &OrchestratorConfig, defer_to_config: bool) -> OrchestratorConfig {
         let mut cfg = base.clone();
+        let mine = |key: &str| !defer_to_config || !base.explicit_keys.contains(key);
         if let Some(v) = &self.events {
-            cfg.events = v.clone();
+            if mine("events") {
+                cfg.events = v.clone();
+            }
         }
         if let Some(v) = self.event_cooldown_secs {
-            cfg.event_cooldown_secs = v;
+            if mine("event_cooldown_secs") {
+                cfg.event_cooldown_secs = v;
+            }
         }
         if let Some(v) = &self.approval {
-            cfg.approval = v.clone();
+            if mine("approval") {
+                cfg.approval = v.clone();
+            }
         }
         if let Some(v) = &self.auto_approve {
-            cfg.auto_approve = v.clone();
+            if mine("auto_approve") {
+                cfg.auto_approve = v.clone();
+            }
         }
         if let Some(v) = &self.allowed_tools {
-            cfg.allowed_tools = v.clone();
+            if mine("allowed_tools") {
+                cfg.allowed_tools = v.clone();
+            }
         }
         if let Some(v) = self.max_tool_iterations {
-            cfg.max_tool_iterations = v;
+            if mine("max_tool_iterations") {
+                cfg.max_tool_iterations = v;
+            }
         }
         if let Some(v) = self.tool_dedup_secs {
-            cfg.tool_dedup_secs = v;
+            if mine("tool_dedup_secs") {
+                cfg.tool_dedup_secs = v;
+            }
         }
         if let Some(v) = self.max_context_tokens {
-            cfg.max_context_tokens = v;
+            if mine("max_context_tokens") {
+                cfg.max_context_tokens = v;
+            }
         }
         if let Some(v) = self.event_tail_lines {
-            cfg.event_tail_lines = v;
+            if mine("event_tail_lines") {
+                cfg.event_tail_lines = v;
+            }
         }
         cfg.persona_note = self.note.clone();
         cfg.persona = self.name.clone();
         cfg
+    }
+
+    /// Keys `apply_at_startup` would leave alone because the user set them
+    /// explicitly under `[orchestrator]`. Surfaced at startup so "the persona
+    /// did nothing" is never a silent outcome. A runtime swap uses `apply`
+    /// and overrides everything, so it has nothing to report.
+    pub fn overridden_by_config(&self, base: &OrchestratorConfig) -> Vec<&'static str> {
+        [
+            ("events", self.events.is_some()),
+            ("event_cooldown_secs", self.event_cooldown_secs.is_some()),
+            ("approval", self.approval.is_some()),
+            ("auto_approve", self.auto_approve.is_some()),
+            ("allowed_tools", self.allowed_tools.is_some()),
+            ("max_tool_iterations", self.max_tool_iterations.is_some()),
+            ("tool_dedup_secs", self.tool_dedup_secs.is_some()),
+            ("max_context_tokens", self.max_context_tokens.is_some()),
+            ("event_tail_lines", self.event_tail_lines.is_some()),
+        ]
+        .into_iter()
+        .filter(|(key, wanted)| *wanted && base.explicit_keys.contains(*key))
+        .map(|(key, _)| key)
+        .collect()
     }
 }
 
@@ -1276,9 +1369,25 @@ pub fn save_profile(profile: &Profile) -> anyhow::Result<std::path::PathBuf> {
 
 pub fn parse(content: &str) -> anyhow::Result<Config> {
     let mut cfg: Config = toml::from_str(content)?;
+    cfg.orchestrator.explicit_keys = orchestrator_keys(content);
     validate_profiles(&cfg)?;
     cfg.derive_planning_backends();
     Ok(cfg)
+}
+
+/// Which keys the user actually wrote under `[orchestrator]`. Serde cannot
+/// tell "absent" from "set to the default value", and a persona needs that
+/// distinction to know what it may fill in.
+fn orchestrator_keys(content: &str) -> std::collections::HashSet<String> {
+    content
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|v| {
+            v.get("orchestrator")
+                .and_then(|o| o.as_table())
+                .map(|t| t.keys().cloned().collect())
+        })
+        .unwrap_or_default()
 }
 
 impl Config {

@@ -310,6 +310,13 @@ pub struct PlanningState {
     pub backend: Option<crate::planning::Backend>,
     /// True while a turn or commit is in flight; the input is not sent twice.
     pub busy: bool,
+    /// The message sent by the turn currently in flight. The background task
+    /// owns the thread and only writes it on completion, so without this the
+    /// text vanishes the instant you press Enter — cleared from the input,
+    /// not yet in the transcript — and the pane looks like it swallowed the
+    /// message. Shown in the transcript as a pending turn until the real one
+    /// is loaded back from disk.
+    pub pending_user: Option<String>,
     /// Latest progress line from the running turn.
     pub status: String,
     /// Last error, kept visible until the next successful turn.
@@ -646,6 +653,12 @@ pub struct App {
     pub orchestrator_status: Option<(String, std::time::Instant)>,
     /// Name of the active persona (empty = bare [orchestrator] config).
     pub orchestrator_persona: String,
+    /// The active persona was chosen at runtime (`/persona`, the menu) rather
+    /// than read from `[orchestrator].persona`. A restart must not undo that
+    /// choice: Stop/Start and "Restart To Apply Changes" sit in the same menu
+    /// as the Persona row, so re-reading the config persona on start silently
+    /// threw the user's pick away seconds after they made it.
+    pub persona_user_selected: bool,
     /// Pristine [orchestrator] config. Personas layer over *this*, never over
     /// an already-layered config, so swapping A -> B -> A is idempotent.
     pub orchestrator_base: Option<crate::config::OrchestratorConfig>,
@@ -769,6 +782,7 @@ impl App {
             orchestrator_ctx_max: None,
             orchestrator_status: None,
             orchestrator_persona: String::new(),
+            persona_user_selected: false,
             orchestrator_base: None,
             orch_event_cooldowns: HashMap::new(),
             last_permission_request: None,
@@ -2583,18 +2597,40 @@ impl App {
                 b
             }
         };
-        let want = base.persona.clone();
+        // A persona picked at runtime survives stop/start and restart — the
+        // layered config it produced is already in self.config, so there is
+        // nothing to re-apply. Only fall back to the config's persona when
+        // the user has not chosen one themselves.
+        let want = if self.persona_user_selected {
+            String::new()
+        } else {
+            base.persona.clone()
+        };
         if !want.is_empty() && self.orchestrator_persona != want {
             if let Some(p) = self.personas().into_iter().find(|p| p.name == want) {
+                let kept = p.overridden_by_config(&base);
                 let mut cfg = (*self.config).clone();
-                cfg.orchestrator = p.apply(&base);
+                cfg.orchestrator = p.apply_at_startup(&base);
                 self.config = Arc::new(cfg);
                 self.orchestrator_persona = want;
+                if !kept.is_empty() {
+                    self.chat_system(format!(
+                        "persona {} did not set {} — your [orchestrator] {} wins. \
+                         /persona {} at runtime applies the persona in full.",
+                        p.name,
+                        kept.join(", "),
+                        if kept.len() == 1 { "value" } else { "values" },
+                        p.name,
+                    ));
+                }
             } else {
                 self.chat_system(format!("unknown persona \"{}\" in config; ignoring", want));
             }
         }
         let cfg = self.config.orchestrator.clone();
+        if let Some(warning) = cfg.approval_warning() {
+            self.chat_system(warning);
+        }
         match cfg.class()? {
             crate::config::OrchestratorClass::Api(_) => {
                 if self.config.agents.contains_key(&cfg.name) {
@@ -4203,7 +4239,11 @@ impl App {
                 b
             }
         };
+        // Asked for by hand, now: the persona wins outright over the config
+        // file and over any earlier runtime tweak. Whatever the user did last
+        // is what they meant — including across a restart.
         let cfg = persona.apply(&base);
+        self.persona_user_selected = true;
         let Some(h) = &self.orchestrator else {
             // No API orchestrator running: still record it so a later
             // /orchestrator start picks the persona up.
@@ -5034,6 +5074,13 @@ impl App {
             MenuAction::ReloadConfig => {
                 self.config = std::sync::Arc::new(crate::config::load());
                 self.orchestrator_config_dirty = false;
+                // Reloading is a deliberate "go back to the file": drop the
+                // remembered base and the runtime persona pick along with it,
+                // or the next start would layer the new config under stale
+                // values from the old one.
+                self.orchestrator_base = None;
+                self.persona_user_selected = false;
+                self.orchestrator_persona.clear();
                 self.command_result = "config reloaded from disk".into();
                 MenuOutcome::Stay
             }
@@ -6658,6 +6705,7 @@ impl App {
         self.planning.thread = Some(thread);
         self.planning.input.clear();
         self.planning.cursor = 0;
+        self.planning.pending_user = None;
         self.planning.scroll = 0;
         self.planning.error.clear();
         self.planning.overflow = false;
@@ -6674,6 +6722,8 @@ impl App {
     pub fn planning_open_thread(&mut self, id: &str) -> Result<(), String> {
         let thread = crate::planning::store::load(id).map_err(|e| e.to_string())?;
         self.planning.thread = Some(thread);
+        // A pending turn belongs to the thread it was typed into.
+        self.planning.pending_user = None;
         self.planning.scroll = 0;
         self.planning.error.clear();
         self.planning.overflow = false;
@@ -6727,6 +6777,9 @@ impl App {
         self.planning.input.clear();
         self.planning.cursor = 0;
         self.planning.busy = true;
+        // Keep the message on screen while it is in flight; the transcript
+        // only gains the real turn when the reply lands.
+        self.planning.pending_user = Some(text.clone());
         self.planning.status = "sending".to_string();
         self.planning.error.clear();
         self.planning.overflow = false;
@@ -6795,6 +6848,9 @@ impl App {
             return;
         }
         self.planning.busy = false;
+        // The turn is on disk now; the reload below brings back the real
+        // message, so the placeholder has done its job.
+        self.planning.pending_user = None;
         self.planning.last_peak_tokens = peak_tokens;
         self.planning.status.clear();
         // The background task owns its own copy of the thread, so reload from
@@ -6831,6 +6887,9 @@ impl App {
         }
         self.planning.busy = false;
         self.planning.status.clear();
+        // The draft comes back into the input below, so showing it as a
+        // pending turn as well would double it.
+        self.planning.pending_user = None;
         self.planning.error = error;
         self.planning.overflow = overflow;
         // Restore the unsent message so a switch-and-retry costs nothing.
@@ -6852,6 +6911,7 @@ impl App {
             return;
         }
         self.planning.busy = false;
+        self.planning.pending_user = None;
         self.planning.status = if stale.is_empty() {
             format!("plan revision {} written to {}", revision, path)
         } else {
@@ -8070,6 +8130,95 @@ mod tests {
         assert!(
             !app.orchestrator_config_dirty,
             "personas layer over the base config and apply on the next turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_planning_message_stays_on_screen() {
+        // The turn task owns the thread and only writes it on completion, so
+        // between Enter and the reply the text lives nowhere else: cleared
+        // from the input, not yet in the transcript. It used to vanish under
+        // the thinking spinner, which reads as the pane having eaten it.
+        let mut cfg = crate::config::Config::default();
+        cfg.planning.backends.insert(
+            "fake".into(),
+            crate::planning::Backend {
+                name: "fake".into(),
+                provider: "lmstudio".into(),
+                endpoint: "http://127.0.0.1:1/v1".into(),
+                model: "fake".into(),
+                ..Default::default()
+            },
+        );
+        let mut app = make_app_with_config(cfg);
+        let thread = crate::planning::store::Thread::new("t", std::path::PathBuf::from("/tmp"));
+        let id = thread.id.clone();
+        app.planning.thread = Some(thread);
+        app.planning.backend = app.config.planning.default_backend();
+        app.planning.input = "how should I structure retries".into();
+
+        app.planning_send();
+        assert!(app.planning.input.is_empty(), "the draft left the input");
+        assert_eq!(
+            app.planning.pending_user.as_deref(),
+            Some("how should I structure retries"),
+            "so it must be visible in the transcript instead"
+        );
+
+        // On failure the draft returns to the input; showing it as a pending
+        // turn as well would double it.
+        app.handle_planning_failed(
+            id.clone(),
+            "how should I structure retries".into(),
+            "boom".into(),
+            false,
+        );
+        assert!(app.planning.pending_user.is_none());
+        assert_eq!(app.planning.input, "how should I structure retries");
+
+        // On success the reply handler reloads the thread, which carries the
+        // real user turn — the placeholder must go with it.
+        app.planning.input = "second try".into();
+        app.planning_send();
+        assert!(app.planning.pending_user.is_some());
+        app.handle_planning_reply(id, "ok".into(), "fake".into(), "fake".into(), 10, None);
+        assert!(app.planning.pending_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_persona_picked_at_runtime_survives_an_orchestrator_restart() {
+        let mut cfg = crate::config::Config::default();
+        cfg.orchestrator.enabled = true;
+        // Provider whose start path needs no network or child process.
+        cfg.orchestrator.provider = "lmstudio".into();
+        cfg.orchestrator.persona = "orchestrator".into();
+        let mut app = make_app_with_config(cfg);
+
+        app.start_orchestrator().unwrap();
+        assert_eq!(app.orchestrator_persona, "orchestrator");
+        assert_eq!(app.config.orchestrator.approval, "auto");
+
+        // The user picks a different persona from the menu / /persona.
+        let (si, ii, _) = find_item(&app, "Orchestrator", "Persona");
+        app.open_menu();
+        app.activate_menu_index(si, ii);
+        let picked = app.orchestrator_persona.clone();
+        assert_ne!(picked, "orchestrator", "the cycle moved off the config one");
+
+        // Stop/Start — both a keystroke away in the same menu — used to
+        // silently re-apply [orchestrator].persona over the user's choice.
+        app.stop_orchestrator();
+        app.start_orchestrator().unwrap();
+        assert_eq!(app.orchestrator_persona, picked);
+        assert_eq!(
+            app.config.orchestrator.approval,
+            crate::config::builtin_personas()
+                .iter()
+                .find(|p| p.name == picked)
+                .unwrap()
+                .approval
+                .clone()
+                .unwrap()
         );
     }
 

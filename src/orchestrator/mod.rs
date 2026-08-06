@@ -13,6 +13,8 @@ mod anthropic;
 mod openai;
 mod skills;
 
+pub use skills::install_defaults as install_default_skills;
+
 use crate::config::{ApiProvider, OrchestratorClass, OrchestratorConfig};
 use crate::events::{AppEvent, OrchestratorReq};
 use tokio::sync::mpsc;
@@ -787,6 +789,15 @@ async fn exec_tool(
 // ── Prompts ────────────────────────────────────────────────────────────────
 
 fn system_prompt(cfg: &OrchestratorConfig) -> String {
+    // Describe the job the persona actually has. A read-only persona used to
+    // be told, in the opening paragraphs, to type into sessions, start them
+    // and wire pipes — with one corrective sentence buried at the very
+    // bottom — so it kept reaching for tools it was not given.
+    let tools: std::collections::HashSet<&str> =
+        allowed_specs(cfg).into_iter().map(|(n, _, _)| n).collect();
+    let can = |t: &str| tools.contains(t);
+    let drives = can("send_input") || can("start_session") || can("pipe_add");
+
     let mut p = String::from(
         "You are the resident orchestrator agent inside linkshell, a terminal \
 multiplexer for AI coding sessions (claude, codex, opencode, oh-my-pi, aider, shells). \
@@ -794,27 +805,80 @@ You watch over all sessions on the user's behalf.\n\
 \n\
 Session states: STARTING, READY (idle, will accept input), THINKING/RUNNING (busy), \
 WAITING (blocked on user input — the waiting_prompt field says what it asked), \
-ERROR, DEAD. Use your tools to inspect sessions, start new ones in any directory, \
-type into them, and wire pipes between them. Tool session_id arguments take the raw \
+ERROR, DEAD. ",
+    );
+    if drives {
+        let mut verbs = vec!["inspect sessions"];
+        if can("start_session") {
+            verbs.push("start new ones in any directory");
+        }
+        if can("send_input") {
+            verbs.push("type into them");
+        }
+        if can("pipe_add") {
+            verbs.push("wire pipes between them");
+        }
+        p.push_str(&format!("Use your tools to {}. ", join_and(&verbs)));
+    } else {
+        p.push_str(
+            "You observe and advise: you can read sessions and report to the user, but \
+you have no tools to type into them, start them, or change them in any way. When \
+something needs doing, say what you would do and let the user do it — do not claim to \
+have done it, and do not describe a tool call as if it had run. ",
+        );
+    }
+    p.push_str(
+        "Tool session_id arguments take the raw \
 `id` from list_sessions; the user sees 1-based `display` numbers, so when talking to \
-the user, call sessions by their display number or name.\n\
-\n\
-You cannot kill sessions. request_kill only files a request the user must approve \
-with /confirm-kill. You can however pause_session/resume_session: pausing stops a \
-session's process (SIGSTOP) without losing its context — its state shows PAUSED — \
-which is the right lever when concurrent sessions contend for limited CPU or RAM.\n\
-\n\
-Messages starting with [linkshell event] are automatic notifications that a session \
-changed state. For WAITING, ERROR, and DEAD events you MUST report: investigate \
+the user, call sessions by their display number or name.\n",
+    );
+    if can("pause_session") || can("request_kill") {
+        p.push_str(
+            "\nYou cannot kill sessions. request_kill only files a request the user must \
+approve with /confirm-kill. You can however pause_session/resume_session: pausing stops \
+a session's process (SIGSTOP) without losing its context — its state shows PAUSED — \
+which is the right lever when concurrent sessions contend for limited CPU or RAM.\n",
+        );
+    }
+    if !cfg.events.is_empty() {
+        p.push_str(
+            "\nMessages starting with [linkshell event] are automatic notifications that a \
+session changed state. For WAITING, ERROR, and DEAD events you MUST report: investigate \
 briefly (read_output) and tell the user in one or two sentences what happened, what \
 it needs, and what you suggest — never answer these with just `ok`. Only when ALL \
 events in the message are informational (READY/STARTING/THINKING/RUNNING) and nothing \
 depends on them: make no tool calls and reply with exactly `ok` — that reply is \
-suppressed and never shown to the user. \
-Messages starting \
-with [linkshell] are system notes.\n\
+suppressed and never shown to the user.\n",
+        );
+    }
+    p.push_str(
+        "\nMessages starting with [linkshell] are system notes.\n\
 \n\
 Your replies render in a small chat pane: be concise, no markdown headers.",
+    );
+    // The persona's own words go here, next to the capability description
+    // they qualify, rather than after the memory dump at the end.
+    if !cfg.persona_note.trim().is_empty() {
+        p.push_str("\n\nYour persona is \"");
+        p.push_str(&cfg.persona);
+        p.push_str("\": ");
+        p.push_str(cfg.persona_note.trim());
+        p.push('\n');
+    }
+    p.push_str(
+        "\n\nStanding rules, above any task:\n\
+- Installing, upgrading, or removing software is the user's call, never yours. \
+If a session prompts to install something, report what it wants and wait for \
+explicit approval — do not answer the prompt, and do not run the install \
+yourself.\n\
+- If you cannot confirm that input you sent to a session was picked up, say so \
+in one line — which session, what you sent — and move on with the rest of the \
+work. Do not silently resend, and do not stall on it.\n\
+- The same holds for anything destructive and hard to undo: rm -rf, git reset \
+--hard, force pushes, dropping or resetting a branch, truncating or dropping \
+data. Describe what you would run and wait to be told to run it.\n\
+- Report uncertainty as uncertainty. A guess presented as an observation is \
+worse than saying you do not know.",
     );
     if let Some(list) = skills_section(cfg, false) {
         p.push_str(
@@ -823,7 +887,7 @@ matches a skill's description, load it and follow it:\n",
         );
         p.push_str(&list);
     }
-    if cfg.approval == "propose" {
+    if cfg.approval_gates() {
         p.push_str(
             "\nSome of your tool calls require the user's approval before they run; \
 they may take a while to return while the user decides. A tool result of \
@@ -843,14 +907,16 @@ and continue; otherwise report what you wanted to do and why.\n",
     if let Some(memory) = memory_section(cfg) {
         p.push_str(&memory);
     }
-    // Persona note last of the static text (before memory), so a persona
-    // swap invalidates as little of the cached prefix as possible.
-    if !cfg.persona_note.trim().is_empty() {
-        p.push_str("\n\n## Persona\n\n");
-        p.push_str(cfg.persona_note.trim());
-        p.push('\n');
-    }
     p
+}
+
+/// "a, b and c" — for listing capabilities in prose.
+fn join_and(parts: &[&str]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+    }
 }
 
 /// Briefing typed into a CLI-class orchestrator session once it is READY.
@@ -875,6 +941,16 @@ Keep chat messages short.\n\
 Lines arriving that start with [linkshell event] mean a session changed state \
 (WAITING/ERROR/DEAD): investigate with `list`/`read`, then summarize for the user via \
 `linkshell-ctl chat`. Do not modify files unless the user asks; your role is coordination.",
+    );
+    p.push_str(
+        "\nStanding rules, above any task: installing, upgrading, or removing \
+software is the user's call — if a session prompts to install something, report it \
+via `linkshell-ctl chat` and wait for explicit approval rather than answering the \
+prompt or running the install yourself. Anything destructive and hard to undo — \
+rm -rf, git reset --hard, force pushes, dropping a branch, discarding data — needs \
+the same explicit approval: describe the command, then wait. If you cannot confirm that input you sent \
+to a session was picked up, say so in one line and move on; never silently resend. \
+Report uncertainty as uncertainty.\n",
     );
     if let Some(list) = skills_section(cfg, true) {
         p.push_str(
@@ -1294,6 +1370,16 @@ mod tests {
         assert!(!cfg.approval_required("kill_session"));
         cfg.approval = "auto".to_string();
         assert!(!cfg.approval_required("send_input"));
+        assert!(cfg.approval_warning().is_none());
+
+        // Only "auto" opens the gate. A misspelling used to mean full
+        // autonomy, silently — now it gates and says so.
+        for typo in ["auto_approve", "approve", "ask", "yes"] {
+            cfg.approval = typo.to_string();
+            assert!(cfg.approval_required("send_input"), "{typo}");
+            let warning = cfg.approval_warning().unwrap_or_default();
+            assert!(warning.contains(typo), "{warning}");
+        }
     }
 
     #[tokio::test]
@@ -1449,6 +1535,64 @@ mod tests {
         // The most autonomous persona still cannot disable loop suppression.
         let orch = personas.iter().find(|p| p.name == "orchestrator").unwrap();
         assert!(orch.apply(&base).tool_dedup_secs > 0);
+    }
+
+    #[test]
+    fn a_persona_does_not_clobber_a_setting_the_user_wrote_explicitly() {
+        let cfg = crate::config::parse(
+            "[orchestrator]\nprovider = \"lmstudio\"\napproval = \"propose\"\n",
+        )
+        .unwrap()
+        .orchestrator;
+        let personas = crate::config::builtin_personas();
+        let orch = personas.iter().find(|p| p.name == "orchestrator").unwrap();
+
+        // Startup: both settings come from the same file, and the explicit
+        // key is the more specific one. The persona wants approval = "auto";
+        // the config said "propose", which is the point of writing it down.
+        let layered = orch.apply_at_startup(&cfg);
+        assert_eq!(layered.approval, "propose");
+        assert!(layered.approval_required("send_input"));
+        // Not silent about what it declined to set.
+        assert_eq!(orch.overridden_by_config(&cfg), vec!["approval"]);
+        // Fields the user left alone still come from the persona.
+        assert_eq!(layered.event_cooldown_secs, 15);
+
+        // Runtime (/persona orchestrator): the user is asking for this
+        // persona now, so it outranks the config file.
+        let layered = orch.apply(&cfg);
+        assert_eq!(layered.approval, "auto");
+        assert!(!layered.approval_required("send_input"));
+    }
+
+    #[test]
+    fn a_read_only_persona_is_not_told_it_can_drive_sessions() {
+        let personas = crate::config::builtin_personas();
+        let assistant = personas.iter().find(|p| p.name == "assistant").unwrap();
+        let cfg = assistant.apply(&OrchestratorConfig::default());
+        let prompt = system_prompt(&cfg);
+
+        // The capability paragraph used to promise tools the persona lacks.
+        assert!(!prompt.contains("Use your tools to"), "{prompt}");
+        assert!(!prompt.contains("start new ones"), "{prompt}");
+        assert!(!prompt.contains("wire pipes between them"), "{prompt}");
+        assert!(!prompt.contains("pause_session"), "{prompt}");
+        assert!(prompt.contains("You observe and advise"), "{prompt}");
+        // No events reach this persona, so the "you MUST report" rule is off.
+        assert!(!prompt.contains("[linkshell event]"), "{prompt}");
+        // The persona's own words sit with the capabilities they qualify,
+        // not after the memory block at the very end.
+        let note = prompt.find("reactive assistant").expect("persona note");
+        let chat_pane = prompt.find("small chat pane").expect("chat pane line");
+        assert!(note > chat_pane);
+        assert!(note < prompt.find("Standing rules").expect("standing rules"));
+
+        // The autonomous persona still gets the full description.
+        let orch = personas.iter().find(|p| p.name == "orchestrator").unwrap();
+        let prompt = system_prompt(&orch.apply(&OrchestratorConfig::default()));
+        assert!(prompt.contains("type into them"), "{prompt}");
+        assert!(prompt.contains("wire pipes between them"), "{prompt}");
+        assert!(prompt.contains("[linkshell event]"), "{prompt}");
     }
 
     #[test]

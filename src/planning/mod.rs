@@ -265,6 +265,26 @@ fn system_prompt(thread: &Thread) -> String {
         "\n\nScope root (all paths resolve against it): {}",
         thread.root.display()
     ));
+    // The root is chosen once, when the thread is created, and nothing in the
+    // UI can move it afterwards. Without this the model re-opens the question
+    // every turn — "this isn't the right directory for that" — which the
+    // engineer cannot act on and has already read.
+    p.push_str(
+        "\nThe root was fixed when this thread was created and cannot be changed, by you \
+or by the engineer. Do not assess whether it is the right directory and do not suggest \
+moving or re-rooting the work. If something you need falls outside it, say once, in a \
+line, what you cannot see, then plan with what is in front of you.",
+    );
+    // `thread` does not yet include the message being sent, so an empty
+    // transcript really does mean this is the opening turn.
+    if !thread.messages.is_empty() {
+        p.push_str(
+            "\n\nThis is a continuing conversation. Everything you have already established — \
+scope, caveats, what you can and cannot see, how you read the codebase — stands, and the \
+engineer has read it. Do not restate it. Pick up from the transcript and answer what was \
+just asked.",
+        );
+    }
     if !thread.reads.is_empty() {
         let stale = thread.stale_reads();
         if !stale.is_empty() {
@@ -837,6 +857,8 @@ mod tests {
     fn system_prompt_pins_the_root_and_flags_stale_grounding() {
         let mut t = Thread::new("t", PathBuf::from("/tmp/repo"));
         assert!(system_prompt(&t).contains("/tmp/repo"));
+        // The root cannot be moved, so re-litigating it wastes the turn.
+        assert!(system_prompt(&t).contains("cannot be changed"));
         t.record_read(tools::ReadRecord {
             rel: "vanished.rs".to_string(),
             hash: 7,
@@ -844,5 +866,21 @@ mod tests {
         });
         let p = system_prompt(&t);
         assert!(p.contains("vanished.rs"), "stale reads are surfaced: {}", p);
+    }
+
+    #[test]
+    fn a_continuing_thread_is_told_not_to_restate_what_it_already_said() {
+        // The opening turn has nothing to repeat yet.
+        let mut t = Thread::new("t", PathBuf::from("/tmp/repo"));
+        assert!(!system_prompt(&t).contains("continuing conversation"));
+
+        // `thread` never carries the message being sent, so one prior
+        // exchange is what makes the next turn a continuation.
+        t.messages.push(Message::user("how should retries work"));
+        t.messages.push(Message::assistant(
+            "Back off exponentially.",
+            &Backend::default(),
+        ));
+        assert!(system_prompt(&t).contains("continuing conversation"));
     }
 }

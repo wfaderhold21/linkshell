@@ -114,6 +114,10 @@ accept `~`).
   is just a slow tool — its context stays coherent, which matters for local
   models. While a proposal is pending the orchestrator processes nothing
   else; incoming events coalesce into its next turn.
+  `"auto"` and `"propose"` are the only values. Anything else — `"approve"`,
+  `"auto_approve"`, a typo — is treated as `"propose"` and reported in the
+  chat pane and by `linkshell doctor`, so a misspelling can never quietly
+  hand the agent full autonomy.
 - `auto_approve` (default `["list_sessions", "read_output", "use_skill"]`) —
   tools that skip the gate. The default set is read-only, so routine
   observation stays fluid and only session-mutating calls (`start_session`,
@@ -152,7 +156,24 @@ Local LLMs require `endpoint` and `model`; `system` and `api_key` are optional.
 ## `[[personas]]`
 
 Named behavioural presets layered over `[orchestrator]`. Every field is
-optional; omitted fields inherit from `[orchestrator]`. Set
+optional; omitted fields inherit from `[orchestrator]`.
+
+Precedence is "whatever you asked for most recently":
+
+- The persona named by `[orchestrator].persona` leaves keys you wrote
+  explicitly under `[orchestrator]` alone — both come from the same file, and
+  the key you spelled out is the more specific of the two. The chat pane says
+  which of its settings the persona therefore did not apply.
+- `/persona <name>` at runtime, and the Orchestrator menu's Persona row,
+  apply the persona in full: you are picking it now, so it overrides the
+  config file and any earlier runtime tweak.
+- A runtime field change (the menu's Approval row, say) holds until the next
+  persona swap.
+- A persona chosen at runtime survives stopping, starting and restarting the
+  orchestrator. "Reload Config From Disk" is the deliberate way back to
+  `[orchestrator].persona`.
+
+Set
 `[orchestrator].persona` to pick the one applied at startup, or switch at
 runtime with `/persona <name>` (history is preserved).
 
@@ -165,7 +186,11 @@ persona cannot turn correctness off.
 - `approval`, `auto_approve` — propose-mode gating.
 - `allowed_tools` — tools present in the schema at all. `list_sessions` is always kept.
 - `max_tool_iterations`, `tool_dedup_secs`, `max_context_tokens`, `event_tail_lines`.
-- `note` — appended to the system prompt under a `## Persona` heading.
+- `note` — added to the system prompt beside the capability description it
+  qualifies. The rest of that description is generated from `allowed_tools`:
+  a persona without `send_input` is not told it can type into sessions, and
+  one with `events = []` is not given the "you must report every WAITING
+  event" rule.
 
 Builtins: `assistant` (reactive, read-only, propose), `monitor` (watches and
 reports, writes gated), `orchestrator` (acts autonomously, tightest dedup

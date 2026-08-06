@@ -773,6 +773,12 @@ impl Session {
                 self.pattern_waiting = false;
                 self.state = self.watcher_state.clone().unwrap_or(new_state);
             }
+            // Same reasoning as above, for the no-watcher case: a Claude
+            // dialog is drawn with the input hint ("⏵⏵ accept edits on")
+            // rendered *below* it in the same frame, and that trailing line
+            // reads as RUNNING. Letting it through wiped WAITING milliseconds
+            // after the dialog appeared.
+            SessionState::Running if self.pattern_waiting => {}
             _ if !self.ipc_state => {
                 self.pattern_waiting = false;
                 self.state = new_state;
@@ -1411,11 +1417,19 @@ mod tests {
     fn pattern_states_apply_freely_without_a_watcher() {
         let mut s = session(SessionKind::Aider);
 
-        s.apply_pattern_state(SessionState::Waiting);
-        assert_eq!(s.state, SessionState::Waiting);
-        // No watcher state to fall back on: a complete RUNNING line clears it.
         s.apply_pattern_state(SessionState::Running);
         assert_eq!(s.state, SessionState::Running);
+
+        s.apply_pattern_state(SessionState::Waiting);
+        assert_eq!(s.state, SessionState::Waiting);
+        // A trailing RUNNING line from the same repaint (a Claude dialog is
+        // drawn with the input hint below it) must not wipe the dialog.
+        s.apply_pattern_state(SessionState::Running);
+        assert_eq!(s.state, SessionState::Waiting);
+        // Ready is positive evidence the dialog is gone, and releases it.
+        s.apply_pattern_state(SessionState::Ready);
+        assert_eq!(s.state, SessionState::Ready);
+        assert!(!s.pattern_waiting);
     }
 
     #[test]
