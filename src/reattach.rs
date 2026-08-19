@@ -5,6 +5,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+/// Bytes of kernel socket buffer we ask for on both ends of the relay.
+///
+/// The default unix-socket buffer is generous on Linux (~208 KiB) but tiny on
+/// macOS/BSD (`net.local.stream.{send,recv}space`, 8 KiB). A single ratatui
+/// frame for a wide terminal can exceed that on its own, so a burst of PTY
+/// output would fill the pipe faster than a slow terminal emulator drains it,
+/// stall the server's bounded relay writes, and trip the "client is wedged"
+/// escalation into an involuntary detach. Widening the buffer keeps bursts in
+/// the kernel where they belong.
+const RELAY_SOCK_BUF: libc::c_int = 512 * 1024;
+
+/// Best-effort widening of a socket's send/receive buffers. Failure is fine:
+/// the kernel clamps to `kern.ipc.maxsockbuf` and we simply keep the default.
+pub fn widen_socket_buffers<F: std::os::unix::io::AsRawFd>(sock: &F) {
+    let fd = sock.as_raw_fd();
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &RELAY_SOCK_BUF as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 // ── SwappableWriter ────────────────────────────────────────────────────────
 // Allows the ratatui terminal backend to be redirected from stdout to a
 // relay socket at runtime, without reconstructing the Terminal object.
@@ -368,6 +396,7 @@ pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
             e
         )
     })?;
+    widen_socket_buffers(&stream);
     let (read_half, mut write_half) = stream.into_split();
 
     // Handshake: tell the server our terminal dimensions.
@@ -423,7 +452,9 @@ pub async fn run_relay_client(id: &str) -> anyhow::Result<()> {
     let done_tx2 = done_tx.clone();
     tokio::spawn(async move {
         let mut reader = read_half;
-        let mut buf = vec![0u8; 4096];
+        // Drain in large gulps: the faster this side empties the socket, the
+        // less the server's bounded writes stall behind a slow emulator.
+        let mut buf = vec![0u8; 64 * 1024];
         let mut stdout = tokio::io::stdout();
         loop {
             match reader.read(&mut buf).await {
