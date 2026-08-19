@@ -390,7 +390,7 @@ async fn run_server() -> anyhow::Result<()> {
                     // one frame per write-timeout forever and reject new
                     // reattach attempts as "already attached".
                     relay_write_failures += 1;
-                    if headless || relay_write_failures < 3 {
+                    if headless || relay_write_failures < RELAY_STALL_LIMIT {
                         continue;
                     }
                 } else if headless {
@@ -559,11 +559,26 @@ fn send_restore_sequences(writer_handle: &Arc<Mutex<WriterBox>>, kitty: bool) {
     let _ = w.flush();
 }
 
+/// Consecutive 5-second relay write timeouts before the server gives up on an
+/// attached client and drops to headless. A client that has actually gone away
+/// is caught much sooner by the relay reader hitting EOF, so this only governs
+/// the rare *stalled but connected* case — being patient here costs nothing and
+/// avoids yanking the terminal away from someone whose emulator merely fell
+/// behind a heavy output burst.
+const RELAY_STALL_LIMIT: u32 = 12;
+
 fn is_transient_terminal_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-    ) || error.raw_os_error() == Some(libc::EAGAIN)
+        // A `set_write_timeout` expiry surfaces as EAGAIN on Linux but can come
+        // back as ETIMEDOUT on macOS/BSD; both mean "slow client", not "dead".
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ETIMEDOUT)
+    )
 }
 
 fn handle_event(app: &mut App, event: AppEvent) {
@@ -1552,6 +1567,7 @@ async fn do_reattach(
         return None;
     };
     let _ = std_stream.set_nonblocking(false); // writer clone must be blocking
+    reattach::widen_socket_buffers(&std_stream);
     let Ok(writer_clone) = std_stream.try_clone() else {
         return None;
     };
@@ -1565,7 +1581,10 @@ async fn do_reattach(
     };
 
     // Point the ratatui backend at the relay socket.
-    *writer_handle.lock().unwrap() = Box::new(std::io::BufWriter::new(writer_clone));
+    // 64 KiB so a whole frame usually reaches the kernel in one write syscall
+    // rather than eight 8 KiB chunks, each of which can block separately.
+    *writer_handle.lock().unwrap() =
+        Box::new(std::io::BufWriter::with_capacity(64 * 1024, writer_clone));
 
     // Re-issue terminal init sequences to the relay client: enter alternate
     // screen and re-enable mouse capture so the relay terminal is ready.
